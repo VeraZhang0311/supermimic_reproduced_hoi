@@ -4,7 +4,7 @@ import importlib.metadata as metadata
 import json
 from packaging.requirements import Requirement
 
-root=Path('/mnt/projects/ll/tianzizh/supermimic_reproduced_hoi')
+root=Path('/mnt/projects/ll/tianzizh/supermimic_reproduced_hoi_selfcollision')
 checks=[]
 for line in (root/'provenance/grasp-cu128-requirements.txt').read_text().splitlines():
     if not line or line.startswith('#'): continue

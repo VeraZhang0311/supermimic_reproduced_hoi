@@ -1,4 +1,4 @@
-"""Run upstream code unchanged: native gate, full-sized warm-up gate, then 14000 updates."""
+"""Run the single-flag self-collision experiment: native gate, full-sized warm-up gate, then 14000 updates."""
 from pathlib import Path
 import csv
 import datetime
@@ -12,8 +12,8 @@ import subprocess
 import sys
 import time
 
-ROOT=Path('/mnt/projects/ll/tianzizh/supermimic_reproduced_hoi')
-RUN=ROOT/'logs/lafan1_stock_seed0'
+ROOT=Path('/mnt/projects/ll/tianzizh/supermimic_reproduced_hoi_selfcollision')
+RUN=ROOT/'logs/lafan1_selfcollision_seed0'
 SMOKE=ROOT/('logs/smoke_full501-'+os.environ.get('SLURM_JOB_ID','local'))
 TRACKER_SITE='/mnt/projects/ll/tianzizh/SuperMimic_HOI/envs/tracking-py312/lib/python3.12/site-packages'
 PORTABLE=ROOT/'tools/python-portable/cpython-3.12.4-linux-x86_64-gnu/bin/python3.12'
@@ -42,6 +42,11 @@ def terminate(process):
     except subprocess.TimeoutExpired:
         process.kill(); process.wait(timeout=15)
 
+def validate_identity():
+    sys.path.insert(0,str(ROOT/'cluster'))
+    from validate_experiment import validate
+    return validate()
+
 def main():
     import torch
     assert torch.cuda.device_count()==1,'Exactly one allocated GPU required'
@@ -57,6 +62,17 @@ def main():
         'nvidia_smi':subprocess.check_output(['nvidia-smi','--query-gpu=name,driver_version,memory.total','--format=csv,noheader'],text=True).strip()}
     write_json(ROOT/'provenance/gpu-hardware.json',hardware)
     write_json(ROOT/f"provenance/gpu-hardware-{os.environ['SLURM_JOB_ID']}.json",hardware)
+    validate_identity()
+    for setting in ('off', 'on'):
+        logged(upstream_command('cluster/check_selfcollision.py','--setting',setting),
+               ROOT/f"logs/collision-gate-{setting}-{os.environ['SLURM_JOB_ID']}.log",1800)
+    off=json.loads((ROOT/f"provenance/collision-off-{os.environ['SLURM_JOB_ID']}.json").read_text())
+    on=json.loads((ROOT/f"provenance/collision-on-{os.environ['SLURM_JOB_ID']}.json").read_text())
+    assert off['newton_allowed_self_shape_pairs']==0,off
+    assert off['mujoco_allowed_nonadjacent_geom_pairs']==0,off
+    assert on['newton_allowed_self_shape_pairs']>0,on
+    assert on['mujoco_allowed_nonadjacent_geom_pairs']>0,on
+    assert on['cross_body_shape_pairs']==off['cross_body_shape_pairs']
     gate_log=ROOT/f"logs/native-fk-gate-{os.environ['SLURM_JOB_ID']}.log"
     logged(upstream_command('tools/test_env.py','--num_envs','64'),gate_log,1800)
     text=gate_log.read_text()
@@ -83,6 +99,12 @@ def main():
     RUN.mkdir()
     source={str(path.relative_to(ROOT)):sha(path) for folder in ('supermimic','tools') for path in sorted((ROOT/folder).glob('*.py'))}
     manifest={'stage':'formal','created_utc':stamp(),'upstream_commit':'a1508d42c9d1699a52e8233ab16d08c488441ab9',
+        'experiment':'selfcollision_on','comparison_group':'LAFAN1-seed0-selfcollision',
+        'physical_self_collisions':True,'extra_self_collision_reward_penalty':False,
+        'baseline_root':'/mnt/projects/ll/tianzizh/supermimic_reproduced_hoi',
+        'scientific_change':'Only G1 articulation enabled_self_collisions=False -> True; same reward/termination and all training hyperparameters.',
+        'collision_backend_verification':{'off':off,'on':on},
+        'source_identity':validate_identity(),
         'isaaclab_commit':'46d6cc3d7b115906fad12efd372fbf69f4e3d3ed','hardware':hardware,
         'source_sha256':source,'data_manifest_sha256':sha(ROOT/'provenance/download-manifest.json'),
         'environment_deviation':json.loads((ROOT/'provenance/environment-deviation.json').read_text()),
@@ -93,6 +115,7 @@ def main():
         'graph_compatibility_launcher_sha256':sha(ROOT/'cluster/compat_launch.py'),
         'graph_compatibility_receipts':[json.loads(p.read_text()) for p in sorted((ROOT/'provenance').glob(f"graph-compat-{os.environ['SLURM_JOB_ID']}-*.json"))]}
     write_json(RUN/'manifest.json',manifest)
+    validate_identity()
     tracker_env=dict(os.environ,PYTHONPATH=TRACKER_SITE,WANDB_CACHE_DIR=str(ROOT/'.cache/wandb'),WANDB_DATA_DIR=str(ROOT/'.cache/wandb-data'),WANDB_DIR=str(ROOT/'logs'))
     track_log=(ROOT/'logs/tracker.stdout.log').open('w')
     tracker=subprocess.Popen([str(PORTABLE),str(ROOT/'cluster/track_csv.py')],cwd=ROOT,env=tracker_env,stdout=track_log,stderr=subprocess.STDOUT)
@@ -127,7 +150,7 @@ def main():
             'n_failed':int(result['n_failed']),'completion_fraction':1-int(result['n_failed'])/40,
             'train_wall_h':float(result['train_wall_h']),
             'target_reproduced':float(result['norm_return'])>=0.82 and int(result['n_failed'])==0,
-            'hardware_identical_to_author':False,'source_unchanged':True})
+            'hardware_identical_to_author':False,'source_unchanged_since_manifest':True,'upstream_core_diff':'one self-collision flag'})
         status='completed'
     except BaseException as exc:
         error=repr(exc)

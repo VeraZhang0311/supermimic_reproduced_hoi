@@ -7,8 +7,8 @@ import os
 import time
 import wandb
 
-ROOT=Path('/mnt/projects/ll/tianzizh/supermimic_reproduced_hoi')
-RUN=ROOT/'logs/lafan1_stock_seed0'
+ROOT=Path('/mnt/projects/ll/tianzizh/supermimic_reproduced_hoi_selfcollision')
+RUN=ROOT/'logs/lafan1_selfcollision_seed0'
 STATE=RUN/'wandb-cursor.json'
 def load_rows(path):
     if not path.exists(): return []
@@ -18,11 +18,12 @@ def load_rows(path):
 def main():
     manifest=json.loads((RUN/'manifest.json').read_text())
     config={key:manifest[key] for key in ('stage','upstream_commit','isaaclab_commit','hardware','parameters','acceptance','environment_deviation','timing','checkpoint_uploads')}
+    config.update({key:manifest[key] for key in ('experiment','comparison_group','physical_self_collisions','extra_self_collision_reward_penalty','scientific_change','source_identity','collision_backend_verification')})
     config['graph_compatibility']={key:manifest[key] for key in ('graph_compatibility_launcher_sha256','graph_compatibility_receipts') if key in manifest}
     run=wandb.init(entity='tianzizh-university-of-pennsylvania',project='SuperMimic_Upstream_Reproduction',
-        id='stock-lafan1-20261022-s0',name='LAFAN1-stock-seed0-L40',job_type='train',resume='allow',
+        id='selfcoll-lafan1-20261022-s0',name='LAFAN1-selfcollision-ON-seed0-L40',job_type='train',resume='allow',
         config=config,save_code=False,mode='online',settings=wandb.Settings(disable_code=True),
-        tags=['upstream-a1508d4','mujoco-warp','LAFAN1','original-hyperparameters','L40','cu128-compatibility'])
+        tags=['upstream-a1508d4','mujoco-warp','LAFAN1','original-hyperparameters','L40','cu128-compatibility','selfcollision-on','controlled-comparison'])
     run.define_metric('train/iteration')
     run.define_metric('train/*',step_metric='train/iteration')
     run.define_metric('eval/iteration')

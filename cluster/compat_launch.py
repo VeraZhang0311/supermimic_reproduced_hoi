@@ -7,7 +7,7 @@ import os
 import runpy
 import sys
 
-ROOT=Path('/mnt/projects/ll/tianzizh/supermimic_reproduced_hoi')
+ROOT=Path('/mnt/projects/ll/tianzizh/supermimic_reproduced_hoi_selfcollision')
 
 def install_graph_compatibility(mujoco_warp, supported):
     """Only select MuJoCo-Warp's graph scheduling path; solver settings stay intact."""

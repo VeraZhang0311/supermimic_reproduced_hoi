@@ -16,3 +16,10 @@ logs/
 results/analysis/
 # third-party paper
 *.pdf
+
+# Shared read-only runtime/assets and independent runtime scratch
+/envs
+/tools/python-portable
+/IsaacLab
+/data
+/tmp
