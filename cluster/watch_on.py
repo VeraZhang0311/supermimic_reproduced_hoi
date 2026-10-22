@@ -61,9 +61,22 @@ fk_match = re.search(r'FK pos err ([0-9.eE+-]+)', native)
 native_valid = bool(smoke) and set(roundtrip) == {'p', 'R', 'v', 'w', 'q', 'qd'} and all(float(x) < 2e-4 for x in roundtrip.values()) and bool(fk_match) and float(fk_match[1]) < 1e-4
 queue = cmd(['/opt/slurm/bin/squeue', '-u', 'tianzizh', '--noheader', '--format=%i|%j|%T|%M|%R'])
 accounting = cmd(['/opt/slurm/bin/sacct', '-j', JOB, '--format=JobID,State,Elapsed,ExitCode,NodeList', '-P'])
+# Derive current state from this observation, rather than retaining submission status.
+queue_line = next((line for line in queue.splitlines() if line.split('|')[0] == JOB), '')
+accounting_line = next((line for line in accounting.splitlines() if line.split('|')[0] == JOB), '')
+slurm_state = queue_line.split('|')[2] if queue_line else accounting_line.split('|')[1] if accounting_line else 'UNKNOWN'
+slurm_state = slurm_state.split()[0].rstrip('+')
+if formal:
+    stage = 'formal'
+elif smoke:
+    stage = 'smoke'
+elif native or (ROOT / f'provenance/collision-on-{JOB}.json').exists():
+    stage = 'native'
+else:
+    stage = 'pending' if slurm_state == 'PENDING' else 'setup'
 receipt = {
     'utc': UTC.isoformat(), 'variant': 'selfcollision_on', 'job_id': int(JOB),
-    'queue': queue, 'accounting': accounting,
+    'queue': queue, 'accounting': accounting, 'slurm_state': slurm_state, 'stage': stage,
     'native_gpu_validated': native_valid,
     'native_fk_max_m': float(fk_match[1]) if fk_match else None,
     'smoke_last_iteration': int(smoke[-1]['iteration']) if smoke else None,
@@ -123,5 +136,12 @@ atomic(destination, receipt)
 status_path = ROOT / 'provenance/startup-status.json'
 status = json.loads(status_path.read_text())
 status.update(last_checked_utc=UTC.isoformat(), last_watch_receipt=str(destination.relative_to(ROOT)), last_queue_snapshot=queue, repair_native_gpu_validated=receipt['native_gpu_validated'], physical_self_collision_verified=receipt['physical_self_collision_verified'], formal_training_started=bool(formal), smoke_last_iteration=receipt['smoke_last_iteration'], formal_last_iteration=receipt['formal_last_iteration'], formal_stable_start_validated=receipt['stable_start_conditions_currently_satisfied'], automation_interval_minutes=15)
+status.update(status=slurm_state.lower(), slurm_state=slurm_state, stage=stage,
+              queue_snapshot=queue_line or accounting_line,
+              last_observation_attempt_utc=UTC.isoformat(),
+              latest_observation_status='actual_cluster_state_read',
+              fresh_cluster_state_available=True, last_observation_error=None,
+              native_self_collision_verified=receipt['physical_self_collision_verified'],
+              formal_training_stable=receipt['stable_start_conditions_currently_satisfied'])
 atomic(status_path, status)
 print(json.dumps({'receipt_path': str(destination), 'receipt': json.loads(destination.read_text())}, indent=2))
