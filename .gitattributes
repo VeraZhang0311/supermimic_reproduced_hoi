@@ -1,0 +1,2 @@
+cluster/*.sh text eol=lf
+cluster/*.py text eol=lf
