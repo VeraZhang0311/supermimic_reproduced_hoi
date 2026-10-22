@@ -31,9 +31,16 @@ from supermimic.robot import G1_CFG, default_joint_pos_list
 
 expected=args.setting=='on'
 assert G1_CFG.spawn.articulation_props.enabled_self_collisions is True
-assert TrackingSceneCfg.robot.spawn.articulation_props.enabled_self_collisions is True
+# configclass stores mutable fields in instance factories, not class attributes.
+assert TrackingSceneCfg(num_envs=1,env_spacing=0.0,replicate_physics=True).robot.spawn.articulation_props.enabled_self_collisions is True
 if not expected:
-    TrackingSceneCfg.robot.spawn.articulation_props.enabled_self_collisions=False
+    import supermimic.env as env_module
+    original_scene_config=env_module.TrackingSceneCfg
+    def diagnostic_scene_config(*arguments,**keywords):
+        config=original_scene_config(*arguments,**keywords)
+        config.robot.spawn.articulation_props.enabled_self_collisions=False
+        return config
+    env_module.TrackingSceneCfg=diagnostic_scene_config
 dev='cuda:0'
 torch.manual_seed(0)
 kin=G1Kinematics(dev)
