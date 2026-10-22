@@ -14,7 +14,7 @@ import time
 
 ROOT=Path('/mnt/projects/ll/tianzizh/supermimic_reproduced_hoi')
 RUN=ROOT/'logs/lafan1_stock_seed0'
-SMOKE=ROOT/'logs/smoke_full501'
+SMOKE=ROOT/('logs/smoke_full501-'+os.environ.get('SLURM_JOB_ID','local'))
 TRACKER_SITE='/mnt/projects/ll/tianzizh/SuperMimic_HOI/envs/tracking-py312/lib/python3.12/site-packages'
 PORTABLE=ROOT/'tools/python-portable/cpython-3.12.4-linux-x86_64-gnu/bin/python3.12'
 def stamp(): return datetime.datetime.now(datetime.timezone.utc).isoformat()
@@ -26,6 +26,8 @@ def logged(command,path,timeout):
     with Path(path).open('w') as stream:
         subprocess.run(command,cwd=ROOT,stdout=stream,stderr=subprocess.STDOUT,check=True,timeout=timeout)
 def sha(path): return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+def upstream_command(script,*arguments):
+    return [sys.executable,str(ROOT/'cluster/compat_launch.py'),script,*arguments]
 def evaluation_complete():
     p=RUN/'eval.csv'
     if not p.exists(): return False
@@ -54,8 +56,9 @@ def main():
         'slurm_job_id':os.environ['SLURM_JOB_ID'],'cpus':os.environ['SLURM_CPUS_PER_TASK'],
         'nvidia_smi':subprocess.check_output(['nvidia-smi','--query-gpu=name,driver_version,memory.total','--format=csv,noheader'],text=True).strip()}
     write_json(ROOT/'provenance/gpu-hardware.json',hardware)
-    gate_log=ROOT/'logs/native-fk-gate.log'
-    logged([sys.executable,'tools/test_env.py','--num_envs','64'],gate_log,1800)
+    write_json(ROOT/f"provenance/gpu-hardware-{os.environ['SLURM_JOB_ID']}.json",hardware)
+    gate_log=ROOT/f"logs/native-fk-gate-{os.environ['SLURM_JOB_ID']}.log"
+    logged(upstream_command('tools/test_env.py','--num_envs','64'),gate_log,1800)
     text=gate_log.read_text()
     errors=dict(re.findall(r'roundtrip (\w+): max err ([0-9.eE+-]+)',text))
     assert set(errors)=={'p','R','v','w','q','qd'},errors
@@ -64,7 +67,7 @@ def main():
     assert math.isfinite(fk) and fk<1e-4,fk
     assert 'motion: 40 clips' in text
     assert not SMOKE.exists(),'Existing smoke directory preserved; inspect before retry'
-    logged([sys.executable,'supermimic/train.py','--iterations','501','--ckpt_every','501','--log_every','1','--log_dir',str(SMOKE)],ROOT/'logs/smoke501.stdout.log',3600)
+    logged(upstream_command('supermimic/train.py','--iterations','501','--ckpt_every','501','--log_every','1','--log_dir',str(SMOKE)),ROOT/f"logs/smoke501-{os.environ['SLURM_JOB_ID']}.stdout.log",3600)
     smoke_rows=list(csv.DictReader((SMOKE/'train_log.csv').open()))
     assert smoke_rows and int(smoke_rows[-1]['iteration'])==501
     assert all(math.isfinite(float(row[key])) for row in smoke_rows for key in ('wm_loss','wm_err8'))
@@ -86,7 +89,9 @@ def main():
         'parameters':{'num_envs':4096,'iterations':14000,'buffer_steps':1000,'utd':0.4,'horizon':32,'goal_frames':10,'hist':10,'wm_window':8,'wm_batches':10,'wm_batch':2048,'pi_batch':4096,'lr':0.0002,'gamma':0.99,'lam':0.95,'action_noise':0.1,'critic_epochs':5,'critic_minibatches':4,'warmup_steps':64,'wm_only_iters':500,'lr_decay_iters':250000,'ckpt_every':2000,'log_every':50,'seed':0,'amp':'bf16'},
         'acceptance':{'mean_normalized_return':0.82,'failed_clips':0,'clip_count':40},
         'timing':'Unchanged upstream wall_h includes training-loop compile and concurrent same-GPU evaluation; initial data/simulator/replay warm-up, setup and this separate smoke gate are outside its clock.',
-        'checkpoint_uploads':False}
+        'checkpoint_uploads':False,
+        'graph_compatibility_launcher_sha256':sha(ROOT/'cluster/compat_launch.py'),
+        'graph_compatibility_receipts':[json.loads(p.read_text()) for p in sorted((ROOT/'provenance').glob(f"graph-compat-{os.environ['SLURM_JOB_ID']}-*.json"))]}
     write_json(RUN/'manifest.json',manifest)
     tracker_env=dict(os.environ,PYTHONPATH=TRACKER_SITE,WANDB_CACHE_DIR=str(ROOT/'.cache/wandb'),WANDB_DATA_DIR=str(ROOT/'.cache/wandb-data'),WANDB_DIR=str(ROOT/'logs'))
     track_log=(ROOT/'logs/tracker.stdout.log').open('w')
@@ -95,14 +100,14 @@ def main():
     eval_log=(RUN/'eval.stdout.log').open('w')
     train=None; evaluator=None; status='failed'; error=None
     try:
-        train=subprocess.Popen([sys.executable,'supermimic/train.py','--iterations','14000','--log_dir',str(RUN)],cwd=ROOT,stdout=train_log,stderr=subprocess.STDOUT)
-        evaluator=subprocess.Popen([sys.executable,'supermimic/evaluate.py','--run_dir',str(RUN),'--watch'],cwd=ROOT,stdout=eval_log,stderr=subprocess.STDOUT)
+        train=subprocess.Popen(upstream_command('supermimic/train.py','--iterations','14000','--log_dir',str(RUN)),cwd=ROOT,stdout=train_log,stderr=subprocess.STDOUT)
+        evaluator=subprocess.Popen(upstream_command('supermimic/evaluate.py','--run_dir',str(RUN),'--watch'),cwd=ROOT,stdout=eval_log,stderr=subprocess.STDOUT)
         write_json(RUN/'processes.json',{'training_pid':train.pid,'evaluation_pid':evaluator.pid,'tracker_pid':tracker.pid,'slurm_job_id':os.environ['SLURM_JOB_ID']})
         attempts=1
         while train.poll() is None:
             if evaluator.poll() is not None and attempts<3:
                 time.sleep(10)
-                evaluator=subprocess.Popen([sys.executable,'supermimic/evaluate.py','--run_dir',str(RUN),'--watch'],cwd=ROOT,stdout=eval_log,stderr=subprocess.STDOUT)
+                evaluator=subprocess.Popen(upstream_command('supermimic/evaluate.py','--run_dir',str(RUN),'--watch'),cwd=ROOT,stdout=eval_log,stderr=subprocess.STDOUT)
                 attempts+=1
             time.sleep(10)
         if train.returncode: raise RuntimeError(f'Upstream training exited {train.returncode}')

@@ -18,6 +18,7 @@ def load_rows(path):
 def main():
     manifest=json.loads((RUN/'manifest.json').read_text())
     config={key:manifest[key] for key in ('stage','upstream_commit','isaaclab_commit','hardware','parameters','acceptance','environment_deviation','timing','checkpoint_uploads')}
+    config['graph_compatibility']={key:manifest[key] for key in ('graph_compatibility_launcher_sha256','graph_compatibility_receipts') if key in manifest}
     run=wandb.init(entity='tianzizh-university-of-pennsylvania',project='SuperMimic_Upstream_Reproduction',
         id='stock-lafan1-20261022-s0',name='LAFAN1-stock-seed0-L40',job_type='train',resume='allow',
         config=config,save_code=False,mode='online',settings=wandb.Settings(disable_code=True),
