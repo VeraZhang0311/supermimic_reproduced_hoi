@@ -2,6 +2,8 @@
 from pathlib import Path
 import hashlib
 import json
+import subprocess
+import sys
 import xml.etree.ElementTree as ET
 
 HAND_SHA = {'left': 'cff2221a690fa69303f61fce68f2d155c1517b52efb6ca9262dd56e0bc6e70fe',
@@ -58,10 +60,10 @@ def stage_snapshot(stage):
 
 
 def prepare(root, output, original_urdf):
-    import coacd
-    import numpy as np
-    import trimesh
+    # CoACD/trimesh followed by pxr.Tf segfaults in this pinned runtime. Keep the
+    # mesh cooker in a child interpreter; USD authoring never loads those libs.
     from pxr import Usd, UsdGeom, UsdPhysics, Sdf, Gf
+    import numpy as np
     root, output = Path(root), Path(output)
     output.mkdir(exist_ok=False)
     definitions = original_definition(original_urdf)
@@ -80,7 +82,6 @@ def prepare(root, output, original_urdf):
     stage.SetDefaultPrim(root_prim)
     root_prim.GetVariantSet('Physics').SetVariantSelection('mujoco')
     hand_info = {}
-    coacd.set_log_level('warn')
     for side in HAND_SHA:
         stl = root / 'data/g1_description/meshes' / (side + '_rubber_hand.STL')
         assert sha(stl) == HAND_SHA[side], stl
@@ -90,8 +91,12 @@ def prepare(root, output, original_urdf):
         # rigid body, inertial, joint, PD, visual or wrist geometry is changed.
         translation = list(UsdGeom.Xformable(body).GetLocalTransformation().ExtractTranslation())
         assert np.allclose(translation, ORIGIN[side], atol=1e-7), translation
-        mesh = trimesh.load_mesh(str(stl), process=True)
-        pieces = coacd.run_coacd(coacd.Mesh(np.asarray(mesh.vertices), np.asarray(mesh.faces)), **RECIPE)
+        cooked=output/(side+'-hulls.json')
+        with (output/(side+'-cook.log')).open('x') as log:
+            subprocess.run([sys.executable,'-X','faulthandler','-m','hoi.hand_collision',
+                '--cook',side,'--stl',str(stl),'--output',str(cooked)],
+                check=True,stdout=log,stderr=subprocess.STDOUT,timeout=600)
+        pieces=[(np.asarray(p['vertices']),np.asarray(p['faces'])) for p in json.loads(cooked.read_text())['pieces']]
         assert 1 <= len(pieces) <= 5, len(pieces)
         parts = []
         for index, (vertices, faces) in enumerate(pieces):
@@ -116,7 +121,7 @@ def prepare(root, output, original_urdf):
     layer.Save()
     report = {'source_usd': str(source.resolve()), 'source_usd_sha256': sha(source),
         'original_hoi_urdf_sha256': sha(original_urdf), 'recipe': RECIPE,
-        'cooker': 'CoACD', 'limitations': LIMITATION, 'hands': hand_info,
+        'cooker': 'CoACD', 'cooker_and_usd_imports_isolated':True, 'limitations': LIMITATION, 'hands': hand_info,
         'original_authored_values_unchanged': True, 'added_collider_count': len(added),
         'usd': str(target), 'usd_sha256': sha(target)}
     (output / 'hand-asset.json').write_text(json.dumps(report, indent=2) + '\n')
@@ -192,3 +197,27 @@ def assert_same_physics(off, on):
                 assert np.allclose(off[group][name][field], on[group][name][field],
                     rtol=2e-6, atol=2e-7), (group, name, field)
     assert not off['enabled'] and on['enabled']
+
+
+def cook(side,stl,output):
+    import coacd
+    import numpy as np
+    import trimesh
+    assert sha(stl)==HAND_SHA[side]
+    coacd.set_log_level('warn')
+    mesh=trimesh.load_mesh(str(stl),process=True)
+    pieces=coacd.run_coacd(coacd.Mesh(np.asarray(mesh.vertices),np.asarray(mesh.faces)),**RECIPE)
+    assert 1<=len(pieces)<=5
+    assert all(4<=len(v)<=16 and np.isfinite(v).all() for v,f in pieces)
+    Path(output).write_text(json.dumps({'recipe':RECIPE,'stl_sha256':sha(stl),
+        'pieces':[{'vertices':v.tolist(),'faces':f.tolist()} for v,f in pieces]},allow_nan=False)+'\n')
+
+
+if __name__=='__main__':
+    import argparse
+    parser=argparse.ArgumentParser()
+    parser.add_argument('--cook',choices=['left','right'],required=True)
+    parser.add_argument('--stl',type=Path,required=True)
+    parser.add_argument('--output',type=Path,required=True)
+    arguments=parser.parse_args()
+    cook(arguments.cook,arguments.stl,arguments.output)

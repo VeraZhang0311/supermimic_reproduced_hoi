@@ -35,3 +35,9 @@ Outputs: `results/hoi80_stock14000_handcollision-JOBID`; new W&B run
 deltas against the preserved baseline. Only curated config/metrics/tables sync to
 W&B; weights, source, raw motions and rollouts remain on disk. The80 verified
 rollouts are also downloaded to the independent D: checkout for later rendering.
+
+CPU preflight1457362 and import-only diagnostic1457370 isolated a native crash:
+loading CoACD/trimesh then pxr.Tf in one interpreter segfaults in the pinned
+environment. Hand cooking now runs in a separate interpreter from USD authoring.
+No dependencies, geometry recipe, model or simulation parameters are changed.
+Failure logs/source snapshots remain in provenance/failed-cpu-1457362.
