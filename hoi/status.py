@@ -6,7 +6,7 @@ job=(root/'provenance/eval-job.txt').read_text().strip()
 def command(args):return subprocess.check_output(args,cwd=root,text=True,stderr=subprocess.STDOUT).strip()
 def read(path):return path.read_text(errors='replace') if path.exists() else ''
 def sha(path):return hashlib.sha256(path.read_bytes()).hexdigest()
-out=root/f'results/hoi80_stock14000-{job}'
+out=root/f'results/hoi80_stock14000_handcollision-{job}'
 manifest=json.loads((root/'results/hoi80_inputs/manifest.json').read_text())
 groups={}
 for asset in manifest['assets']:
@@ -30,6 +30,8 @@ receipt={
     'failure':json.loads((out/'failure.json').read_text()) if (out/'failure.json').exists() else None,
     'group_log_tails':{p.name:read(p).splitlines()[-12:] for p in out.glob('*.stdout.log')},
     'output':str(out),'training_or_configuration_mutated':False,
+    'hand_asset':json.loads((out/'hand_asset/hand-asset.json').read_text()) if (out/'hand_asset/hand-asset.json').exists() else None,
+    'hand_gate_passed':(out/'hand-gate-passed.json').exists(),
 }
 if report:
     receipt['rollout_sha256_verified']=all(sha(out/case['rollout'])==case['rollout_sha256'] for case in report['cases'])

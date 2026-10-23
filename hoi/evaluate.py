@@ -20,6 +20,7 @@ p.add_argument('--checkpoint',type=Path,required=True)
 p.add_argument('--asset',required=True)
 p.add_argument('--output',type=Path,required=True)
 p.add_argument('--gate-steps',type=int,default=0)
+p.add_argument('--robot-usd',type=Path,default=None,help='Independent hand-collision overlay; original robot otherwise')
 add_launcher_args(p)
 args=p.parse_args()
 args.output.mkdir(parents=True,exist_ok=False)
@@ -46,6 +47,7 @@ from supermimic.networks import Policy
 import supermimic.networks as networks
 from hoi.ultra_kinematics import UltraKinematics
 from hoi.ultra_metrics import clip_metrics
+from hoi.hand_collision import compiled_audit
 
 def sha(path):return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 def write(name,value):
@@ -99,7 +101,17 @@ class HOISceneCfg(TrackingSceneCfg):
             rigid_props=sim_utils.RigidBodyPropertiesCfg(disable_gravity=False,linear_damping=0.,angular_damping=0.)),
         init_state=RigidObjectCfg.InitialStateCfg(pos=(4.,4.,2.)))
 
-env_module.TrackingSceneCfg=HOISceneCfg
+if args.robot_usd:
+    assert args.robot_usd.is_file()
+    # Instantiate before editing: configclass fields are instance fields. Only
+    # the robot spawn path changes; PD/inertia/joints/self-collision stay intact.
+    def patched_scene_factory(**kwargs):
+        config=HOISceneCfg(**kwargs)
+        config.robot.spawn.usd_path=str(args.robot_usd)
+        return config
+    env_module.TrackingSceneCfg=patched_scene_factory
+else:
+    env_module.TrackingSceneCfg=HOISceneCfg
 torch.manual_seed(0)
 torch.backends.cuda.matmul.allow_tf32=True
 wp.init()
@@ -175,6 +187,7 @@ with launch_simulation(sim_cfg,args),torch.no_grad():
             masks=(int(mj.geom_contype[g1])&int(mj.geom_conaffinity[g2]))|(int(mj.geom_contype[g2])&int(mj.geom_conaffinity[g1]))
             if signature not in excluded and masks:object_robot_pairs+=1
     assert object_robot_pairs>0,'Compiled MuJoCo object/robot collision pairs disabled'
+    hand_verification=compiled_audit(mj,enabled=bool(args.robot_usd))
     native={'object_asset':args.asset,'body_count':obj.num_bodies,'colliders':colliders,
         'object_mass_max_abs_error':mass_error,'object_com_max_abs_error':com_error,
         'object_inertia_max_abs_error':inertia_error,'virtual39_vs_physical14_fk_error_m':fk_error,
@@ -184,7 +197,9 @@ with launch_simulation(sim_cfg,args),torch.no_grad():
         'compiled_mujoco_allowed_object_robot_geom_pairs':object_robot_pairs,
         'gpu':torch.cuda.get_device_name(0),'slurm_job_id':os.environ.get('SLURM_JOB_ID'),
         'convex_decomposition':'Newton CoACD; different engine/cooking from frozen PhysX VHACD',
-        'robot_physics':'Author G1/PD unchanged; does not replace trained hands with ULTRA native hands'}
+        'robot_physics':'Author G1/PD unchanged; only original HOI rubber-hand collision hulls added' if args.robot_usd else 'Original author G1/PD with no rubber-hand colliders',
+        'hand_collision_verification':hand_verification,
+        'robot_usd_override_sha256':sha(args.robot_usd) if args.robot_usd else None}
     write('native.json',native)
     lengths=[int(x)-1 for x in motion.clip_len.tolist()]
     max_steps=min(max(lengths),args.gate_steps) if args.gate_steps else max(lengths)
