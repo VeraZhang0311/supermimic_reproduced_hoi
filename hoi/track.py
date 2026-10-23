@@ -1,6 +1,10 @@
 """Sync only curated HOI80 evaluation metrics/configuration; no raw artifacts."""
 from pathlib import Path
-import argparse,json
+import argparse,json,os,time
+os.environ['WANDB_BASE_URL']='https://api.forge.coreweave.com'
+os.environ['WANDB_MODE']='online'
+os.environ['WANDB_DISABLE_CODE']='true'
+os.environ['WANDB_DISABLE_GIT']='true'
 import wandb
 p=argparse.ArgumentParser();p.add_argument('report',type=Path);a=p.parse_args()
 report=json.loads(a.report.read_text());assert report['status']=='completed' and len(report['cases'])==80
@@ -21,8 +25,10 @@ columns=['id','object_asset','supermimic_norm_return','phc_pass','object_pose_pa
 run.summary['hoi80/per_case']=wandb.Table(columns=columns,data=[[c[key] for key in columns] for c in report['cases']])
 run.summary['hoi80/rollouts_saved_on_cluster']=80
 url=run.url;run.finish()
-cloud=wandb.Api(timeout=30).run('tianzizh-university-of-pennsylvania/SuperMimic_Upstream_Reproduction/zeroshot-hoi80-stock14000-20261022')
-assert cloud.summary['hoi80/count']==80
-for key,value in metrics.items():assert abs(float(cloud.summary[key])-float(value))<1e-7
+for attempt in range(10):
+    cloud=wandb.Api(timeout=30).run('tianzizh-university-of-pennsylvania/SuperMimic_Upstream_Reproduction/zeroshot-hoi80-stock14000-20261022')
+    if cloud.summary.get('hoi80/count')==80 and all(abs(float(cloud.summary.get(key,float('nan')))-float(value))<1e-7 for key,value in metrics.items()):break
+    time.sleep(3)
+else:raise RuntimeError('W&B metrics uploaded but cloud readback has not matched yet; preserve evaluation and retry only tracking')
 (a.report.parent/'wandb-readback.json').write_text(json.dumps({'url':url,'cloud_metrics_verified':True,'uploaded_raw_rollouts':False,'uploaded_weights':False},indent=2)+'\n')
 print(json.dumps({'wandb_url':url,'cloud_metrics_verified':True}))

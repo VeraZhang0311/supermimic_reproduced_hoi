@@ -133,7 +133,7 @@ with launch_simulation(sim_cfg,args),torch.no_grad():
     obj.set_masses_index(masses=expected_mass)
     obj.set_coms_index(coms=expected_com)
     obj.set_inertias_index(inertias=expected_inertia)
-    env.sim.backend_manager.add_model_change(ModelFlags.BODY_PROPERTIES)
+    env.sim.backend_manager.add_model_change(ModelFlags.BODY_PROPERTIES | ModelFlags.BODY_INERTIAL_PROPERTIES)
     # Baseline's setup deliberately changes robot/ground only. Set object friction explicitly.
     model=env.sim.backend_manager.get_model()
     material=wp.to_torch(obj._root_view.get_attribute('shape_material_mu',model))
