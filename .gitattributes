@@ -1,2 +1,4 @@
 cluster/*.sh text eol=lf
 cluster/*.py text eol=lf
+hoi/*.py text eol=lf
+hoi/*.sh text eol=lf

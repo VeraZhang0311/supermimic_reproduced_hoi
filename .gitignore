@@ -16,3 +16,11 @@ logs/
 results/analysis/
 # third-party paper
 *.pdf
+# isolated zero-shot runtime and receipts
+/IsaacLab
+/data
+/envs/
+/tools/python-portable
+/provenance/
+/results/hoi80_inputs/
+/results/hoi80_stock14000-*/
