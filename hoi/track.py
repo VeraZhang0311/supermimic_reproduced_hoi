@@ -31,6 +31,8 @@ for key,value in report['paired_comparison']['aggregate_deltas'].items():run.sum
 columns=['id','object_asset','supermimic_norm_return','phc_pass','object_pose_pass','body_and_object_pose_pass','first_supermimic_failure_step','first_phc_failure_reference_s','first_object_failure_reference_s']
 run.summary['hoi80/per_case']=wandb.Table(columns=columns,data=[[c[key] for key in columns] for c in report['cases']])
 run.summary['hoi80/rollouts_saved_on_cluster']=80
+run.summary['evaluation_status']='completed'
+run.summary['slurm/job_id']=report['slurm_job_id']
 url=run.url;run.finish()
 for attempt in range(10):
     cloud=wandb.Api(timeout=30).run('tianzizh-university-of-pennsylvania/SuperMimic_Upstream_Reproduction/'+a.run_id)
