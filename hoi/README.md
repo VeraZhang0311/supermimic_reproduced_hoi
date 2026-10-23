@@ -12,6 +12,8 @@ from the frozen HOI inputs. Newton's CoACD and MuJoCo-Warp replace the previous
 PhysX/VHACD execution, so this is not identical ULTRA benchmark physics.
 Actual object mass, COM, inertia, initial pose, compiled free joints and enabled
 object/robot collision pairs must pass native checks for every asset.
+MuJoCo-Warp collision/constraint capacity flags are checked after every control
+step; an overflow preserves evidence and aborts before publishing evaluation.
 
 Source motions are verified against all 80 hashes. Original 60Hz motions are
 sampled on integer 50Hz ticks without changing their duration. Full references

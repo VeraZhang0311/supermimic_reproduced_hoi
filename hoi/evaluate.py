@@ -194,6 +194,10 @@ with launch_simulation(sim_cfg,args),torch.no_grad():
     first_failure=torch.full((len(cases),),-1,device=dev,dtype=torch.long)
     ret=torch.zeros(len(cases),device=dev)
     alive=torch.ones(len(cases),device=dev,dtype=torch.bool)
+    capacity_mask=int(mujoco_warp.OverflowType.NEFC | mujoco_warp.OverflowType.NJMAX_NNZ |
+        mujoco_warp.OverflowType.BROADPHASE | mujoco_warp.OverflowType.NARROWPHASE |
+        mujoco_warp.OverflowType.CCD | mujoco_warp.OverflowType.HFIELD |
+        mujoco_warp.OverflowType.NVMAX | mujoco_warp.OverflowType.EPA_HORIZON)
     def record_state():
         S=env.state();quat=mat_to_quat(S[1])
         root=torch.cat((S[0],quat[:,[1,2,3,0]],S[2],S[3]),-1)
@@ -215,6 +219,15 @@ with launch_simulation(sim_cfg,args),torch.no_grad():
         action=pi(hist,goal)
         assert torch.isfinite(action).all()
         out=env.step(action)
+        overflow=wp.to_torch(env.sim.backend_manager._solver.mjw_data.overflow)
+        if bool(((overflow&capacity_mask)!=0).any()):
+            write('physics-overflow.json',{'step':step+1,'overflow_flags':overflow.cpu().tolist(),
+                'nconmax':128,'njmax':500,'action':'stop without publishing invalid evaluation metrics'})
+            Sbad=env.state()
+            np.savez_compressed(args.output/'overflow-state.npz',root_p=Sbad[0].cpu().numpy(),
+                q=Sbad[4].cpu().numpy(),action=action.cpu().numpy(),
+                object_pose=obj.data.root_link_pose_w.torch.cpu().numpy())
+            raise RuntimeError('MuJoCo-Warp collision/constraint capacity overflow; physical evidence preserved')
         active=step<torch.tensor(lengths,device=dev)
         ret+=torch.where(alive&active,out['r'],0.)
         new_fail=out['term']&(first_failure<0)&active
