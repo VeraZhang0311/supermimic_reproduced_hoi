@@ -38,3 +38,11 @@ clock; extra evaluations contribute to elapsed training time.
 Checks: `python cluster/test_continuation.py` (CPU); actual GPU restore and replay
 audits are written into the continuation directory. `pipeline.json` marks this
 session's completion independently of the old completed pipeline.
+
+The first continuation allocation1457337 failed before output creation or model
+updates: its validation compared the initial saved arguments to the post-launch
+checkpoint arguments. IsaacLab changes `livestream:-1->0` and adds
+`kit_visualizer=False, enable_cameras=False`. These exact runtime display-only
+changes are now allowlisted and recorded; every other argument difference still
+fails validation. Original failure logs and the first adapter are archived in
+`provenance/continuation-failed-1457337`.

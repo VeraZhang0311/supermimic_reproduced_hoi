@@ -113,6 +113,15 @@ iterations = list(range(start_it, args.iterations))
         actual = vars(parser.parse_args(continue_pipeline.training_arguments(manifest)))
         self.assertEqual(actual, {k: params[k] for k in actual})
 
+    def test_checkpoint_launcher_changes_allowlisted_but_science_change_rejected(self):
+        before = {'lr': .0002, 'num_envs': 4096, 'livestream': -1}
+        after = dict(before, livestream=0, kit_visualizer=False, enable_cameras=False)
+        self.assertEqual(set(continue_pipeline.validate_saved_arguments(before, after)),
+                         {'livestream', 'kit_visualizer', 'enable_cameras'})
+        after['lr'] = .0001
+        with self.assertRaises(AssertionError):
+            continue_pipeline.validate_saved_arguments(before, after)
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

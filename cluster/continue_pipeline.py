@@ -45,6 +45,19 @@ def training_arguments(manifest):
     return argv + ['--log_dir', str(RUN)]
 
 
+def validate_saved_arguments(initial, checkpoint):
+    # IsaacLab's launcher mutates only these display flags after args.json was
+    # written. They are not training parameters. Fail on any other difference.
+    allowed = {'livestream': [-1, 0], 'kit_visualizer': [None, False],
+               'enable_cameras': [None, False]}
+    differences = {key: [initial.get(key), checkpoint.get(key)]
+                   for key in set(initial) | set(checkpoint)
+                   if initial.get(key) != checkpoint.get(key)}
+    for key, values in differences.items():
+        assert key in allowed and values == allowed[key], (key, values)
+    return differences
+
+
 def prepare():
     import torch
     assert not RUN.exists(), 'Continuation directory exists; inspect before retrying'
@@ -65,7 +78,7 @@ def prepare():
             for v in value: scan(v)
     scan(checkpoint)
     args = json.loads((ORIGINAL / 'args.json').read_text())
-    assert args == checkpoint['args']
+    launcher_changes = validate_saved_arguments(args, checkpoint['args'])
     manifest = json.loads((ORIGINAL / 'manifest.json').read_text())
     for relative, digest in manifest['source_sha256'].items():
         assert sha(ROOT / relative) == digest, relative
@@ -79,6 +92,7 @@ def prepare():
     SNAPSHOT.chmod(0o444)
     manifest.update(stage='continuation', created_utc=stamp(), original_manifest_sha256=sha(ORIGINAL / 'manifest.json'),
         effective_parameters=effective_args(args), resume_limitations=LIMITATIONS,
+        original_runtime_launcher_arg_changes=launcher_changes,
         continuation={'start_iteration': START, 'stop_iteration': END, 'extra_iterations': END - START,
             'evaluation_interval': EVERY, 'evaluation_clips': 40, 'wandb_run_id': RUN_ID,
             'checkpoint_sha256': EXPECTED_SHA, 'original_run_directory': str(ORIGINAL),
