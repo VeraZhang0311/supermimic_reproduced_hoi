@@ -13,6 +13,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
 
 from isaaclab.app import add_launcher_args, launch_simulation
+from supermimic.physics import add_physics_arguments, resolve_arguments, validate_resume
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--num_envs", type=int, default=4096)
@@ -43,11 +44,22 @@ parser.add_argument("--log_dir", type=str, default=os.path.join(REPO, "logs", "r
 parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--resume", type=str, default=None)
 parser.add_argument("--amp", type=str, default="bf16", choices=["none", "bf16"], help="autocast dtype for MLP matmuls")
+add_physics_arguments(parser)
 add_launcher_args(parser)
 args = parser.parse_args()
 
 import torch
 import torch.nn as nn
+
+resume_checkpoint = torch.load(args.resume, map_location='cpu', weights_only=False) if args.resume else None
+physics_settings, physics_explicit = resolve_arguments(
+    args, resume_checkpoint['args'] if resume_checkpoint else None,
+    require_legacy_explicit=bool(args.resume))
+if resume_checkpoint:
+    validate_resume(resume_checkpoint['args'], physics_settings, physics_explicit)
+if any(os.path.exists(os.path.join(args.log_dir, name)) for name in ('args.json', 'train_log.csv', 'last.pt')):
+    raise FileExistsError('Preserve existing results: choose a new --log_dir, including for checkpoint continuation.')
+os.environ['SUPERMIMIC_ASSET_DIR'] = os.path.join(args.log_dir, 'robot_assets')
 
 from supermimic.buffer import ReplayBuffer
 from supermimic.env import TrackingSim, make_sim
@@ -63,7 +75,7 @@ torch.backends.cudnn.allow_tf32 = True
 torch.manual_seed(args.seed)
 networks.AMP_DTYPE = torch.bfloat16 if args.amp == "bf16" else None
 dev = "cuda:0"
-os.makedirs(args.log_dir, exist_ok=True)
+os.makedirs(args.log_dir, exist_ok=False)
 json.dump(vars(args), open(os.path.join(args.log_dir, "args.json"), "w"), indent=2)
 
 kin = G1Kinematics(dev)
@@ -81,10 +93,11 @@ opt_pi = torch.optim.Adam(pi.parameters(), lr=args.lr, betas=(0.9, 0.95))
 opt_v = torch.optim.Adam(critic.parameters(), lr=args.lr)
 start_it, wall_offset, sim_steps = 0, 0.0, 0
 if args.resume:
-    ck = torch.load(args.resume, map_location=dev)
+    ck = resume_checkpoint
     wm.load_state_dict(ck["wm"]), pi.load_state_dict(ck["pi"]), critic.load_state_dict(ck["critic"])
     opt_wm.load_state_dict(ck["opt_wm"]), opt_pi.load_state_dict(ck["opt_pi"]), opt_v.load_state_dict(ck["opt_v"])
     start_it, wall_offset, sim_steps = ck["iteration"], ck["wall_time"], ck["sim_steps"]
+    del ck, resume_checkpoint
 
 
 # per-component floors on the error normalization (pos, rot, lin vel, ang vel, q, qd increments)
@@ -260,6 +273,7 @@ def policy_update():
 sim_cfg = make_sim(dev, args)
 with launch_simulation(sim_cfg, args):
     env = TrackingSim(sim_cfg, args.num_envs, motion, mdp, gamma=args.gamma)
+    json.dump(env.physics_settings, open(os.path.join(args.log_dir, 'physics.json'), 'w'), indent=2)
     buffer = ReplayBuffer(args.buffer_steps, args.num_envs, dev)
     obs_hist = torch.zeros(args.num_envs, Hh, OBS_DIM, device=dev)
 
@@ -290,10 +304,10 @@ with launch_simulation(sim_cfg, args):
                 stats["done"].append(out["done"].float().sum())
 
     stats = {"r": [], "ep_len": [], "ep_ret": [], "term": [], "done": []}
-    if start_it == 0:
+    if start_it == 0 or bool(args.resume):
         collect(args.warmup_steps, stats)
     log_f = open(os.path.join(args.log_dir, "train_log.csv"), "a")
-    if start_it == 0:
+    if log_f.tell() == 0:
         log_f.write("iteration,wall_h,sim_steps,wm_loss,wm_err8,pi_loss,v_loss,imag_rew,pi_gradnorm,imag_survival,sim_rew,ep_len,ep_ret_norm,term_frac,it_per_s,lr\n")
     t_start = time.time() - wall_offset
     t_log = time.time()

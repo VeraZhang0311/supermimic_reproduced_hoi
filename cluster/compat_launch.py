@@ -7,7 +7,7 @@ import os
 import runpy
 import sys
 
-ROOT=Path('/mnt/projects/ll/tianzizh/supermimic_reproduced_hoi')
+ROOT=Path(__file__).resolve().parents[1]
 
 def install_graph_compatibility(mujoco_warp, supported):
     """Only select MuJoCo-Warp's graph scheduling path; solver settings stay intact."""
@@ -25,6 +25,7 @@ def install_graph_compatibility(mujoco_warp, supported):
             'solver_iterations':int(model.opt.iterations),'line_search_iterations':int(model.opt.ls_iterations),
             'reason':'MuJoCo-Warp supported nonconditional scheduling fallback for driver CUDA<12.4' if not supported else 'Driver supports original graph configuration'}
         path=ROOT/'provenance'/f"graph-compat-{os.environ.get('SLURM_JOB_ID','local')}-{os.getpid()}.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(receipt,indent=2)+'\n')
         print('[GRASP compatibility] '+json.dumps(receipt),flush=True)
         return model

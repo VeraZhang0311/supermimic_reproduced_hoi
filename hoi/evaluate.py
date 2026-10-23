@@ -13,6 +13,7 @@ import time
 
 REPO=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(REPO))
+from supermimic.physics import add_physics_arguments, resolve_arguments, compiled_self_collision_audit
 from isaaclab.app import add_launcher_args, launch_simulation
 p=argparse.ArgumentParser(description=__doc__)
 p.add_argument('--prepared',type=Path,required=True)
@@ -21,8 +22,14 @@ p.add_argument('--asset',required=True)
 p.add_argument('--output',type=Path,required=True)
 p.add_argument('--gate-steps',type=int,default=0)
 p.add_argument('--robot-usd',type=Path,default=None,help='Independent hand-collision overlay; original robot otherwise')
+add_physics_arguments(p)
 add_launcher_args(p)
 args=p.parse_args()
+physics_settings, _ = resolve_arguments(args)
+if args.robot_usd and not physics_settings.hand_collision:
+    p.error('--robot-usd requires --hand-collision')
+if physics_settings.hand_collision and args.robot_usd is None:
+    p.error('Use python -m hoi.run to prepare and verify hand assets before evaluation')
 args.output.mkdir(parents=True,exist_ok=False)
 
 import numpy as np
@@ -60,7 +67,8 @@ manifest=json.loads((args.prepared/'manifest.json').read_text())
 asset=manifest['assets'][args.asset]
 cases=[case for case in manifest['cases'] if case['object_asset']==args.asset]
 meta=asset['metadata']
-assert cases and OBS_DIM==99 and G1_CFG.spawn.articulation_props.enabled_self_collisions is False
+assert cases and OBS_DIM==99
+assert G1_CFG.spawn.articulation_props.enabled_self_collisions is physics_settings.self_collision
 assert list(G1_JOINT_NAMES)==manifest['robot_joint_names']==meta['dof_names']
 assert sha(asset['usd'])==asset['usd_sha256']
 checkpoint_hash=sha(args.checkpoint)
@@ -126,7 +134,7 @@ mdp=MDP(kin,motion,torch.tensor(default_joint_pos_list(),device=dev))
 refs=[torch.tensor(np.load(args.prepared/'references'/f"{c['id']}.npz")['reference'],device=dev) for c in cases]
 fk=UltraKinematics(args.prepared/'metadata/ultra_g1.urdf',meta['body_names'],meta['dof_names'],dev)
 ck=torch.load(args.checkpoint,map_location=dev,weights_only=False)
-assert ck['iteration']==14000
+checkpoint_iteration=int(ck['iteration'])
 K,Hh=ck['args']['goal_frames'],ck['args']['hist']
 assert K==10 and Hh==10
 networks.AMP_DTYPE=torch.bfloat16 if ck['args'].get('amp')=='bf16' else None
@@ -187,17 +195,19 @@ with launch_simulation(sim_cfg,args),torch.no_grad():
             masks=(int(mj.geom_contype[g1])&int(mj.geom_conaffinity[g2]))|(int(mj.geom_contype[g2])&int(mj.geom_conaffinity[g1]))
             if signature not in excluded and masks:object_robot_pairs+=1
     assert object_robot_pairs>0,'Compiled MuJoCo object/robot collision pairs disabled'
-    hand_verification=compiled_audit(mj,enabled=bool(args.robot_usd))
+    hand_verification=compiled_audit(mj,enabled=physics_settings.hand_collision)
+    self_verification=compiled_self_collision_audit(mj, physics_settings.self_collision)
     native={'object_asset':args.asset,'body_count':obj.num_bodies,'colliders':colliders,
         'object_mass_max_abs_error':mass_error,'object_com_max_abs_error':com_error,
         'object_inertia_max_abs_error':inertia_error,'virtual39_vs_physical14_fk_error_m':fk_error,
         'physical_objects':True,'object_friction':.6,'policy_observation_dim':99,'goal_dim':730,
-        'object_observation_channels':0,'robot_self_collision':False,
+        'object_observation_channels':0,'robot_self_collision':physics_settings.self_collision,
+        'physics':env.physics_settings, 'self_collision_verification':self_verification,
         'compiled_mujoco_dynamic_object_bodies':len(object_bodies),
         'compiled_mujoco_allowed_object_robot_geom_pairs':object_robot_pairs,
         'gpu':torch.cuda.get_device_name(0),'slurm_job_id':os.environ.get('SLURM_JOB_ID'),
         'convex_decomposition':'Newton CoACD; different engine/cooking from frozen PhysX VHACD',
-        'robot_physics':'Author G1/PD unchanged; only original HOI rubber-hand collision hulls added' if args.robot_usd else 'Original author G1/PD with no rubber-hand colliders',
+        'robot_physics':'Original G1/PD and existing colliders retained; hand/body self-collision settings recorded in physics',
         'hand_collision_verification':hand_verification,
         'robot_usd_override_sha256':sha(args.robot_usd) if args.robot_usd else None}
     write('native.json',native)
@@ -274,7 +284,8 @@ with launch_simulation(sim_cfg,args),torch.no_grad():
             'rollout':target.name,'rollout_sha256':sha(target),**metric})
     assert sha(args.checkpoint)==checkpoint_hash
     write('evaluation.json',{'protocol':manifest['protocol'],'checkpoint':str(args.checkpoint),
-        'checkpoint_iteration':14000,'checkpoint_sha256':checkpoint_hash,'case_count':len(results),
+        'checkpoint_iteration':checkpoint_iteration,'checkpoint_sha256':checkpoint_hash,'case_count':len(results),
+        'physics':{'hand_collision':physics_settings.hand_collision,'self_collision':physics_settings.self_collision},
         'gate_only':bool(args.gate_steps),'optimizer_updates':0,'normalization_updates':0,
         'no_failure_reset':True,'physical_objects':True,'object_observation_channels':0,
         'action_timing':'action/obs/goal[t] acts on state[t] to produce state[t+1]; states and reference have T+1 frames',

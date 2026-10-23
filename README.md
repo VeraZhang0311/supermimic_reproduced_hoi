@@ -1,5 +1,12 @@
 # SuperMimic reproduction on Isaac Lab 3 (kit-less, MuJoCo-Warp)
 
+## 当前开发入口
+
+统一使用本仓库的 `hoi/zero_shot` 分支。新实验默认开启橡胶手碰撞体和身体自碰撞；
+用 `--no-self-collision` 关闭身体自碰撞，用 `--no-hand-collision` 复核旧物理配置。
+完整入口、参数、历史结果边界和视频命令见 [DEVELOPMENT.md](DEVELOPMENT.md)。
+以下上游复现说明中的历史成绩对应其原始配置，不代表新的默认碰撞组合。
+
 **Unofficial** reproduction of *SuperMimic: Scaling Humanoid Whole-Body Control with One Differentiable World
 Model* (arXiv 2610.28480) — no official code is released, so everything here is implemented from
 the paper. Target experiment: the controlled LAFAN1 comparison (Fig. 4a): 40 G1-retargeted LAFAN1

@@ -24,18 +24,19 @@ def sha(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
-def original_definition(path):
+def original_definition(path, require_collision=True):
     root = ET.parse(path).getroot()
     out = {}
     for side in HAND_SHA:
         name = side + '_rubber_hand'
         link = root.find(f"link[@name='{name}']")
         collision = link.findall('collision')
-        assert len(collision) == 1
-        mesh = collision[0].find('geometry/mesh')
+        assert (len(collision) == 1 if require_collision else len(collision) in (0, 1))
+        geometry = collision[0] if collision else link.find('visual')
+        mesh = geometry.find('geometry/mesh')
         assert Path(mesh.get('filename')).name == name + '.STL'
         assert [float(x) for x in mesh.get('scale', '1 1 1').split()] == [1., 1., 1.]
-        origin = collision[0].find('origin')
+        origin = geometry.find('origin')
         assert [float(x) for x in origin.get('xyz', '0 0 0').split()] == [0., 0., 0.]
         assert [float(x) for x in origin.get('rpy', '0 0 0').split()] == [0., 0., 0.]
         joint = next(j for j in root.findall('joint') if j.find('child').get('link') == name)
@@ -59,14 +60,15 @@ def stage_snapshot(stage):
         for p in Usd.PrimRange(stage.GetPseudoRoot(), Usd.TraverseInstanceProxies())}
 
 
-def prepare(root, output, original_urdf):
+def prepare(root, output, original_urdf=None):
     # CoACD/trimesh followed by pxr.Tf segfaults in this pinned runtime. Keep the
     # mesh cooker in a child interpreter; USD authoring never loads those libs.
     from pxr import Usd, UsdGeom, UsdPhysics, Sdf, Gf
     import numpy as np
     root, output = Path(root), Path(output)
     output.mkdir(exist_ok=False)
-    definitions = original_definition(original_urdf)
+    definition_source = original_urdf or root / 'data/g1_description/g1_29dof_rev_1_0.urdf'
+    definitions = original_definition(definition_source, require_collision=original_urdf is not None)
     source = root / 'data/g1_usd/g1_29dof/g1_29dof.usda'
     src = Usd.Stage.Open(str(source))
     session = Sdf.Layer.CreateAnonymous()
@@ -120,7 +122,8 @@ def prepare(root, output, original_urdf):
     assert all('HOIRubberCollision' in p for p in added)
     layer.Save()
     report = {'source_usd': str(source.resolve()), 'source_usd_sha256': sha(source),
-        'original_hoi_urdf_sha256': sha(original_urdf), 'recipe': RECIPE,
+        'original_hoi_urdf_sha256': sha(original_urdf) if original_urdf else None,
+        'hand_definition_sha256': sha(definition_source), 'recipe': RECIPE,
         'cooker': 'CoACD', 'cooker_and_usd_imports_isolated':True, 'limitations': LIMITATION, 'hands': hand_info,
         'original_authored_values_unchanged': True, 'added_collider_count': len(added),
         'usd': str(target), 'usd_sha256': sha(target)}

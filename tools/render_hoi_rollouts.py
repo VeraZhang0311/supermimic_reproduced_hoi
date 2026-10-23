@@ -11,7 +11,7 @@ import subprocess
 import time
 import xml.etree.ElementTree as ET
 
-os.environ['MUJOCO_GL'] = 'glfw'
+os.environ.setdefault('MUJOCO_GL', 'glfw' if os.name == 'nt' else 'egl')
 import mujoco
 import numpy as np
 import imageio_ffmpeg
@@ -30,7 +30,12 @@ def dump(path, value):
 
 @functools.lru_cache(None)
 def font(size):
-    return ImageFont.truetype('C:/Windows/Fonts/arial.ttf', size)
+    for name in ('C:/Windows/Fonts/arial.ttf', '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf', 'DejaVuSans.ttf'):
+        try:
+            return ImageFont.truetype(name, size)
+        except OSError:
+            pass
+    return ImageFont.load_default(size=size)
 
 def object_mesh(source, destination):
     """Strict reader for the identity-transform flattened mesh snapshots in this run."""
@@ -168,7 +173,7 @@ def render_frame(renderer, model, data, maps, d, t, camera, case):
     result = Image.fromarray(renderer.render())
     draw = ImageDraw.Draw(result)
     draw.rectangle((0, 0, W, 86), fill=(245, 248, 252))
-    draw.text((22, 9), f'HOI zero-shot  |  {case["id"]}  |  rubber-hand collisions ON  |  checkpoint 14000', font=font(23), fill=(29, 43, 65))
+    draw.text((22, 9), f'HOI zero-shot | {case["id"]} | hands {case["_hands"]} / self {case["_self"]} | checkpoint {case["_iteration"]}', font=font(23), fill=(29, 43, 65))
     draw.rectangle((22, 51, 38, 67), fill=(95, 98, 103))
     draw.text((47, 46), 'ACTUAL', font=font(19), fill=(45, 52, 64))
     draw.rectangle((170, 51, 186, 67), fill=(45, 133, 255))
@@ -192,7 +197,7 @@ def gallery(out, clips):
     cards = []
     for c in clips:
         cards.append(f'<article><h2>{html.escape(c["id"])}</h2><video controls preload="none" poster="{c["preview"]}" src="{c["file"]}"></video><p>{c["frames"]} frames · {c["seconds"]:.2f}s · return {c["return"]:.4f} · PHC {"pass" if c["phc_pass"] else "fail"} · object {"pass" if c["object_pose_pass"] else "fail"}</p></article>')
-    (out/'index.html').write_text('<!doctype html><meta charset="utf-8"><title>HOI20 rubber-hand collision rollouts</title><style>body{font:16px system-ui;background:#eef2f7;color:#203049;margin:32px}main{display:grid;grid-template-columns:repeat(auto-fit,minmax(480px,1fr));gap:24px}article{background:white;padding:18px;border-radius:14px}video{width:100%}h1{margin-bottom:8px}p{color:#53637a}a{color:#1768cf}</style><h1>HOI20 · rubber-hand collisions ON · checkpoint 14000</h1><p>四类物体各5条：080 / 084 / 089 / 094 / 099。灰色机器人和橙色物体为实际轨迹；半透明蓝色为reference。共享世界坐标，完整50fps轨迹。</p><p><a href="all20.mp4">播放全部20条合集</a> · <a href="rendering.json">渲染记录与校验</a></p><main>' + ''.join(cards) + '</main>', encoding='utf-8')
+    (out/'index.html').write_text('<!doctype html><meta charset="utf-8"><title>HOI recorded rollouts</title><style>body{font:16px system-ui;background:#eef2f7;color:#203049;margin:32px}main{display:grid;grid-template-columns:repeat(auto-fit,minmax(480px,1fr));gap:24px}article{background:white;padding:18px;border-radius:14px}video{width:100%}h1{margin-bottom:8px}p{color:#53637a}a{color:#1768cf}</style><h1>HOI recorded rollout comparison</h1><p>四类物体各5条：080 / 084 / 089 / 094 / 099。灰色机器人和橙色物体为实际轨迹；半透明蓝色为reference。共享世界坐标，完整50fps轨迹。</p><p><a href="all20.mp4">播放全部20条合集</a> · <a href="rendering.json">渲染记录与校验</a></p><main>' + ''.join(cards) + '</main>', encoding='utf-8')
 
 def main():
     parser = argparse.ArgumentParser()
@@ -202,10 +207,13 @@ def main():
     parser.add_argument('--preview-only', action='store_true')
     args = parser.parse_args()
     out = args.output
-    out.mkdir(parents=True, exist_ok=True)
+    out.mkdir(parents=True, exist_ok=False)
     (out/'assets').mkdir(exist_ok=True)
     report = json.loads((args.input/'evaluation.json').read_text())
     selection = [next(c for c in report['cases'] if c['id'] == f'{kind}_{i:03d}') for kind in KINDS for i in IDS]
+    physics = report.get('physics', {'hand_collision': report.get('hand_collision_comparison', False), 'self_collision': False})
+    for case in selection:
+        case.update(_iteration=report['checkpoint_iteration'], _hands='ON' if physics['hand_collision'] else 'OFF', _self='ON' if physics['self_collision'] else 'OFF')
     dump(out/'selection.json', {'input': str(args.input), 'input_evaluation_sha256': sha(args.input/'evaluation.json'), 'checkpoint_sha256': report['checkpoint_sha256'], 'selection_rule': 'Uniformly spaced IDs over 080..099, one endpoint-inclusive five-point set per object type; no performance-based selection.', 'cases': selection})
     ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
     urdf = args.assets/'g1_29dof_rev_1_0.urdf'
@@ -276,7 +284,7 @@ def main():
         with Image.open(out/c['preview']) as img:
             contact.paste(img.resize((320, 180)), ((i//5)*320, (i%5)*180))
     contact.save(out/'contact_sheet.jpg', quality=94)
-    result = {'status': 'rendered_and_fully_decode_verified', 'checkpoint_iteration': 14000, 'checkpoint_sha256': report['checkpoint_sha256'], 'evaluation_job': report['slurm_job_id'], 'renderer_version': mujoco.__version__, 'script_sha256': sha(__file__), 'robot_urdf_sha256': sha(urdf), 'selection': [c['id'] for c in clips], 'reference_rgba': [0.08, .43, 1, .35], 'actual_robot': 'original URDF visual colors', 'actual_object': 'solid orange', 'coordinates': 'Shared original world coordinates; fixed common camera per entire clip; no independent alignment or normalization.', 'state_source': 'Actual: saved physical_body_pose (xyzw). Reference: saved reference columns 84:201/201:357 in saved body_names order (xyzw). Object: saved object_state / reference 71:78. Quaternion conversion only.', 'replay': 'Mocap visual bodies; mj_kinematics only; no mj_step, policy inference or optimization. All T+1 state frames retained at 50fps.', 'object_meshes': assets, 'clips': clips, 'all20': {'file': montage.name, 'decoded_frames': decoded, 'seconds': total_frames/FPS, 'sha256': sha(montage)}}
+    result = {'status': 'rendered_and_fully_decode_verified', 'checkpoint_iteration': report['checkpoint_iteration'], 'physics': physics, 'checkpoint_sha256': report['checkpoint_sha256'], 'evaluation_job': report['slurm_job_id'], 'renderer_version': mujoco.__version__, 'script_sha256': sha(__file__), 'robot_urdf_sha256': sha(urdf), 'selection': [c['id'] for c in clips], 'reference_rgba': [0.08, .43, 1, .35], 'actual_robot': 'original URDF visual colors', 'actual_object': 'solid orange', 'coordinates': 'Shared original world coordinates; fixed common camera per entire clip; no independent alignment or normalization.', 'state_source': 'Actual: saved physical_body_pose (xyzw). Reference: saved reference columns 84:201/201:357 in saved body_names order (xyzw). Object: saved object_state / reference 71:78. Quaternion conversion only.', 'replay': 'Mocap visual bodies; mj_kinematics only; no mj_step, policy inference or optimization. All T+1 state frames retained at 50fps.', 'object_meshes': assets, 'clips': clips, 'all20': {'file': montage.name, 'decoded_frames': decoded, 'seconds': total_frames/FPS, 'sha256': sha(montage)}}
     result['render_quality'] = {'width': W, 'height': H, 'samples': 1, 'shadows': False, 'floor_reflections': False, 'reason': 'Visual-only optimization for local Intel Arc rendering; exact meshes and all recorded frames retained.'}
     dump(out/'rendering.json', result)
     gallery(out, clips)

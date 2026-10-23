@@ -1,3 +1,5 @@
+> Historical hands-ON/self-OFF comparison. New unified defaults and commands: [DEVELOPMENT.md](../DEVELOPMENT.md).
+
 # HOI80 paired rubber-hand collision comparison
 
 Parent baseline: `hoi/zero_shot` at65a3b2a, job1457069. Keep its original output

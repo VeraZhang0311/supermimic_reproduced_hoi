@@ -19,6 +19,7 @@ import time
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
 from isaaclab.app import add_launcher_args, launch_simulation
+from supermimic.physics import add_physics_arguments, resolve_arguments
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--run_dir", type=str, required=True)
@@ -27,8 +28,16 @@ parser.add_argument("--ckpt", type=str, default=None, help="evaluate one checkpo
 parser.add_argument("--record", type=str, default=None, help="save trajectories (npz) for rendering")
 parser.add_argument("--motion_dir", type=str, default=os.path.join(REPO, "data", "lafan1_g1"))
 parser.add_argument("--every", type=int, default=1, help="evaluate every n-th checkpoint")
+add_physics_arguments(parser)
 add_launcher_args(parser)
 args = parser.parse_args()
+saved_args_path = os.path.join(args.run_dir, 'args.json')
+saved_args = json.load(open(saved_args_path)) if os.path.exists(saved_args_path) else {}
+physics_settings, physics_explicit = resolve_arguments(args, saved_args, require_legacy_explicit=True)
+if args.watch and any(saved_args.get(key, getattr(args, key)) != getattr(args, key)
+                      for key in ('hand_collision', 'self_collision')):
+    raise ValueError('Watcher collision settings must match the run; use a separate output for comparisons.')
+os.environ['SUPERMIMIC_ASSET_DIR'] = os.path.join(args.run_dir, 'eval_robot_assets')
 
 import numpy as np
 import torch
@@ -88,6 +97,7 @@ def evaluate(env: TrackingSim, ck: dict, record: str | None = None) -> dict:
         "n_failed": int(env.failed_eval.sum().item()),
         "failed": [motion.names[i] for i in env.failed_eval.nonzero().flatten().tolist()],
         "per_clip": {motion.names[i]: round(norm[i].item(), 4) for i in range(C)},
+        "physics": env.physics_settings,
     }
     if record:
         np.savez_compressed(record, names=np.array(motion.names), **{k: torch.stack(v).numpy() for k, v in traj.items()},

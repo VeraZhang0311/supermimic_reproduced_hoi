@@ -2,16 +2,22 @@
 from pathlib import Path
 import copy
 import unittest
+import tempfile
 from hoi.hand_collision import original_definition, assert_same_physics, ORIGIN, RECIPE
 
 
 class HandCollisionTests(unittest.TestCase):
     def test_frozen_original_hoi_hand_definition(self):
-        root=Path(__file__).resolve().parents[1]
-        urdf=root/'results/hoi80_inputs/metadata/ultra_g1.urdf'
-        if not urdf.exists():
-            urdf=Path('D:/supermimic_reproduced_hoi/results/hoi80_stock14000-1457069/rendering_metadata/ultra_g1.urdf')
-        definition=original_definition(urdf)
+        xml='<robot name="G1">'
+        for side,y in [('left',.003),('right',-.003)]:
+            xml+=f'''<link name="{side}_rubber_hand"><collision><origin xyz="0 0 0" rpy="0 0 0"/>
+            <geometry><mesh filename="meshes/{side}_rubber_hand.STL"/></geometry></collision></link>
+            <joint name="{side}_mount" type="fixed"><parent link="{side}_wrist_yaw_link"/>
+            <child link="{side}_rubber_hand"/><origin xyz=".0415 {y} 0" rpy="0 0 0"/></joint>'''
+        xml+='</robot>'
+        with tempfile.TemporaryDirectory() as tmp:
+            urdf=Path(tmp)/'g1.urdf';urdf.write_text(xml)
+            definition=original_definition(urdf)
         for side in ('left','right'):
             self.assertEqual(definition[side]['fixed_joint_origin'],ORIGIN[side])
             self.assertEqual(definition[side]['collision_origin'],[0.,0.,0.])

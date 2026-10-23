@@ -24,3 +24,11 @@ results/analysis/
 /provenance/
 /results/hoi80_inputs/
 /results/hoi80_stock14000-*/
+
+# Private runtime receipts and derived local experiment deliveries
+/tmp/
+/results/eval_*/
+/results/hoi80_*/
+/results/paired-case-comparison-*.json
+/results/hoi80_*.tar.gz
+/results/*-delivery-package.json

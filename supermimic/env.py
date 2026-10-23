@@ -24,6 +24,7 @@ from .mdp import MAX_STEP_REWARD, MDP, flatten_state
 from .motion import CONTROL_DT, MotionLib
 from .robot import G1_CFG, G1_JOINT_NAMES, action_scale
 from .rotations import mat_to_quat, quat_to_mat, so3_exp
+from .physics import configure_robot
 
 
 @configclass
@@ -50,7 +51,9 @@ class TrackingSim:
                  max_episode_steps: int = 500, reset_noise: bool = True):
         self.device = sim_cfg.device
         self.sim = SimulationContext(sim_cfg)
-        self.scene = instantiate(TrackingSceneCfg(num_envs=num_envs, env_spacing=0.0, replicate_physics=True))
+        scene_config = TrackingSceneCfg(num_envs=num_envs, env_spacing=0.0, replicate_physics=True)
+        self.physics_settings = configure_robot(scene_config.robot)
+        self.scene = instantiate(scene_config)
         self.sim.reset()
         self.robot = self.scene["robot"]
         assert list(self.robot.joint_names) == G1_JOINT_NAMES, self.robot.joint_names
