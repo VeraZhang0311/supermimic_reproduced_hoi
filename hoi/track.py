@@ -11,6 +11,9 @@ p.add_argument('--run-id',required=True);a=p.parse_args()
 report=json.loads(a.report.read_text());assert report['status']=='completed' and len(report['cases'])==80
 assert report['hand_collision_comparison'] and a.run_id==report['wandb_run_id']
 assert a.run_id!='zeroshot-hoi80-stock14000-20261022'
+gate=json.loads((a.report.parent/'hand-gate-passed.json').read_text())
+assert gate['same_robot_mass_inertia_joints']
+assert all(gate['on']['hands'][s]['cpu_probe_contacts'] for s in ('left','right'))
 run=wandb.init(entity='tianzizh-university-of-pennsylvania',project='SuperMimic_Upstream_Reproduction',
     id=a.run_id,name='ZeroShot-HOI80-stock14000-rubber-hand-collision',
     job_type='evaluation',resume='allow',save_code=False,
@@ -33,6 +36,7 @@ run.summary['hoi80/per_case']=wandb.Table(columns=columns,data=[[c[key] for key 
 run.summary['hoi80/rollouts_saved_on_cluster']=80
 run.summary['evaluation_status']='completed'
 run.summary['slurm/job_id']=report['slurm_job_id']
+run.summary['gpu_hand_contact_gate_passed']=True
 url=run.url;run.finish()
 for attempt in range(10):
     cloud=wandb.Api(timeout=30).run('tianzizh-university-of-pennsylvania/SuperMimic_Upstream_Reproduction/'+a.run_id)
