@@ -7,10 +7,12 @@ velocity of the pelvis link frame, joint positions and velocities.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import torch
 
-from .kinematics import G1Kinematics
+if TYPE_CHECKING:
+    from .kinematics import G1Kinematics
 from .motion import CONTROL_DT, MotionLib
 from .rotations import mat_to_6d, quat_to_mat, mat_to_quat, rot_angle_sq, yaw_mat
 

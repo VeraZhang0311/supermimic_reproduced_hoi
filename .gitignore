@@ -32,3 +32,6 @@ results/analysis/
 /results/paired-case-comparison-*.json
 /results/hoi80_*.tar.gz
 /results/*-delivery-package.json
+
+# HOI's Python data adapter is source code, not the generated root data/ tree.
+!/hoi/data/

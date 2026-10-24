@@ -1,0 +1,15 @@
+{
+  "num_envs": 8,
+  "iterations": 2,
+  "buffer_steps": 96,
+  "warmup_steps": 64,
+  "wm_batches": 1,
+  "wm_batch": 8,
+  "pi_batch": 8,
+  "critic_epochs": 1,
+  "critic_minibatches": 1,
+  "ckpt_every": 1,
+  "log_every": 1,
+  "gate_every": 1,
+  "experiment_kind": "smoke"
+}

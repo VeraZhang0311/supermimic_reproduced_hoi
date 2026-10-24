@@ -48,10 +48,10 @@ class TrackingSim:
     """
 
     def __init__(self, sim_cfg, num_envs: int, motion: MotionLib, mdp: MDP, gamma: float = 0.99, eval_mode: bool = False,
-                 max_episode_steps: int = 500, reset_noise: bool = True):
+                 max_episode_steps: int = 500, reset_noise: bool = True, *, scene_factory=None):
         self.device = sim_cfg.device
         self.sim = SimulationContext(sim_cfg)
-        scene_config = TrackingSceneCfg(num_envs=num_envs, env_spacing=0.0, replicate_physics=True)
+        scene_config = (scene_factory or TrackingSceneCfg)(num_envs=num_envs, env_spacing=0.0, replicate_physics=True)
         self.physics_settings = configure_robot(scene_config.robot)
         self.scene = instantiate(scene_config)
         self.sim.reset()

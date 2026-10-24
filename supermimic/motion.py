@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import glob
 import os
+from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
 
-from .kinematics import G1Kinematics
+if TYPE_CHECKING:
+    from .kinematics import G1Kinematics
 from .rotations import mat_to_6d, quat_slerp, quat_to_mat, so3_log, yaw_mat
 
 CONTROL_DT = 0.02

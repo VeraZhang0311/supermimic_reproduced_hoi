@@ -11,13 +11,14 @@ import mujoco
 import numpy as np
 import torch
 
-from .robot import G1_JOINT_NAMES, MJCF_PATH, TRACKED_BODIES
+from .robot_metadata import G1_JOINT_NAMES, MJCF_PATH, TRACKED_BODIES
 from .rotations import axis_angle_to_mat, quat_to_mat
 
 
 class G1Kinematics:
-    def __init__(self, device: str, tracked: list[str] = TRACKED_BODIES):
-        m = mujoco.MjModel.from_xml_path(MJCF_PATH)
+    def __init__(self, device: str, tracked: list[str] = TRACKED_BODIES, *, mjcf_path: str | None = None):
+        self.mjcf_path = str(mjcf_path or MJCF_PATH)
+        m = mujoco.MjModel.from_xml_path(self.mjcf_path)
         self.device = device
         jname_to_idx = {n: i for i, n in enumerate(G1_JOINT_NAMES)}
         # moving bodies in tree order (mujoco orders parents before children)

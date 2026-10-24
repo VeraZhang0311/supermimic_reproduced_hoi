@@ -7,3 +7,8 @@ See [DEVELOPMENT.md](../DEVELOPMENT.md) for full commands, immutable outputs, ch
 Frozen policy inputs remain 99 proprioceptive channels and a 730-dimensional human reference goal.
 Physical objects remain active; no object channels enter the actor. All80 full-duration rollouts are saved without failure resets.
 Every result records requested physics and native compiled collision verification. New defaults constitute a new physics combination, not an existing experiment result.
+
+HOI v1's separate CPU data preparation lives in [data/README.md](data/README.md).
+Use `python -m hoi.data.prepare` for manifests and 60-to-50 Hz reference audits; this does not start training or change this zero-shot entry point.
+
+The additive full-reference HOI implementation has separate [v1 entry points](v1/README.md) for geometry preparation, joint-model training, frozen evaluation and recorded-state rendering.
