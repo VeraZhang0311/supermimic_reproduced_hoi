@@ -46,7 +46,9 @@ actor的固定shape只在一次imagination开始时编码，整个32步复用同
 
 每个 global reference 的50帧 bin 中，编号模20为0的 bin 保留为 WM 真实 transition holdout，WM训练和统计不使用这些行。它来自 train split，独立于 validation/eval80/test40。每次更新采用实际执行 action；接触标签来自 `(t,t+1]` 四个物理子步。实际正负计数用于 BCE class weighting。
 
-WM先训练500迭代。policy 还需通过真实 holdout 的1/8/32步物体误差、zero-increment/constant-velocity 对照、contact/onset/release coverage 和 pair概率检查。门槛写入 `plan.json`，明确是 train-only startup proposal，尚非经验标定的成功标准。未通过时只继续 WM，日志记录阻塞原因，不自动减小 horizon 或偷用评测数据。
+本分支 `codex/hoi-v1-no-quality-gate` 保留500迭代WM-only warmup，之后每轮正常更新actor/critic。真实holdout的1/8/32步误差、zero-increment/constant-velocity对照、contact/onset/release coverage及pair概率仍按原 `gate_every=50` 周期计算，但只作诊断，不再阻断策略更新。历史文件名 `wm_gate_*.json` 保留，并明确 `controls_policy_updates=false`；plan/checkpoint/completion记录固定更新日程。Native/数据身份检查以及非有限数据、loss/梯度和holdout诊断的硬错误仍保留。
+
+W&B的 `gate/policy_passed` 表示固定warmup后是否允许策略更新，`diagnostics/wm_quality_passed` 单独表示WM质量比较是否达标，配置记录 `training/wm_quality_gate_enabled=false`。`hoi/v1.0` 保留旧持续质量门。当前两个正式实验仍用原冻结source13，本分支未部署或启动新实验；见[分支变更记录](../../notes/hoi_v1_no_quality_gate_20261023.md)。
 
 ## 冻结完整时长评估
 

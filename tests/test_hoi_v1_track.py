@@ -49,6 +49,19 @@ class TrackingEnvironment(unittest.TestCase):
 
 
 class TrackingTest(TrackingEnvironment):
+    def test_wm_quality_diagnostic_is_distinct_from_actual_policy_schedule(self):
+        plan, rows, evaluation = inputs()
+        plan["policy_update_schedule"] = {"wm_quality_gate_enabled": False, "private": SECRET}
+        rows[0]["policy_gate"]["passed"] = True
+        rows[0]["wm_quality"] = {"passed": False, "blockers": [SECRET], "controls_policy_updates": False}
+        payload = build_payload(plan, rows, evaluation)
+        self.assertFalse(payload["config"]["training/wm_quality_gate_enabled"])
+        metrics = payload["events"][0]["metrics"]
+        self.assertTrue(metrics["gate/policy_passed"])
+        self.assertFalse(metrics["diagnostics/wm_quality_passed"])
+        self.assertFalse(payload["summary"]["last/diagnostics/wm_quality_passed"])
+        self.assertNotIn(SECRET, json.dumps(payload, allow_nan=False))
+
     def test_variants_and_curated_new_diagnostics_exclude_event_times_and_annotations(self):
         plan,rows,evaluation=inputs()
         plan["config"]["variant"]="no_contact_objective"
@@ -69,6 +82,8 @@ class TrackingTest(TrackingEnvironment):
 
     def test_unknown_strings_paths_raw_data_and_credentials_are_dropped(self):
         payload = build_payload(*inputs())
+        self.assertNotIn("training/wm_quality_gate_enabled", payload["config"])
+        self.assertNotIn("diagnostics/wm_quality_passed", payload["events"][0]["metrics"])
         outgoing = json.dumps(payload, allow_nan=False)
         self.assertNotIn(SECRET, outgoing)
         self.assertNotIn("sourcecode", outgoing)

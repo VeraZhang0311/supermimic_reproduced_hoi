@@ -28,9 +28,7 @@ DATA_ID = {"scope": "synthetic_CPU_orchestration_only", "frozen_identity": "test
 
 
 def scripted_wm_report(passed):
-    if not passed:
-        return {"finite": False, "scope": "training_reference_bins_reserved_from_wm_fit_not_eval80_or_test40"}
-    metric = {"valid_samples": 20, "object_normalized_error": .1,
+    metric = {"valid_samples": 20, "object_normalized_error": .1 if passed else .8,
               "zero_increment_normalized_error": .5, "constant_velocity_normalized_error": .4}
     return {"finite": True, "scope": "training_reference_bins_reserved_from_wm_fit_not_eval80_or_test40", "real_executed_actions": True,
             "horizon_reports": {str(k): {**metric, "phases": {p: dict(metric) for p in ("no_contact", "contact", "onset", "release")}}
@@ -104,8 +102,9 @@ class TrainingFlowTests(unittest.TestCase):
         self.assertEqual((workers.steps, workers.snapshot_calls, learner.buffer.size), (0,0,0))
         torch.testing.assert_close(count, learner.pi.obs_norm.count)
 
-    def test_prefill_wm_closed_policy_gate_still_saves_complete_checkpoint(self):
+    def test_prefill_wm_warmup_still_saves_complete_checkpoint(self):
         learner = self.learner()
+        learner.config = replace(learner.config, wm_only_iters=500)
         workers = SyntheticWorkers(learner)
         before_policy = {name: value.detach().clone() for name, value in learner.pi.named_parameters()}
         output, result = self.run_loop(learner, workers, "wm_only", passed=False)
@@ -118,11 +117,13 @@ class TrainingFlowTests(unittest.TestCase):
         self.assertEqual(set(saved["optimizers"]), {"pi","wm","critic"})
         self.assertEqual(saved["iteration"], 2)
         self.assertFalse(saved["extra"]["wm_gate"]["passed"])
+        self.assertFalse(saved["extra"]["policy_gate"]["passed"])
+        self.assertFalse(saved["extra"]["policy_update_schedule"]["wm_quality_gate_enabled"])
         self.assertEqual(saved["extra"]["wm_updates_this_run"], 2)
         self.assertEqual(saved["extra"]["policy_updates_this_run"], 0)
         self.assertTrue(json.loads((output / "prefill.json").read_text())["fresh_replay"])
 
-    def test_passed_policy_gate_and_resume_restore_then_freshly_prefill(self):
+    def test_resume_restores_and_updates_despite_failed_wm_quality_then_freshly_prefills(self):
         learner = self.learner()
         workers = SyntheticWorkers(learner)
         _, first = self.run_loop(learner, workers, "first")
@@ -138,19 +139,75 @@ class TrainingFlowTests(unittest.TestCase):
         torch.testing.assert_close(resumed.pi.obs_norm.count, saved["pi"]["obs_norm.count"], atol=0, rtol=0)
         self.assertTrue(resumed.optimizers["wm"].state)
         count = float(resumed.pi.obs_norm.count)
-        output, result = self.run_loop(resumed, SyntheticWorkers(resumed), "continuation")
+        output, result = self.run_loop(resumed, SyntheticWorkers(resumed), "continuation", passed=False)
         self.assertEqual(result["iteration"], 4)
         self.assertEqual(result["policy_updates"], 2)
         self.assertEqual(resumed.buffer.size, 13)
         continued = torch.load(result["checkpoint"], weights_only=False, map_location="cpu")
         self.assertEqual(continued["extra"]["policy_updates_this_run"], 2)
         self.assertEqual(continued["extra"]["wm_updates_this_run"], 2)
+        self.assertFalse(continued["extra"]["wm_gate"]["passed"])
+        self.assertTrue(continued["extra"]["policy_gate"]["passed"])
         self.assertGreater(float(resumed.pi.obs_norm.count), count)
         self.assertEqual(result["sim_steps"], first["sim_steps"] + 26)
         prefill = json.loads((output / "prefill.json").read_text())
         self.assertEqual(prefill["vector_steps"], 8)
         self.assertTrue(prefill["fresh_replay"])
         self.assertFalse(prefill["bitwise_continuation"])
+
+    def test_failed_quality_does_not_delay_first_post_warmup_policy_update(self):
+        learner = self.learner(iterations=4)
+        learner.config = replace(learner.config, wm_only_iters=2)
+        before = {name: {key: value.detach().clone() for key, value in model.named_parameters()}
+                  for name, model in (("pi", learner.pi), ("critic", learner.critic))}
+        output, result = self.run_loop(learner, SyntheticWorkers(learner), "quality_diagnostic", passed=False)
+        rows = [json.loads(line) for line in (output / "metrics.jsonl").read_text().splitlines()]
+        self.assertEqual([row["policy_updates"] for row in rows], [0, 0, 1, 2])
+        self.assertEqual([row["actor"] is not None for row in rows], [False, False, True, True])
+        self.assertTrue(all(not row["wm_quality"]["passed"] for row in rows))
+        self.assertTrue(all(not row["wm_quality"]["controls_policy_updates"] for row in rows))
+        self.assertEqual((result["wm_updates"], result["policy_updates"]), (4, 2))
+        for name, model in (("pi", learner.pi), ("critic", learner.critic)):
+            self.assertTrue(any(not torch.equal(value, before[name][key]) for key, value in model.named_parameters()))
+
+    def test_quality_regression_does_not_pause_actor_or_critic(self):
+        learner = self.learner(iterations=3)
+        output = self.root / "quality_regression"
+        output.mkdir()
+        reports = [scripted_wm_report(value) for value in (True, False, False)]
+        with patch.object(learner, "wm_validation", side_effect=reports), redirect_stdout(io.StringIO()):
+            result = train_loop(learner, SyntheticWorkers(learner), output, physics=PHYSICS, data_identity=DATA_ID,
+                                initialization={"mode": "synthetic_CPU_test"}, native_gate={"passed": True})
+        rows = [json.loads(line) for line in (output / "metrics.jsonl").read_text().splitlines()]
+        self.assertEqual([row["policy_updates"] for row in rows], [1, 2, 3])
+        self.assertEqual([row["wm_quality"]["passed"] for row in rows], [True, False, False])
+        self.assertTrue(all(row["policy_gate"]["passed"] and row["actor"] is not None for row in rows))
+        self.assertEqual(result["policy_updates"], 3)
+
+    def test_sparse_holdout_is_recorded_without_blocking_post_warmup_updates(self):
+        learner = self.learner()
+        output = self.root / "sparse_holdout"
+        output.mkdir()
+        with patch.object(learner, "wm_validation", side_effect=ValueError("insufficient holdout replay coverage")), redirect_stdout(io.StringIO()):
+            result = train_loop(learner, SyntheticWorkers(learner), output, physics=PHYSICS, data_identity=DATA_ID,
+                                initialization={"mode": "synthetic_CPU_test"}, native_gate={"passed": True})
+        self.assertEqual((result["wm_updates"], result["policy_updates"]), (2, 2))
+        diagnostic = json.loads((output / "wm_gate_000002.json").read_text())
+        self.assertEqual(diagnostic["validation"]["status"], "insufficient_real_holdout_coverage")
+        self.assertFalse(diagnostic["gate"]["controls_policy_updates"])
+
+    def test_nonfinite_holdout_is_a_hard_error_before_policy_update(self):
+        learner = self.learner()
+        output = self.root / "nonfinite_holdout"
+        output.mkdir()
+        report = scripted_wm_report(True)
+        report["finite"] = False
+        with patch.object(learner, "wm_validation", return_value=report), patch.object(learner, "policy_update") as policy, redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(FloatingPointError, "nonfinite WM holdout"):
+                train_loop(learner, SyntheticWorkers(learner), output, physics=PHYSICS, data_identity=DATA_ID,
+                           initialization={"mode": "synthetic_CPU_test"}, native_gate={"passed": True})
+        policy.assert_not_called()
+        self.assertTrue((output / "wm_gate_000001.json").is_file())
 
     def test_config_preserves_formal_defaults_and_marks_smoke_deviations(self):
         config, deviations = read_config()

@@ -108,6 +108,9 @@ def _configuration(plan, evaluation):
             out["training/experiment_kind"] = value
         elif key == "variant" and value in VARIANTS:
             out["training/variant"] = value
+    quality_gate = _nested(plan, "policy_update_schedule", "wm_quality_gate_enabled")
+    if type(quality_gate) is bool:
+        out["training/wm_quality_gate_enabled"] = quality_gate
     physics = _mapping(plan.get("physics", evaluation.get("physics", {})))
     for key in ("hand_collision", "self_collision"):
         if type(physics.get(key)) is bool:
@@ -161,6 +164,8 @@ def _training_event(record):
                 _put(metrics, prefix + "/" + channel, values[index])
     if type(_nested(record, "policy_gate", "passed")) is bool:
         metrics["gate/policy_passed"] = record["policy_gate"]["passed"]
+    if type(_nested(record, "wm_quality", "passed")) is bool:
+        metrics["diagnostics/wm_quality_passed"] = record["wm_quality"]["passed"]
     return {"step": record["iteration"], "metrics": metrics}
 
 
@@ -220,6 +225,7 @@ def _validate_payload(payload):
                    "training/variant": VARIANTS, "evaluation/variant": VARIANTS,
                    "evaluation/partition": ("train", "eval80", "test40", "validation", "regression", "test")}
     numeric_fields = {"training/" + key for key, value in TrainConfig().to_dict().items() if type(value) in (int, float, bool)}
+    numeric_fields.add("training/wm_quality_gate_enabled")
     numeric_fields.update({"physics/hand_collision", "physics/self_collision", "dataset/selected_motions", "dataset/available_motions", "dataset/is_subset"})
     hash_fields = {"dataset/bundle_content_sha256", "dataset/manifest_content_sha256", "dataset/recipes_sha256", "dataset/hands_geometry_sha256",
                    "robot/mjcf_sha256", "robot/reference_urdf_sha256", "robot/native_asset_sha256", "source/content_sha256",
@@ -238,6 +244,7 @@ def _validate_payload(payload):
     train_keys.update("real/" + key for key in ("human_reward_normalized", "hoi_reward_normalized", "objective_reward_normalized", "terminations"))
     train_keys.update("contact/" + sign + "/" + channel for sign in ("fit_positive", "fit_negative") for channel in CHANNELS)
     train_keys.add("gate/policy_passed")
+    train_keys.add("diagnostics/wm_quality_passed")
     previous = -1
     for event in payload["events"]:
         if set(event) != {"step", "metrics"} or type(event["step"]) is not int or event["step"] <= previous:

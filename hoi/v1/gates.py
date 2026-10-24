@@ -1,4 +1,4 @@
-"""Evidence gates for native HOI physics and the first policy update.
+"""Native HOI evidence gates and diagnostic WM quality comparisons.
 
 Missing evidence closes a gate. A CPU test, submitted job, or an uncalibrated
 threshold proposal is never relabelled as a successful native experiment.
@@ -203,7 +203,10 @@ def validate_native_evidence(report_or_path, *, expected_physics=None, required_
 
 @dataclass(frozen=True)
 class WMThresholdProposal:
-    """Explicit startup proposal; this is not an empirically calibrated threshold.
+    """Historical startup proposal, now retained only as a quality diagnostic.
+
+    This is not an empirically calibrated threshold and does not control the
+    training loop's post-warmup actor/critic update schedule.
 
     It asks the learned normalized object error to improve on simple baselines
     and pair probabilities to improve on prevalence-only predictions. Counts

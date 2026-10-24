@@ -1,4 +1,4 @@
-"""Joint HOI training entry: real workers, joint WM, gated actor BPTT.
+"""Joint HOI training entry: real workers, joint WM, post-warmup actor BPTT.
 
 Use --preflight to inspect a concrete bundle/config without starting workers
 or optimization. All runs, including continuation, require fresh output paths.
@@ -62,6 +62,12 @@ def collect(learner, workers, steps):
     return values
 
 
+def policy_update_schedule(config):
+    """Record the fixed schedule separately from diagnostic quality scores."""
+    return {"mode": "fixed_after_wm_warmup", "wm_only_iters": config.wm_only_iters,
+            "wm_quality_gate_enabled": False, "wm_diagnostic_every": config.gate_every}
+
+
 def train_loop(learner, workers, output, *, physics, data_identity, initialization, native_gate,
                evaluation_callback=None, tracker=None):
     """Run a fresh replay prefill even after model/optimizer continuation."""
@@ -78,7 +84,9 @@ def train_loop(learner, workers, output, *, physics, data_identity, initializati
     accumulator = 0.
     policy_updates = wm_updates = 0
     evaluation_dispatches = []
-    gate = {"passed": False, "blockers": ["WM validation has not run"]}
+    quality = {"passed": False, "blockers": ["WM validation has not run"], "controls_policy_updates": False}
+    schedule = policy_update_schedule(config)
+    policy_gate = {"passed": False, "blockers": ["WM warmup has not completed"], "wm_quality_gate_enabled": False}
     proposal = WMThresholdProposal()
     last_checkpoint = None
     first_iteration = learner.iteration
@@ -103,15 +111,24 @@ def train_loop(learner, workers, output, *, physics, data_identity, initializati
             if iteration % config.gate_every == 0 or iteration + 1 == config.iterations:
                 try:
                     validation = learner.wm_validation()
-                    gate = validate_wm_evidence(validation, proposal)
+                    quality = validate_wm_evidence(validation, proposal)
                 except ValueError as exc:
                     if "replay coverage" not in str(exc) and "not enough replay" not in str(exc):
                         raise
                     validation = {"status": "insufficient_real_holdout_coverage", "reason": str(exc)}
-                    gate = {"passed": False, "blockers": [str(exc)], "proposal": asdict(proposal)}
-                write_json(output / f"wm_gate_{iteration + 1:06d}.json", {"validation": validation, "gate": gate})
+                    quality = {"passed": False, "blockers": [str(exc)], "proposal": asdict(proposal)}
+                quality["controls_policy_updates"] = False
+                # Keep the historical filename for readers of diagnostic evidence.
+                write_json(output / f"wm_gate_{iteration + 1:06d}.json", {"validation": validation, "gate": quality,
+                           "policy_update_schedule": schedule})
+                if (validation.get("status") != "insufficient_real_holdout_coverage" and
+                        validation.get("finite") is not True):
+                    raise FloatingPointError("nonfinite WM holdout diagnostics")
             actor = None
-            if iteration >= config.wm_only_iters and gate["passed"]:
+            policy_ready = iteration >= config.wm_only_iters
+            policy_gate = {"passed": policy_ready, "blockers": [] if policy_ready else ["WM warmup has not completed"],
+                           "wm_quality_gate_enabled": False}
+            if policy_ready:
                 actor = learner.policy_update()
                 policy_updates += 1
             learner.iteration = iteration + 1
@@ -120,7 +137,7 @@ def train_loop(learner, workers, output, *, physics, data_identity, initializati
             if iteration == first_iteration or learner.iteration % config.log_every == 0 or learner.iteration == config.iterations:
                 record = {"iteration": learner.iteration, "sim_steps": learner.sim_steps, "lr": lr,
                           "elapsed_seconds": time.monotonic() - started, "real": real,
-                          "wm": losses, "actor": actor, "policy_gate": gate,
+                          "wm": losses, "actor": actor, "policy_gate": policy_gate, "wm_quality": quality,
                           "wm_updates": wm_updates, "policy_updates": policy_updates,
                           "fit_contact_positive": learner.contact_positive.tolist(),
                           "fit_contact_negative": learner.contact_negative.tolist()}
@@ -141,7 +158,8 @@ def train_loop(learner, workers, output, *, physics, data_identity, initializati
                                        "contact_negative": learner.contact_negative.cpu(),
                                        "sampling_bin_counts": learner.sampling_bin_counts.cpu(),
                                        "source_identity": source,
-                                       "native_gate": native_gate, "wm_gate": gate})
+                                       "native_gate": native_gate, "wm_gate": quality, "policy_gate": policy_gate,
+                                       "policy_update_schedule": schedule})
                 if tracker is not None:
                     tracker.checkpoint(learner.iteration, wm_updates, policy_updates)
                 if learner.iteration % config.eval_every == 0:
@@ -149,7 +167,8 @@ def train_loop(learner, workers, output, *, physics, data_identity, initializati
                         raise RuntimeError("periodic frozen HOI80 evaluation is due but no dispatcher is configured")
                     evaluation_dispatches.append(evaluation_callback(last_checkpoint, learner.iteration))
     summary = {"iteration": learner.iteration, "sim_steps": learner.sim_steps,
-               "wm_updates": wm_updates, "policy_updates": policy_updates, "policy_gate": gate,
+               "wm_updates": wm_updates, "policy_updates": policy_updates, "policy_gate": policy_gate,
+               "wm_quality": quality, "policy_update_schedule": schedule,
                "update_count_scope": "this output run since its fresh real replay prefill; excludes prior runs",
                "checkpoint": str(last_checkpoint), "experiment_kind": config.experiment_kind,
                "elapsed_seconds": time.monotonic() - started, "training_completed": True,
@@ -220,6 +239,7 @@ def main(argv=None):
     plan = {"config": config.to_dict(), "smoke_deviations": deviations, "physics": physics,
             "data_identity": identity, "bundle": str(args.bundle.resolve()), "scope": bundle["scope"],
             "native_gate": native, "wm_gate_proposal": asdict(WMThresholdProposal()),
+            "policy_update_schedule": policy_update_schedule(config),
             "source_identity": source_identity(),
             "initialization_request": {"init_checkpoint": str(args.init_checkpoint) if args.init_checkpoint else None,
                                        "resume": str(args.resume) if args.resume else None,
