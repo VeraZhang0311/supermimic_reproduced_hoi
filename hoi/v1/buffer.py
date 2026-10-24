@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import torch
+from .contacts import CHANNELS
 
 
 FIELDS = {
@@ -14,8 +15,8 @@ FIELDS = {
     "f": ((), torch.long), "ep_step": ((), torch.int32),
     "done": ((), torch.bool), "term": ((), torch.bool), "asset_id": ((), torch.long),
     "failure_reason": ((), torch.int32),
-    "contact": (3, torch.float32), "contact_valid": (3, torch.bool),
-    "impulse": (3, torch.float32), "contact_missing_counter": (2, torch.int32),
+    "contact": (len(CHANNELS), torch.float32), "contact_valid": (len(CHANNELS), torch.bool),
+    "impulse": (len(CHANNELS), torch.float32), "contact_missing_counter": (2, torch.int32),
 }
 
 

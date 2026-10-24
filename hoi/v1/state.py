@@ -9,6 +9,7 @@ import torch
 
 from supermimic.mdp import flatten_state, unflatten_state
 from supermimic.rotations import mat_to_6d, mat_to_quat, quat_to_mat, so3_exp, so3_log, yaw_mat
+from .contacts import CHANNELS
 
 ROBOT_STATE_DIM = 71
 OBJECT_STATE_DIM = 13
@@ -17,7 +18,7 @@ OBJECT_INCREMENT_DIM = 12
 OBJECT_CONTEXT_DIM = 12
 OBJECT_OBS_DIM = 18
 OBJECT_GOAL_DIM = 190
-CONTACT_DIM = 3
+CONTACT_DIM = len(CHANNELS)
 
 
 def flatten_object(O):

@@ -8,6 +8,7 @@ import torch
 from torch import nn
 
 from hoi.v1.diagnostics import contact_transition_events, executed_action_reward_gap, source_flag_comparison
+from hoi.v1.contacts import CHANNELS, LABEL_SCHEMA
 from hoi.v1.state import flatten_object, flatten_state
 from tests.test_hoi_v1_evaluate import fixture
 
@@ -23,7 +24,7 @@ class ScriptedWM(nn.Module):
         self.actions.append(a.detach().clone())
         S1 = (S[0] + a[:, :3] * self.scale * .001, *S[1:])
         O1 = (O[0] + a[:, :3] * self.scale * .002, *O[1:])
-        return S1, O1, a.new_full((len(a), 3), 100.)
+        return S1, O1, a.new_full((len(a), len(CHANNELS)), 100.)
 
 
 class EvaluationDiagnosticsTests(unittest.TestCase):
@@ -73,7 +74,7 @@ class EvaluationDiagnosticsTests(unittest.TestCase):
         actions = torch.arange(T * 29).reshape(T, 29).float() / 100
         control = {"action": actions, "a_prev": torch.cat((torch.zeros_like(actions[:1]), actions[:-1])),
                    "xi": torch.ones(T, 33), "xi_o": torch.ones(T, 12),
-                   "contact_valid": torch.ones(T, 3).bool(), "reward": []}
+                   "contact_valid": torch.ones(T, len(CHANNELS)).bool(), "reward": []}
         cloud = shapes.points(torch.tensor(0))
         with torch.no_grad():
             for step in range(T):
@@ -105,6 +106,8 @@ class EvaluationDiagnosticsTests(unittest.TestCase):
         self.assertFalse(result["horizons"]["32"]["available"])
         self.assertIsNone(result["horizons"]["32"]["absolute_reward_gap_mean"])
         self.assertFalse(result["used_as_training_data_or_gate"])
+        self.assertEqual(result["contact_channels"], list(CHANNELS))
+        self.assertEqual(result["contact_label_schema"], LABEL_SCHEMA)
         self.assertTrue(wm.training)
         self.assertTrue(all(parameter.grad is None for parameter in wm.parameters()))
         for key, value in before.items():
@@ -123,6 +126,36 @@ class EvaluationDiagnosticsTests(unittest.TestCase):
         frames[2] += 20
         with self.assertRaisesRegex(ValueError, "contiguous"):
             executed_action_reward_gap(wm, mdp, states, control, frames, cloud)
+
+    def test_paired_reward_rejects_old_validity_and_WM_logits_contracts(self):
+        wm, mdp, states, control, frames, cloud = self.trajectory()
+        old = {**control, "contact_valid": control["contact_valid"][:, :3]}
+        with self.assertRaisesRegex(ValueError, "5 channels"):
+            executed_action_reward_gap(wm, mdp, states, old, frames, cloud)
+        class OldWM(ScriptedWM):
+            def step(self, *args):
+                S, O, logits = super().step(*args)
+                return S, O, logits[:, :3]
+        with self.assertRaisesRegex(ValueError, "five-channel"):
+            executed_action_reward_gap(OldWM(), mdp, states, control, frames, cloud)
+
+    def test_foot_logits_do_not_become_reference_reward_and_nonfinite_feet_are_rejected(self):
+        wm, mdp, states, control, frames, cloud = self.trajectory()
+        class FootWM(ScriptedWM):
+            def step(self, *args):
+                S, O, logits = super().step(*args)
+                logits[:, 3:] = -100.
+                return S, O, logits
+        baseline = executed_action_reward_gap(wm, mdp, states, control, frames, cloud, horizons=(1, 2))
+        feet = executed_action_reward_gap(FootWM(), mdp, states, control, frames, cloud, horizons=(1, 2))
+        self.assertEqual(baseline["horizons"], feet["horizons"])
+        class InvalidFootWM(ScriptedWM):
+            def step(self, *args):
+                S, O, logits = super().step(*args)
+                logits[:, 4] = float("nan")
+                return S, O, logits
+        with self.assertRaisesRegex(FloatingPointError, "contact logits"):
+            executed_action_reward_gap(InvalidFootWM(), mdp, states, control, frames, cloud, horizons=(1,))
 
     def test_full_duration_evaluation_persists_paired_frozen_WM_reports_and_named_source_flags(self):
         from hoi.v1.evaluate import evaluate_group

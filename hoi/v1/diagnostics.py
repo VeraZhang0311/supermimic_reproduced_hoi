@@ -9,7 +9,23 @@ from __future__ import annotations
 import torch
 
 from supermimic.mdp import normalize_xi
+from .contacts import CHANNELS, LABEL_SCHEMA
 from .state import unflatten_object, unflatten_state
+
+
+def validate_actual_contact_fields(control, rows, fields=("contact", "contact_valid", "contact_impulse_Ns")):
+    """Require the current actual-pair contract, independent of hand goals."""
+    binary = {"contact", "actual_contact", "contact_valid"}
+    for name in fields:
+        value = control.get(name)
+        if not torch.is_tensor(value) or value.shape != (rows, len(CHANNELS)):
+            raise ValueError(f"actual contact field {name} requires {len(CHANNELS)} channels in the {LABEL_SCHEMA} order")
+        if not bool(torch.isfinite(value).all()):
+            raise ValueError(f"actual contact field {name} must remain finite")
+        if name in binary and not bool(((value == 0) | (value == 1)).all()):
+            raise ValueError(f"actual contact field {name} must remain binary")
+        if name not in binary and bool((value < 0).any()):
+            raise ValueError(f"actual contact field {name} must remain nonnegative")
 
 
 def source_flag_comparison(source_reference, expected, valid, body_names=None):
@@ -77,9 +93,10 @@ def executed_action_reward_gap(wm, mdp, states, control, frames, points, *, hori
             len(frames) != T + 1 or type(batch_size) is not int or batch_size < 1 or
             any(type(h) is not int or h < 1 for h in horizons)):
         raise ValueError("paired reward diagnostic needs T controls, T+1 states/frames and positive integer windows")
-    for key, dim in (("action", 29), ("a_prev", 29), ("xi", 33), ("xi_o", 12), ("contact_valid", 3)):
+    for key, dim in (("action", 29), ("a_prev", 29), ("xi", 33), ("xi_o", 12)):
         if control[key].shape != (T, dim):
             raise ValueError(f"paired reward diagnostic {key} shape differs")
+    validate_actual_contact_fields(control, T, ("contact_valid",))
     if control["reward"].shape != (T,) or not bool(torch.isfinite(control["reward"]).all()):
         raise ValueError("paired reward diagnostic requires finite saved simulator rewards")
     device = next(wm.parameters()).device
@@ -110,6 +127,10 @@ def executed_action_reward_gap(wm, mdp, states, control, frames, points, *, hori
                     action = control["action"][cpu_indices].to(device)
                     S, O, logits = wm.step(S, O, action, normalize_xi(control["xi"][cpu_indices].to(device)),
                                              control["xi_o"][cpu_indices].to(device), cloud)
+                    if logits.shape != (len(chunk), len(CHANNELS)):
+                        raise ValueError("paired reward diagnostic WM contact logits differ from the five-channel contract")
+                    if not bool(torch.isfinite(logits).all()):
+                        raise FloatingPointError("nonfinite paired WM contact logits")
                     predicted = mdp.reward(S, O, frames[indices + 1], action, control["a_prev"][cpu_indices].to(device),
                                            torch.sigmoid(logits), contact_valid=control["contact_valid"][cpu_indices].to(device))
                     actual = control["reward"][cpu_indices].to(device)
@@ -139,6 +160,7 @@ def executed_action_reward_gap(wm, mdp, states, control, frames, points, *, hori
     finally:
         wm.train(training)
     return {"horizons": reports, "real_executed_actions": True, "identical_real_initial_state_per_window": True,
+            "contact_channels": list(CHANNELS), "contact_label_schema": LABEL_SCHEMA,
             "predicted_contact_source": "sigmoid_frozen_WM_pair_logits; actual validity mask retained",
             "reward_timing": "predicted/real state after action[t] scored at reference(f[t]+1)",
             "survival_weighting": False, "optimizer_updates": 0, "normalization_updates": 0,

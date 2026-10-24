@@ -17,6 +17,7 @@ from unittest.mock import patch
 import torch
 
 from hoi.v1.checkpoint import load_checkpoint
+from hoi.v1.contacts import CHANNELS
 from hoi.v1.state import flatten_state, flatten_object, unflatten_state, unflatten_object
 from supermimic.mdp import normalize_xi
 from hoi.v1.train import main, read_config, train_loop
@@ -33,8 +34,8 @@ def scripted_wm_report(passed):
     return {"finite": True, "scope": "training_reference_bins_reserved_from_wm_fit_not_eval80_or_test40", "real_executed_actions": True,
             "horizon_reports": {str(k): {**metric, "phases": {p: dict(metric) for p in ("no_contact", "contact", "onset", "release")}}
                                 for k in (1,8,32)},
-            "contact_diagnostics": {"positive_counts": [20]*3, "negative_counts": [20]*3, "precision": [.8]*3,
-                                    "recall": [.8]*3, "brier_per_channel": [.1]*3, "prevalence_baseline_brier": [.25]*3}}
+            "contact_diagnostics": {"channels": list(CHANNELS), "positive_counts": [20]*len(CHANNELS), "negative_counts": [20]*len(CHANNELS), "precision": [.8]*len(CHANNELS),
+                                    "recall": [.8]*len(CHANNELS), "brier_per_channel": [.1]*len(CHANNELS), "prevalence_baseline_brier": [.25]*len(CHANNELS)}}
 
 
 class SyntheticWorkers:
@@ -58,7 +59,7 @@ class SyntheticWorkers:
         next_s = (S[0] + S[2] * .02, S[1], S[2] + action[:, :3] * .001,
                   S[3], S[4] + action * .01, S[5] + action * .01)
         next_o = (O[0] + O[2] * .02 + action[:, :3] * .002, O[1], O[2] + action[:, :3] * .01, O[3])
-        actual = torch.full((2,3), float((self.steps // 4) % 2))
+        actual = torch.full((2,len(CHANNELS)), float((self.steps // 4) % 2))
         reward, terms = learner.mdp.reward(next_s, next_o, frame + 1, action, self.previous, actual, terms=True)
         value.update(s=flatten_state(S), s1=flatten_state(next_s), o=flatten_object(O), o1=flatten_object(next_o),
                      contact=actual, impulse=actual * .04, r=reward.detach(), r_human=terms["human_reward"].detach(),
@@ -244,8 +245,8 @@ class TrainingFlowTests(unittest.TestCase):
         for name in ("in_norm", "out_norm", "object_in_norm", "object_out_norm"):
             for key, tensor in getattr(expected, name).state_dict().items():
                 torch.testing.assert_close(getattr(learner.wm, name).state_dict()[key], tensor, rtol=0, atol=0)
-        torch.testing.assert_close(learner.contact_positive, torch.zeros(3, dtype=torch.float64))
-        torch.testing.assert_close(learner.contact_negative, torch.ones(3, dtype=torch.float64))
+        torch.testing.assert_close(learner.contact_positive, torch.zeros(len(CHANNELS), dtype=torch.float64))
+        torch.testing.assert_close(learner.contact_negative, torch.ones(len(CHANNELS), dtype=torch.float64))
         # The raw reserved transition remains available to WM diagnostics.
         self.assertEqual(float(learner.buffer.data["a"][0,0,0]), 100)
 
@@ -255,6 +256,21 @@ class TrainingFlowTests(unittest.TestCase):
         with patch("hoi.v1.evaluate._read_bundle_header", return_value=header), patch.dict(os.environ):
             with self.assertRaisesRegex(ValueError, "subset"):
                 main(["--bundle", str(self.root / "input.json"), "--output", str(output), "--preflight"])
+        self.assertFalse(output.exists())
+
+    def test_preflight_rejects_three_channel_resume_before_output_or_workers(self):
+        learner = self.learner()
+        from hoi.v1.checkpoint import make_checkpoint
+        old = make_checkpoint(learner.pi, learner.wm, learner.critic, learner.optimizers, iteration=12,
+                              physics=PHYSICS, data_identity=DATA_ID, initialization={"mode": "CPU_old_HOI_fixture"})
+        old["feature_schema"]["version"] = "supermimic_hoi_v1_full_reference_1"
+        old["feature_schema"]["contact"] = list(CHANNELS[:3])
+        path = self.root / "old_three_channel.pt"
+        torch.save(old, path)
+        output = self.root / "preflight_old_resume"
+        with self.assertRaisesRegex(ValueError, "old three-channel HOI checkpoints"):
+            main(["--bundle", str(self.root / "unused.json"), "--output", str(output),
+                  "--resume", str(path), "--preflight"])
         self.assertFalse(output.exists())
 
     def test_wm_does_not_consume_masked_reset_actions_or_other_assets(self):

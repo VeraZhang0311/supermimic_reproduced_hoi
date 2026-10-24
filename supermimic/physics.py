@@ -75,6 +75,20 @@ def sha(path):
 def load_hand_asset(path):
     from hoi.hand_collision import HAND_SHA, RECIPE
     path = Path(path)
+    if (path.parent / 'foot-asset.json').is_file():
+        from hoi.v1.foot_collision import validate_overlay
+        feet = validate_overlay(path)
+        base = feet['base_robot_asset']
+        if Path(base['path']).resolve() == path.resolve():
+            raise ValueError('Foot overlay cannot inherit itself')
+        original = load_hand_asset(base['path'])
+        if sha(base['path']) != base['sha256']:
+            raise ValueError('Foot overlay base hand asset changed')
+        # The original hand receipt remains byte-identical and describes its
+        # base overlay. Foot changes have their own explicit identity/proof.
+        return {**original, 'usd': str(path.resolve()), 'usd_sha256': sha(path),
+                'foot_asset': feet, 'original_authored_values_unchanged': False,
+                'unchanged_scope': 'base hand recipe and all non-foot properties; foot collision changes are explicit'}
     report = json.loads((path.parent / 'hand-asset.json').read_text())
     if sha(path) != report['usd_sha256'] or sha(report['source_usd']) != report['source_usd_sha256']:
         raise ValueError('Hand collision asset or source USD changed')

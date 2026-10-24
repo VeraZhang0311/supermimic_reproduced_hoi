@@ -14,6 +14,7 @@ from torch import nn
 
 from supermimic.mdp import normalize_xi
 from .config import TrainConfig
+from .contacts import CHANNELS
 from .networks import frozen_parameters
 from .state import object_features, unflatten_object, unflatten_state
 
@@ -49,8 +50,8 @@ class Learner:
         self.robot_history = torch.zeros((replay.N, 10, 99), device=self.device)
         self.object_history = torch.zeros((replay.N, 10, 18), device=self.device)
         self.iteration = self.sim_steps = 0
-        self.contact_positive = torch.zeros(3, device=self.device, dtype=torch.float64)
-        self.contact_negative = torch.zeros(3, device=self.device, dtype=torch.float64)
+        self.contact_positive = torch.zeros(len(CHANNELS), device=self.device, dtype=torch.float64)
+        self.contact_negative = torch.zeros(len(CHANNELS), device=self.device, dtype=torch.float64)
 
     def set_lr(self, iteration):
         rate = self.config.lr_at(iteration)
@@ -116,7 +117,7 @@ class Learner:
         states, objects, logits = [], [], []
         for step in range(window["a"].shape[1]):
             active = window["mask"][:, step].bool().nonzero().flatten()
-            contact = window["a"].new_zeros(len(window["a"]), 3)
+            contact = window["a"].new_zeros(len(window["a"]), len(CHANNELS))
             if len(active):
                 next_s, next_o, active_contact = self.wm.step(
                     tuple(value[active] for value in S), tuple(value[active] for value in O),
@@ -299,7 +300,7 @@ class Learner:
         for step in range(length):
             active = window["mask"][:, step].bool()
             one_o = tuple(value[:, step].clone() for value in actual_o)
-            one_c = window["a"].new_zeros((len(active), 3))
+            one_c = window["a"].new_zeros((len(active), len(CHANNELS)))
             if bool(active.any()):
                 _, selected_o, selected_c = self.wm.step(unflatten_state(window["s"][active, step]), unflatten_object(window["o"][active, step]),
                                                         window["a"][active, step], normalize_xi(window["xi"][active, step]),
@@ -368,7 +369,8 @@ class Learner:
                 "contact_precision": precision, "contact_recall": recall,
                 "contact_brier": float((calibration * valid).sum() / valid.sum().clamp_min(1)),
                 "horizon_reports": horizon_reports, "real_executed_actions": True,
-                "contact_diagnostics": {"positive_counts": positive.sum((0, 1)).tolist(), "negative_counts": negative.sum((0, 1)).tolist(),
+                "contact_diagnostics": {"channels": list(CHANNELS),
+                                        "positive_counts": positive.sum((0, 1)).tolist(), "negative_counts": negative.sum((0, 1)).tolist(),
                                         "precision": precision, "recall": recall,
                                         "brier_per_channel": ((calibration * valid).sum((0, 1)) / counts).tolist(),
                                         "prevalence_baseline_brier": (prevalence * (1 - prevalence)).tolist(),

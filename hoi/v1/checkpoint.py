@@ -150,11 +150,16 @@ def checkpoint_training_progress(checkpoint):
             "initialization_identity": "checkpoint.initialization separately records prior motion training or continuation"}
 
 
+def validate_checkpoint_features(checkpoint):
+    """Reject incompatible continuation on CPU, before workers/output creation."""
+    if checkpoint.get("schema_version") != CHECKPOINT_SCHEMA or checkpoint.get("feature_schema") != FEATURE_SCHEMA:
+        raise ValueError("checkpoint feature schema/version differs; five-channel hand/foot-object contact requires an explicit migration for old three-channel HOI checkpoints")
+
+
 def load_checkpoint(path, policy, wm, critic, optimizers=None, *, physics, data_identity, map_location="cpu", variant="hoi_v1"):
     from .variants import validate_variant, geometry_input_enabled
     checkpoint = torch.load(path, map_location=map_location, weights_only=False) if not isinstance(path, dict) else path
-    if checkpoint.get("schema_version") != CHECKPOINT_SCHEMA or checkpoint.get("feature_schema") != FEATURE_SCHEMA:
-        raise ValueError("checkpoint feature schema/version differs; explicit migration is required")
+    validate_checkpoint_features(checkpoint)
     if checkpoint_variant(checkpoint) != validate_variant(variant):
         raise ValueError("checkpoint experiment variant differs from the requested continuation/evaluation")
     if type(checkpoint.get("iteration")) is not int or checkpoint["iteration"] < 0:

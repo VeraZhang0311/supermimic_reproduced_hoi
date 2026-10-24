@@ -15,7 +15,8 @@ from hoi.v1.geometry import (ShapeAssetBank, build_geometry_cache, collision_dis
     _point_mesh_signed_distance, _prepare_exact_meshes, _rigid_mesh_vertices, _exact_mesh_gap)
 from hoi.data.manifest import build_manifest, robot_joint_names, write_manifest
 from hoi.v1.prepare import (load_bundle, prepare_bundle, _validate_palm_evidence, _reference_contacts,
-                           _reference_contact_quality, _aggregate_reference_contact_quality)
+                           _reference_contact_quality, _aggregate_reference_contact_quality,
+                           native_robot_asset_binding, bind_robot_collision_overlay)
 from hoi.hand_collision import HAND_SHA, ORIGIN
 from hoi.v1.merge_recipes import merge_recipes
 
@@ -297,6 +298,64 @@ class BundleTests(unittest.TestCase):
                              for index in range(2)]}
         self.recipes = dump("recipes.json", recipe)
         self.kin = BundleKinematics()
+
+    def test_foot_overlay_rebind_preserves_every_data_and_cache_binding(self):
+        base = self.root / "base_robot"
+        base.mkdir()
+        robot = base / "robot.usda"
+        robot.write_text("synthetic base robot identity only")
+        hand = base / "hand-asset.json"
+        hand.write_text("synthetic base hand receipt identity only")
+        sha = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
+        recipe = json.loads(self.recipes.read_text())
+        recipe["native_robot_asset"] = {"path": str(robot), "sha256": sha(robot)}
+        self.recipes.write_text(json.dumps(recipe))
+        source = self.root / "original_bundle"
+        original = prepare_bundle(self.manifest, self.recipes, source, self.kin)
+        before = {path: path.read_bytes() for path in source.iterdir()}
+        overlay = self.root / "foot_overlay"
+        overlay.mkdir()
+        new_robot = overlay / "robot.usda"
+        new_robot.write_text("synthetic foot extension identity only")
+        (overlay / "hand-asset.json").write_bytes(hand.read_bytes())
+        foot = overlay / "foot-asset.json"
+        foot.write_text("synthetic separately bound foot receipt")
+        evidence = {"base_robot_asset": {"path": str(robot), "sha256": sha(robot)}}
+        with patch("hoi.v1.foot_collision.validate_overlay", return_value=evidence):
+            result = bind_robot_collision_overlay(source / "bundle.json", self.root / "extended_bundle", new_robot, sha(new_robot))
+            binding = result["native_robot_asset"]
+            self.assertEqual(binding["foot_asset_manifest"]["sha256"], sha(foot))
+            self.assertEqual(binding["hand_asset_manifest"]["sha256"], sha(hand))
+            self.assertNotEqual(result["bundle_content_sha256"], original["bundle_content_sha256"])
+            for key in original:
+                if key not in ("native_robot_asset", "validation", "bundle_content_sha256"):
+                    self.assertEqual(result[key], original[key], key)
+            bank, _, loaded = load_bundle(self.root / "extended_bundle/bundle.json", self.kin)
+            self.assertEqual(bank.num_frames, sum(clip["state_frames"] for clip in original["clips"]))
+            self.assertEqual(loaded, result)
+            foot.write_bytes(foot.read_bytes() + b"tamper")
+            with self.assertRaisesRegex(ValueError, "foot-asset receipt bytes changed"):
+                load_bundle(self.root / "extended_bundle/bundle.json", self.kin)
+        for path, raw in before.items():
+            self.assertEqual(path.read_bytes(), raw)
+
+    def test_foot_overlay_wrong_base_or_missing_binding_cannot_reuse_cache_identity(self):
+        source = self.root / "original_bundle"
+        prepare_bundle(self.manifest, self.recipes, source, self.kin)
+        overlay = self.root / "foot_overlay"
+        overlay.mkdir()
+        robot = overlay / "robot.usda"
+        robot.write_text("synthetic foot extension identity")
+        (overlay / "hand-asset.json").write_text("synthetic hand identity")
+        sha = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
+        with self.assertRaisesRegex(ValueError, "verified foot overlay"):
+            bind_robot_collision_overlay(source / "bundle.json", self.root / "missing_foot", robot, sha(robot))
+        self.assertFalse((self.root / "missing_foot").exists())
+        (overlay / "foot-asset.json").write_text("synthetic foot identity")
+        with patch("hoi.v1.foot_collision.validate_overlay", return_value={"base_robot_asset": {"path": str(robot), "sha256": sha(robot)}}):
+            with self.assertRaisesRegex(ValueError, "exact bundle robot/hand asset"):
+                bind_robot_collision_overlay(source / "bundle.json", self.root / "wrong_base", robot, sha(robot))
+        self.assertFalse((self.root / "wrong_base").exists())
 
     def test_full_bundle_roundtrip_asset_filter_and_hash_guards(self):
         output = self.root / "new_bundle"

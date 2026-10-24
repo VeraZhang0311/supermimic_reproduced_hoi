@@ -16,6 +16,7 @@ import time
 import torch
 
 from .config import TrainConfig, bundle_identity, fresh_directory, write_json, source_identity
+from .contacts import CHANNELS, LABEL_SCHEMA
 from .gates import WMThresholdProposal, require_native_evidence, validate_native_evidence, validate_wm_evidence
 from .variants import geometry_input_enabled, reward_config, max_step_reward
 
@@ -140,7 +141,8 @@ def train_loop(learner, workers, output, *, physics, data_identity, initializati
                           "wm": losses, "actor": actor, "policy_gate": policy_gate, "wm_quality": quality,
                           "wm_updates": wm_updates, "policy_updates": policy_updates,
                           "fit_contact_positive": learner.contact_positive.tolist(),
-                          "fit_contact_negative": learner.contact_negative.tolist()}
+                          "fit_contact_negative": learner.contact_negative.tolist(),
+                          "contact_channels": list(CHANNELS), "contact_label_schema": LABEL_SCHEMA}
                 metrics.write(json.dumps(record, allow_nan=False) + "\n")
                 print(json.dumps({key: record[key] for key in ("iteration", "sim_steps", "wm_updates", "policy_updates")}), flush=True)
                 if tracker is not None:
@@ -167,6 +169,7 @@ def train_loop(learner, workers, output, *, physics, data_identity, initializati
                         raise RuntimeError("periodic frozen HOI80 evaluation is due but no dispatcher is configured")
                     evaluation_dispatches.append(evaluation_callback(last_checkpoint, learner.iteration))
     summary = {"iteration": learner.iteration, "sim_steps": learner.sim_steps,
+               "contact_channels": list(CHANNELS), "contact_label_schema": LABEL_SCHEMA,
                "wm_updates": wm_updates, "policy_updates": policy_updates, "policy_gate": policy_gate,
                "wm_quality": quality, "policy_update_schedule": schedule,
                "update_count_scope": "this output run since its fresh real replay prefill; excludes prior runs",
@@ -210,6 +213,9 @@ def main(argv=None):
     args, launcher = parser.parse_known_args(argv)
     config, deviations = read_config(args.config)
     checkpoint, checkpoint_sha = read_checkpoint(args.resume) if args.resume else (None, None)
+    if checkpoint is not None:
+        from .checkpoint import validate_checkpoint_features
+        validate_checkpoint_features(checkpoint)
     settings, _ = resolve_arguments(args, checkpoint.get("physics") if checkpoint else None)
     physics = asdict(settings)
     if not (settings.hand_collision and settings.self_collision):
@@ -237,6 +243,7 @@ def main(argv=None):
     output = fresh_directory(args.output)
     identity = bundle_identity(bundle)
     plan = {"config": config.to_dict(), "smoke_deviations": deviations, "physics": physics,
+            "contact_channels": list(CHANNELS), "contact_label_schema": LABEL_SCHEMA,
             "data_identity": identity, "bundle": str(args.bundle.resolve()), "scope": bundle["scope"],
             "native_gate": native, "wm_gate_proposal": asdict(WMThresholdProposal()),
             "policy_update_schedule": policy_update_schedule(config),

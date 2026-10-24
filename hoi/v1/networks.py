@@ -10,9 +10,10 @@ import torch.nn.functional as F
 from supermimic.mdp import NUM_J, invariant_features
 from supermimic.networks import RunningNorm, WorldModel as RobotWorldModel, mlp, run_mlp
 from supermimic.rotations import so3_exp, yaw_mat
+from .contacts import CHANNELS, LABEL_SCHEMA
 from .state import integrate_object, object_features, object_state_error, object_targets
 
-FEATURE_VERSION = "supermimic_hoi_v1_full_reference_1"
+FEATURE_VERSION = "supermimic_hoi_v1_full_reference_2"
 FEATURE_SCHEMA = {
     "version": FEATURE_VERSION,
     "robot_state": "p3,quat_wxyz4,v_world3,omega_world3,q29,qd29",
@@ -26,9 +27,9 @@ FEATURE_SCHEMA = {
     "object_observation": "HrobotT*(pO-pR)3,rot6d(HrobotT*RO)6,HrobotT*(pOref-pO)3,rot6d(ROT*ROref)6",
     "object_goal_tick": "HrobotT*(pOref-pR)3,rot6d(HrobotT*ROref)6,HrobotT*vOref3,HrobotT*omegaOref3,expectedLR2,validLR2",
     "object_increment": "HrobotT*dp3,log(ROT*ROnext)3,HrobotT*dv3,HrobotT*domega3",
-    "contact": ["left_hand_object", "right_hand_object", "object_ground"],
+    "contact": list(CHANNELS),
     "contact_time": "actual_interval_t_tplus1",
-    "actual_contact_label": {"schema": "hoi_v1_pair_normal_impulse_v1", "threshold_N": 1., "comparison": "strict_greater",
+    "actual_contact_label": {"schema": LABEL_SCHEMA, "threshold_N": 1., "comparison": "strict_greater",
                              "control_dt_s": .02, "num_substeps": 4,
                              "aggregation": "sum_normal_impulses_all_contact_points_all_substeps_divided_by_control_dt"},
     "shape": "pointnet_3_64_128_128_max_128_64_ELU_FPS128_object_local_meters",
@@ -116,7 +117,7 @@ class WorldModel(nn.Module):
         with torch.no_grad():
             self.net[-1].weight[:70].zero_()
             self.net[-1].bias[:70].zero_()
-        self.contact_head = mlp(hidden[-1], [contact_hidden], 3, act=nn.SiLU)
+        self.contact_head = mlp(hidden[-1], [contact_hidden], len(CHANNELS), act=nn.SiLU)
         self.shape_encoder = ShapeEncoder()
         self.in_norm, self.out_norm = RunningNorm(133), RunningNorm(70, eps=1e-4)
         self.object_in_norm = RunningNorm(27)
@@ -180,7 +181,7 @@ class WorldModel(nn.Module):
         scaled = (error[..., 70:] / torch.maximum(self.object_out_norm.std(), self.object_error_floor)) ** 2
         obj = scaled.reshape(scaled.shape[:-1] + (4, 3)).mean(-1).mean(-1)
         for x, name in ((contact_logits, "contact logits"), (contact_actual, "actual pair labels"), (contact_valid, "pair validity")):
-            _dim(x, 3, name)
+            _dim(x, len(CHANNELS), name)
         bce = F.binary_cross_entropy_with_logits(contact_logits, contact_actual.float(), reduction="none", pos_weight=pos_weight)
         valid = contact_valid.to(bce.dtype)
         contact = (bce * valid).sum(-1) / valid.sum(-1).clamp_min(1)

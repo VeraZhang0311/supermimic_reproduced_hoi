@@ -7,6 +7,7 @@ training success. All outputs are exclusive-created in a fresh directory.
 from __future__ import annotations
 
 import argparse
+from copy import deepcopy
 from concurrent.futures import ProcessPoolExecutor
 import hashlib
 import io
@@ -32,6 +33,60 @@ from .motion import TrainingMotionBank
 
 BUNDLE_SCHEMA = "supermimic_hoi_v1_bundle_v1"
 LOGGER = logging.getLogger(__name__)
+
+
+def native_robot_asset_binding(path, expected_sha256):
+    """Bind a hand overlay and optional explicitly versioned foot extension."""
+    path = Path(path).resolve()
+    if sha256_file(path) != expected_sha256:
+        raise ValueError("bound native robot/hand overlay bytes differ")
+    hand = path.parent / "hand-asset.json"
+    if not hand.is_file():
+        raise ValueError("native rubber-hand overlay requires its original hand-asset.json receipt")
+    result = {"path": str(path), "sha256": expected_sha256,
+              "hand_asset_manifest": {"path": str(hand.resolve()), "sha256": sha256_file(hand)}}
+    foot = path.parent / "foot-asset.json"
+    if foot.is_file():
+        from .foot_collision import validate_overlay, FOOT_PROFILE
+        validate_overlay(path)
+        result["foot_asset_manifest"] = {"path": str(foot.resolve()), "sha256": sha256_file(foot)}
+        result["foot_collision_profile"] = FOOT_PROFILE
+    return result
+
+
+def bind_robot_collision_overlay(bundle_path, output, robot_asset, expected_sha256):
+    """Rebind only robot collision identity; preserve immutable data/cache bytes.
+
+    Object/hand geometry and reference FK are unchanged by replacing foot
+    colliders. Their original recipe and all cache paths/hashes remain bound.
+    The independent foot manifest supplies the new robot collision recipe.
+    """
+    from .evaluate import _read_bundle_header
+    source = Path(bundle_path).resolve()
+    bundle = deepcopy(_read_bundle_header(source))
+    binding = native_robot_asset_binding(robot_asset, expected_sha256)
+    if "foot_asset_manifest" not in binding:
+        raise ValueError("robot collision rebind requires a verified foot overlay")
+    from .foot_collision import validate_overlay
+    feet = validate_overlay(binding["path"])
+    base = feet["base_robot_asset"]
+    previous = bundle.get("native_robot_asset", {})
+    if (Path(previous.get("path", "/missing")).resolve() != Path(base["path"]).resolve() or
+            previous.get("sha256") != base["sha256"]):
+        raise ValueError("foot overlay must inherit the exact bundle robot/hand asset")
+    original_hash = bundle.pop("bundle_content_sha256")
+    bundle["native_robot_asset"] = binding
+    bundle["robot_collision_extension"] = {
+        "schema": "hoi_v1_robot_collision_rebind_v1", "profile": binding["foot_collision_profile"],
+        "source_bundle": {"path": str(source), "sha256": sha256_file(source), "content_sha256": original_hash},
+        "unchanged": "reference/source/timebase/FK/object/hand geometry and caches; only native foot collision changes"}
+    bundle["validation"] = {**bundle["validation"], "native_physics": "not_run", "pair_instrumentation": "not_run"}
+    bundle["bundle_content_sha256"] = _digest_json(bundle)
+    output = _fresh_output(output)
+    with (output / "bundle.json").open("x", encoding="utf-8") as stream:
+        json.dump(bundle, stream, ensure_ascii=False, sort_keys=True, indent=2, allow_nan=False)
+        stream.write("\n")
+    return bundle
 
 
 def _digest_json(value):
@@ -464,13 +519,7 @@ def prepare_bundle(manifest_path, recipes_path, output, kin, *, partition="train
         robot_asset = {"path": report["usd"], "sha256": report["usd_sha256"]}
     if robot_asset is not None:
         native_robot = _resolve(robot_asset["path"], root)
-        if sha256_file(native_robot) != robot_asset["sha256"]:
-            raise ValueError("bound native robot/hand overlay bytes differ")
-        hand_report = native_robot.parent / "hand-asset.json"
-        if not hand_report.is_file():
-            raise ValueError("native rubber-hand overlay requires its original hand-asset.json receipt")
-        bundle["native_robot_asset"] = {"path": str(native_robot.resolve()), "sha256": robot_asset["sha256"],
-                                        "hand_asset_manifest": {"path": str(hand_report.resolve()), "sha256": sha256_file(hand_report)}}
+        bundle["native_robot_asset"] = native_robot_asset_binding(native_robot, robot_asset["sha256"])
     elif not custom:
         raise ValueError("canonical bundle must bind the exact cooked native robot/hand overlay; workers must not recook hands")
     if "reference_kinematics" in recipe:
@@ -510,6 +559,14 @@ def load_bundle(path, kin, device="cpu", require_train=True, asset_filter=None, 
         record = native_robot["hand_asset_manifest"]
         if sha256_file(record["path"]) != record["sha256"]:
             raise ValueError("bound native hand-asset receipt bytes changed")
+        if "foot_asset_manifest" in native_robot:
+            record = native_robot["foot_asset_manifest"]
+            if sha256_file(record["path"]) != record["sha256"]:
+                raise ValueError("bound native foot-asset receipt bytes changed")
+            if native_robot_asset_binding(native_robot["path"], native_robot["sha256"]) != native_robot:
+                raise ValueError("bound native foot overlay identity differs")
+        elif (Path(native_robot["path"]).parent / "foot-asset.json").is_file():
+            raise ValueError("native foot extension requires its explicit manifest binding")
     if "reference_kinematics" in bundle:
         virtual = bundle["reference_kinematics"]
         if sha256_file(virtual["urdf"]["path"]) != virtual["urdf"]["sha256"]:

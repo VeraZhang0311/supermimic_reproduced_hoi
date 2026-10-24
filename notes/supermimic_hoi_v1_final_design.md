@@ -1,5 +1,9 @@
 # SuperMimic + HOI v1.0 最终设计方案
 
+最新足部物理修订：用户随后授权五通道新版从零实验，并要求与原ULTRA足部一致。实际ULTRA HOI入口为整脚STL collision+VHACD；新profile改用同源STL/原变换的explicit CoACD5hull/16vertex碰撞，保留原foot质量/COM/惯量与其他科学参数，跨引擎/cooker差异明确记录。source15已通过八资产严格原生门和全量4096/H32/64prefill资源验证（1461502，COMPLETED0:0），独立正式from-scratch job1461591已进入初始化/采集，见[足部对齐与验收](hoi_v1_ultra_foot_alignment_20261023.md)与[启动记录](hoi_v1_contact5_scratch_experiment_20261023.md)。旧zero-start继续使用不可变原球体足source13；不把旧原生或显存证据冒充网格足通过。
+
+双脚接触修订：按用户最新要求，`codex/hoi-v1-no-quality-gate` 的learned contact head扩为5通道，保留原左手—物体、右手—物体、物体—地面顺序，再追加左脚—物体、右脚—物体。真实监督使用足部碰撞几何与物体的区间法向冲量，不把脚—地面混入。Reference expected-contact和contact-match reward仍为双手定义；无新增脚接触奖励。旧三通道HOI checkpoint/native验收证据不能直接复用；用户后续授权已停止warm1461248、保留旧zero1461253，独立部署新版从零实验，未覆盖旧源码或结果。详细契约见[双脚contact扩展](hoi_v1_foot_contact_20261023.md)。
+
 分支修订：用户已要求保留并推送 `hoi/v1.0` 基线，在独立的 `codex/hoi-v1-no-quality-gate` 分支恢复固定500 iter WM-only后的交替更新。该分支的WM holdout质量比较仅作诊断，不控制actor/critic更新；native和非有限值等硬错误检查保留。具体语义与CPU验证见[无质量门分支记录](hoi_v1_no_quality_gate_20261023.md)。现有两个source13正式实验保留原行为继续运行，新分支尚未部署或启动实验；下文原始准备阶段的「尚未启动」属于历史时点。
 
 日期：2026-10-23。目标分支：`hoi/v1.0`。本文是设计规格；前两轮为设计与数据交接修订，第一阶段数据层证据见 [数据阶段实现记录](hoi_v1_data_stage1_20261023.md)。随后按用户要求实施完整v1，代码、CPU检查、独立集群数据/原生smoke及首次实验准备状态见 [实现与验收记录](hoi_v1_implementation_20261023.md)。正式训练尚未启动，不能把smoke称为正式实验或收敛。
@@ -288,7 +292,7 @@ Robot height 已在原 invariant 中，配合 relative object height 可确定 o
 
 ### 5.2 Contact auxiliary head
 
-从联合 WM 的最终 hidden feature 新接 `2048 → 128 → 3` 的 contact logits，预测 `(X_t,a_t,shape,xi) → b_actual(t+1)`：左手—物体、右手—物体、物体—地面。它与 dynamics 共享 WM backbone；ground channel 用于诊断和物理模式检验，v1 不要求 ground expected-contact 目标。这里 ground 严格指场景地面，不能把桌面或其他 support 接触合并命名为 ground；若数据要求额外支撑物，需显式扩展场景与 pair schema。
+从联合 WM 的最终 hidden feature 新接 `2048 → 128 → 5` 的 contact logits，预测 `(X_t,a_t,shape,xi) → b_actual(t+1)`，固定顺序为左手—物体、右手—物体、物体—地面、左脚—物体、右脚—物体。它与 dynamics 共享 WM backbone。脚通道使踢箱子等真实交互进入辅助监督；新增脚与原ground channel用于动力学辅助监督和诊断，当前不增加reference expected-contact目标或脚接触奖励。这里 ground 严格指场景地面，不能把桌面或其他 support 接触合并命名为 ground；若数据要求额外支撑物，需显式扩展场景与 pair schema。
 
 实际标签按**碰撞实体 pair**收集，对一个 control interval 内的接触 normal impulse 求和，再除以 `dt` 得到平均法向力；每个 pair 默认 `>1N` 记为接触。`b_actual(t+1)` 表示 `(t,t+1]` 这个已执行控制区间的汇总接触，和末端 `X_(t+1)` 一起记录；不是只读取最后一个 physics substep。保存原 impulse/force 数值、单位、聚合方式、有效 mask 和 threshold，同时输出轻触检出率。此 1N 是起始定义，需用已知手—物体、手—地面、物体—地面 probe 校准；标签定义改变必须版本化并在训练前锁定。
 

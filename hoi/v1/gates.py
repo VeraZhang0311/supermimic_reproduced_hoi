@@ -15,6 +15,8 @@ import sys
 
 import torch
 
+from .contacts import CHANNELS, LABEL_SCHEMA
+
 
 class GateError(RuntimeError):
     pass
@@ -95,6 +97,89 @@ def _native_geometry_evidence(physics, prefix):
     return blockers
 
 
+def _preserved_foot_physics(physical):
+    from supermimic.rotations import quat_to_mat
+    try:
+        tensors = []
+        for record in (physical["actual_first_body"], physical["original_reference_body"]):
+            mass, com, diagonal, quaternion = [torch.tensor(record[key], dtype=torch.float64)
+                for key in ("body_mass", "body_ipos", "body_inertia", "body_iquat")]
+            if (mass.shape != () or com.shape != (3,) or diagonal.shape != (3,) or quaternion.shape != (4,) or
+                    not all(bool(torch.isfinite(x).all()) for x in (mass, com, diagonal, quaternion)) or
+                    float(mass) <= 0 or not bool((diagonal > 0).all()) or abs(float(quaternion.norm()) - 1) > 1e-5):
+                return False
+            rotation = quat_to_mat(quaternion)
+            tensors.append((mass, com, rotation @ torch.diag(diagonal) @ rotation.T))
+        for actual, reference, key in zip(*tensors, (
+                "mass_absolute_error", "com_max_absolute_error_m", "inertia_tensor_max_absolute_error")):
+            error = physical[key]
+            if (type(error) not in (int, float) or not math.isfinite(error) or error < 0 or
+                    error > 1e-8 + 1e-5 * float(reference.abs().max()) or
+                    not torch.allclose(actual, reference, atol=1e-8, rtol=1e-5)):
+                return False
+        return True
+    except (KeyError, TypeError, ValueError, RuntimeError):
+        return False
+
+
+def _native_foot_evidence(report, physics, contact, prefix):
+    """The five-channel experiment requires the explicitly bound mesh-foot profile."""
+    from .foot_collision import FOOT_PROFILE, FOOT_SCHEMA, FOOT_SHA, ULTRA_URDF_SHA256, RECIPE, ORIGINAL_VHACD
+    audit = report.get("compiled_foot_audit", physics.get("compiled_foot_audit", {}))
+    blockers = []
+    cook = audit.get("cook", {})
+    expected_cook = {"algorithm": "CoACD", "recipe": RECIPE, "original_ultra_vhacd": ORIGINAL_VHACD,
+                     "equivalent_to_physx_vhacd": False, "cooker_and_usd_imports_isolated": True}
+    cook_hash = hashlib.sha256(json.dumps(expected_cook, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()
+    if (audit.get("schema") != "hoi_v1_compiled_ultra_foot_mesh_v1" or audit.get("passed") is not True or
+            audit.get("profile") != FOOT_PROFILE or audit.get("manifest_schema") != FOOT_SCHEMA or
+            any(not _sha256(audit.get(key)) for key in ("foot_asset_manifest_sha256", "cook_sha256", "overlay_sha256")) or
+            audit.get("original_ultra_urdf_sha256") != ULTRA_URDF_SHA256 or
+            cook != expected_cook or audit.get("cook_sha256") != cook_hash):
+        blockers.append(f"{prefix}: explicit ULTRA STL mesh-foot profile/cook provenance is missing")
+    topology, environments = audit.get("topology"), audit.get("num_envs")
+    reported_envs = report.get("num_envs", report.get("spec", {}).get("num_envs"))
+    valid_worlds = (type(environments) is int and environments > 0 and environments == reported_envs and
+                    topology in ("one_mujoco_world_per_environment", "one_world_with_named_environments"))
+    if not valid_worlds:
+        blockers.append(f"{prefix}: compiled mesh-foot audit does not bind the actual environment topology")
+    for side in ("left", "right"):
+        item = audit.get("sides", {}).get(side, {})
+        hulls = item.get("hulls_per_environment")
+        worlds = 1 if topology == "one_mujoco_world_per_environment" else environments
+        if (audit.get("source_mesh_sha256", {}).get(side) != FOOT_SHA[side] or
+                audit.get("source_mesh_transforms", {}).get(side) != {
+                    "collision_origin": [0., 0., 0.], "collision_rpy": [0., 0., 0.],
+                    "mesh_scale": [1., 1., 1.], "link": side + "_ankle_roll_link"} or
+                item.get("link") != side + "_ankle_roll_link" or type(hulls) is not int or not 1 <= hulls <= 5 or
+                item.get("all_active_colliders_mesh") is not True or item.get("all_geometries_graph_backed") is not True or
+                not _sha256(item.get("native_convex_evidence_sha256")) or
+                not valid_worlds or item.get("model_environment_count") != worlds or
+                item.get("simulated_environment_count") != environments or
+                item.get("model_collision_geom_count") != hulls * worlds or
+                contact.get("foot_collision_geom_counts", {}).get(side) != hulls * worlds):
+            blockers.append(f"{prefix}: {side} actual mesh-foot hulls/source identity do not cover every native environment")
+        physical = item.get("physical_properties", {})
+        if (physical.get("passed") is not True or physical.get("compared_model_body_count") != worlds or
+                not _sha256(physical.get("reference_mjcf_sha256")) or
+                physical.get("inertia_comparison") != "link_frame_symmetric_tensor" or
+                physical.get("absolute_tolerance") != 1e-8 or physical.get("relative_tolerance") != 1e-5 or
+                not _preserved_foot_physics(physical)):
+            blockers.append(f"{prefix}: {side} compiled foot mass/COM/inertia preservation readback is missing")
+        comparison = item.get("native_vs_cooked_geometry", {})
+        error, tolerance = comparison.get("max_error_m"), comparison.get("tolerance_m")
+        if (comparison.get("passed") is not True or
+                comparison.get("comparison") != "unordered_bidirectional_vertex_set_distance" or
+                comparison.get("coordinate_frame") != "ankle_roll_link" or
+                not _sha256(comparison.get("cooked_geometry_sha256")) or
+                type(tolerance) not in (int, float) or not math.isfinite(tolerance) or not 0 < tolerance <= 5e-5 or
+                type(error) not in (int, float) or not math.isfinite(error) or not 0 <= error <= tolerance or
+                not valid_worlds or type(hulls) is not int or comparison.get("compared_model_environment_count") != worlds or
+                comparison.get("matched_hull_pairs") != hulls * worlds):
+            blockers.append(f"{prefix}: {side} actual ankle-local mesh hulls were not verified against their bound cook")
+    return blockers
+
+
 def validate_native_evidence(report_or_path, *, expected_physics=None, required_asset_ids=None,
                              expected_bundle_sha256=None):
     if report_or_path is None:
@@ -152,6 +237,7 @@ def validate_native_evidence(report_or_path, *, expected_physics=None, required_
         if physics.get("compiled_collision_geometry_verified_against_bundle") is not True:
             blockers.append(f"{prefix}: compiled collider and cached reward geometry are not verified equal")
         blockers.extend(_native_geometry_evidence(physics, prefix))
+        blockers.extend(_native_foot_evidence(report, physics, contact, prefix))
         geometry = report.get("geometry", {})
         if report.get("palm_selection_verified", geometry.get("palm_selection_verified")) is not True:
             blockers.append(f"{prefix}: actual palm-surface probe selection is not calibrated")
@@ -165,10 +251,14 @@ def validate_native_evidence(report_or_path, *, expected_physics=None, required_
         self_collision = report.get("compiled_self_collision_audit", {})
         if self_collision.get("enabled") is not True or self_collision.get("allowed_nonadjacent_robot_geom_pairs", 0) < 1:
             blockers.append(f"{prefix}: compiled nonadjacent self-collision audit missing")
-        expected_channels = ["left_hand_object", "right_hand_object", "object_ground"]
-        if (contact.get("schema") != "hoi_v1_pair_normal_impulse_v1" or list(contact.get("channels", [])) != expected_channels or
+        if (contact.get("schema") != LABEL_SCHEMA or list(contact.get("channels", [])) != list(CHANNELS) or
             contact.get("interval") != "(t,t+1]" or contact.get("num_substeps") != 4 or contact.get("substep_dt") != .005):
-            blockers.append(f"{prefix}: pair labels do not cover the four physics substeps of (t,t+1]")
+            blockers.append(f"{prefix}: v2 five-channel pair labels do not cover the four physics substeps of (t,t+1]")
+        for side in ("left", "right"):
+            count = contact.get("foot_collision_geom_counts", {}).get(side)
+            if (contact.get("foot_body_links", {}).get(side) != side + "_ankle_roll_link" or
+                    type(count) is not int or count < 1):
+                blockers.append(f"{prefix}: {side} foot is not bound to active native ankle-roll collision geometry")
         if contact.get("normal_force_api") != "mujoco_warp.contact_force(to_world_frame=False)[0]":
             blockers.append(f"{prefix}: pair-specific normal-force instrumentation is unverified")
         if contact.get("use_cuda_graph") is not False or physics.get("use_cuda_graph") is not False:
@@ -180,15 +270,35 @@ def validate_native_evidence(report_or_path, *, expected_physics=None, required_
         probes = report.get("pair_probes", {})
         if report.get("native_pair_calibration_complete") is not True or probes.get("passed") is not True:
             blockers.append(f"{prefix}: native pair calibration is incomplete")
-        for channel, index in (("left_hand_object", 0), ("right_hand_object", 1), ("object_ground", 2)):
+        for index, channel in enumerate(CHANNELS):
             values = probes.get(channel, {}).get("maximum_interval_normal_force_N", [])
-            if probes.get("checks", {}).get(channel) is not True or len(values) != 3 or not _finite(values) or values[index] <= threshold:
+            if probes.get("checks", {}).get(channel) is not True or len(values) != len(CHANNELS) or not _finite(values) or values[index] <= threshold:
                 blockers.append(f"{prefix}: {channel} positive pair probe is missing")
         negative = probes.get("hand_ground_negative", {})
         negative_pair, hand_ground = negative.get("maximum_interval_normal_force_N", []), negative.get("maximum_hand_ground_interval_force_N", [])
-        if (probes.get("checks", {}).get("hand_ground_not_mislabelled") is not True or len(negative_pair) != 3 or len(hand_ground) != 2 or
+        if (probes.get("checks", {}).get("hand_ground_not_mislabelled") is not True or len(negative_pair) != len(CHANNELS) or len(hand_ground) != 2 or
             not _finite(negative_pair + hand_ground) or max(hand_ground, default=0) <= threshold or max(negative_pair[:2], default=math.inf) != 0):
             blockers.append(f"{prefix}: hand-ground negative identity control did not pass")
+        for index, side in enumerate(("left", "right")):
+            positive = probes.get(side + "_foot_object", {}).get("definition", {})
+            placement = positive.get("ground_placement_audit", {})
+            penetration = placement.get("maximum_ground_penetration_m")
+            clearance = placement.get("minimum_final_world_z_m")
+            if (positive.get("foot_surface", {}).get("primitive") != "actual_compiled_convex_mesh" or
+                    positive.get("object_support_selection") != "lowest_world_z_vertex_on_opposing_support_plane" or
+                    placement.get("passed") is not True or placement.get("maximum_allowed_penetration_m") != .002 or
+                    placement.get("minimum_required_clearance_m") != .002 or
+                    placement.get("root_and_object_translated_identically") is not True or
+                    type(clearance) not in (int, float) or not math.isfinite(clearance) or clearance < .002 - 2e-6 or
+                    type(penetration) not in (int, float) or not math.isfinite(penetration) or not 0 <= penetration <= .002 + 2e-6):
+                blockers.append(f"{prefix}: {side} mesh-foot positive probe lacks a shallow above-ground object placement audit")
+            negative = probes.get(side + "_foot_ground_negative", {})
+            values = negative.get("maximum_interval_normal_force_N", [])
+            ground = negative.get("maximum_foot_ground_interval_force_N", [])
+            if (probes.get("checks", {}).get(side + "_foot_ground_not_mislabelled") is not True or
+                    len(values) != len(CHANNELS) or len(ground) != 2 or not _finite(values + ground) or
+                    ground[index] <= threshold or max(values[3:], default=math.inf) != 0):
+                blockers.append(f"{prefix}: {side} foot-ground negative identity control did not pass")
         if report.get("zero_action_smoke_completed") is not True:
             blockers.append(f"{prefix}: native smoke did not complete")
         if expected_bundle_sha256 is not None and report.get("bundle_content_sha256") != expected_bundle_sha256:
@@ -261,17 +371,17 @@ def validate_wm_evidence(report, proposal=None):
                     elif metrics[0] > proposal.baseline_error_ratio * min(metrics[1:]) or (metrics[0] == min(metrics[1:]) and metrics[0] > 0):
                         blockers.append(f"{horizon}-step {name} phase has not improved over both baselines")
     contact = report.get("contact_diagnostics", {})
-    for channel in range(3):
+    for channel in range(len(CHANNELS)):
         for key in ("positive_counts", "negative_counts"):
             values = contact.get(key, [])
-            if len(values) != 3 or values[channel] < 1:
+            if len(values) != len(CHANNELS) or values[channel] < 1:
                 blockers.append(f"actual pair channel {channel} lacks {key}")
         for key in ("precision", "recall"):
             values = contact.get(key, [])
-            if len(values) != 3 or not _finite(values) or not 0 < values[channel] <= 1:
+            if len(values) != len(CHANNELS) or not _finite(values) or not 0 < values[channel] <= 1:
                 blockers.append(f"actual pair channel {channel} has no positive {key}")
         brier, baseline = contact.get("brier_per_channel", []), contact.get("prevalence_baseline_brier", [])
-        if len(brier) != 3 or len(baseline) != 3 or not _finite(brier + baseline):
+        if len(brier) != len(CHANNELS) or len(baseline) != len(CHANNELS) or not _finite(brier + baseline):
             blockers.append(f"actual pair channel {channel} calibration diagnostics missing")
         elif proposal.require_pair_brier_improvement and brier[channel] >= baseline[channel]:
             blockers.append(f"actual pair channel {channel} probabilities do not improve on prevalence-only Brier")

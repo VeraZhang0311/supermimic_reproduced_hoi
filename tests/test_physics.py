@@ -23,6 +23,40 @@ def parse(flags=(), saved=None, legacy=False):
 
 
 class PhysicsTests(unittest.TestCase):
+    def test_explicit_foot_overlay_validates_original_hand_asset_without_relabelling_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base = root / "base"
+            base.mkdir()
+            source = base / "source.usda"
+            source.write_text("original robot source")
+            original = base / "hands.usda"
+            original.write_text("original frozen hand overlay")
+            h = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
+            report = {"source_usd": str(source), "source_usd_sha256": h(source),
+                      "usd": str(original), "usd_sha256": h(original), "recipe": RECIPE,
+                      "original_authored_values_unchanged": True,
+                      "hands": {side: {"stl_sha256": digest} for side, digest in HAND_SHA.items()}}
+            receipt = json.dumps(report).encode()
+            (base / "hand-asset.json").write_bytes(receipt)
+            extended = root / "extended"
+            extended.mkdir()
+            overlay = extended / "feet.usda"
+            overlay.write_text("explicit separate foot overlay")
+            (extended / "hand-asset.json").write_bytes(receipt)
+            (extended / "foot-asset.json").write_text("synthetic explicit foot receipt")
+            foot = {"base_robot_asset": {"path": str(original), "sha256": h(original)}}
+            with patch("hoi.v1.foot_collision.validate_overlay", return_value=foot):
+                actual = load_hand_asset(overlay)
+                self.assertEqual(actual["hands"], report["hands"])
+                self.assertEqual(actual["usd_sha256"], h(overlay))
+                self.assertFalse(actual["original_authored_values_unchanged"])
+                self.assertEqual(actual["foot_asset"], foot)
+                self.assertEqual((extended / "hand-asset.json").read_bytes(), receipt)
+                source.write_text("tampered original source")
+                with self.assertRaisesRegex(ValueError, "source USD changed"):
+                    load_hand_asset(overlay)
+
     def test_new_defaults_and_all_independent_combinations(self):
         with patch.dict(os.environ, {}, clear=True):
             self.assertEqual(asdict(parse()[0]), {'hand_collision': True, 'self_collision': True})

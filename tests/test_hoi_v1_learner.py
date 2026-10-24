@@ -14,6 +14,7 @@ import torch
 from hoi.v1.buffer import FIELDS, ReplayBuffer
 from hoi.v1.checkpoint import make_checkpoint, load_checkpoint
 from hoi.v1.config import TrainConfig
+from hoi.v1.contacts import CHANNELS
 from hoi.v1.learner import Learner
 from hoi.v1.mdp import HOIMDP
 from hoi.v1.motion import TrainingMotionBank
@@ -109,7 +110,7 @@ def transition(learner, f, ep_step, a=None, a_prev=None):
     O1 = (O[0] + .02 * O[2] + .002 * a[:, :3], O[1], O[2] + .01 * a[:, :3], O[3])
     value.update(s=flatten_state(S), s1=flatten_state(S1), o=flatten_object(O), o1=flatten_object(O1),
                  a=a.clone(), a_prev=a_prev.clone(), f=f, ep_step=torch.full((n,), ep_step, dtype=torch.int32),
-                 asset_id=learner.motion.asset_ids[f], contact=torch.ones(n, 3), contact_valid=torch.ones(n, 3, dtype=torch.bool))
+                 asset_id=learner.motion.asset_ids[f], contact=torch.ones(n, len(CHANNELS)), contact_valid=torch.ones(n, len(CHANNELS), dtype=torch.bool))
     value["xi"][:, 0] = .75
     value["xi_o"][:, 0] = 1.
     return value
@@ -133,6 +134,22 @@ class ReplayTest(unittest.TestCase):
         window = learner.buffer._windows_at(torch.tensor([0]), torch.tensor([0]), 8)
         torch.testing.assert_close(window["mask"], torch.tensor([[1., 1., 1., 0., 0., 0., 0., 0.]]))
         torch.testing.assert_close(window["s1"][0, 2], learner.buffer.data["s1"][2, 0])
+
+    def test_replay_preserves_distinct_feet_and_rejects_legacy_contact_shapes(self):
+        learner = make_learner()
+        item = transition(learner, [70, 80], 0)
+        item["contact"] = torch.tensor([[0., 0., 0., 1., 0.], [0., 0., 1., 0., 1.]])
+        item["impulse"] = torch.tensor([[0., 0., 0., .03, 0.], [0., 0., .04, 0., .05]])
+        item["contact_valid"][1, 3] = False
+        learner.buffer.add(item)
+        window = learner.buffer._windows_at(torch.tensor([0, 0]), torch.tensor([0, 1]), 1)
+        for name in ("contact", "contact_valid", "impulse"):
+            torch.testing.assert_close(window[name][:, 0], item[name])
+        for name in ("contact", "contact_valid", "impulse"):
+            old = {**item, name: item[name][:, :3]}
+            with self.assertRaisesRegex(ValueError, "wrong " + name + " shape"):
+                learner.buffer.add(old)
+        self.assertEqual(learner.buffer.size, 1)
 
     def test_histories_respect_reset_asset_and_ring_boundary(self):
         learner = make_learner()
@@ -200,6 +217,25 @@ class LearnerTest(unittest.TestCase):
         self.assertEqual(learner.sim_steps, 2)
         self.assertEqual(action.shape, (2, 29))
 
+    def test_feet_class_counts_use_only_valid_fit_labels_and_hand_reward_stays_fixed(self):
+        learner = make_learner()
+        item = transition(learner, [0, 70], 0)
+        item["contact"] = torch.tensor([[1., 1., 1., 1., 1.], [0., 0., 0., 1., 0.]])
+        item["contact_valid"][1, 4] = False
+        learner.observe(item)
+        torch.testing.assert_close(learner.contact_positive, torch.tensor([0., 0., 0., 1., 0.], dtype=torch.float64))
+        torch.testing.assert_close(learner.contact_negative, torch.tensor([1., 1., 1., 0., 0.], dtype=torch.float64))
+        item = transition(learner, [71, 81], 1)
+        item["contact"] = torch.tensor([[0., 0., 0., 0., 1.], [0., 0., 0., 1., 0.]])
+        learner.observe(item)
+        torch.testing.assert_close(learner.contact_positive, torch.tensor([0., 0., 0., 2., 1.], dtype=torch.float64))
+        torch.testing.assert_close(learner.contact_negative, torch.tensor([3., 3., 3., 1., 1.], dtype=torch.float64))
+        S, O = unflatten_state(item["s1"]), unflatten_object(item["o1"])
+        frames = item["f"] + 1
+        hands_only = learner.mdp.reward(S, O, frames, item["a"], item["a_prev"], item["contact"][:, :3])
+        with_feet = learner.mdp.reward(S, O, frames, item["a"], item["a_prev"], item["contact"])
+        torch.testing.assert_close(hands_only, with_feet, rtol=0, atol=0)
+
     def test_eight_step_wm_fit_uses_executed_actions_and_changes_parameters(self):
         learner = make_learner()
         fill(learner)
@@ -212,7 +248,7 @@ class LearnerTest(unittest.TestCase):
                 torch.testing.assert_close(call.args[2], window["a"][:, t])
         self.assertEqual(predicted_s[0].shape, (3, 8, 3))
         self.assertEqual(predicted_o[0].shape, (3, 8, 3))
-        self.assertEqual(logits.shape, (3, 8, 3))
+        self.assertEqual(logits.shape, (3, 8, len(CHANNELS)))
         loss = learner.wm_update()
         self.assertTrue(all(torch.isfinite(torch.tensor(v)) for v in loss.values()))
         self.assertTrue(any(not torch.equal(v, original[k]) for k, v in learner.wm.state_dict().items()))

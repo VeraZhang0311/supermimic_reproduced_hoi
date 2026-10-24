@@ -12,6 +12,7 @@ from supermimic.rotations import so3_exp
 from hoi.v1.state import (flatten_object, unflatten_object, object_features, object_targets,
                           object_state_error, integrate_object)
 from hoi.v1.networks import Policy, WorldModel, Critic, ShapeEncoder, frozen_parameters
+from hoi.v1.contacts import CHANNELS, LABEL_SCHEMA
 from hoi.v1.checkpoint import make_checkpoint, load_checkpoint, save_checkpoint, migrate_legacy
 from hoi.v1.checkpoint import checkpoint_training_progress
 
@@ -144,6 +145,7 @@ class NetworksTest(unittest.TestCase):
         self.assertEqual([x.out_features for x in wm.net if isinstance(x, nn.Linear)], [2048, 2048, 2048, 82])
         self.assertEqual(wm.net[0].in_features, 224)
         self.assertEqual(wm.contact_head[0].in_features, 2048)
+        self.assertEqual(wm.contact_head[-1].out_features, 5)
         self.assertEqual(critic.net[0].in_features, 1214)
         self.assertEqual([x.out_features for x in critic.net if isinstance(x, nn.Linear)], [256, 128, 1])
         self.assertEqual(len({id(m.shape_encoder) for m in (pi, wm, critic)}), 3)
@@ -281,8 +283,8 @@ class NetworksTest(unittest.TestCase):
         S = tuple(x[:, None].expand((2, 2) + x.shape[1:]) for x in S)
         O = tuple(x[:, None].expand((2, 2) + x.shape[1:]) for x in O)
         O_bad = tuple(x + .01 if i != 1 else x for i, x in enumerate(O))
-        logits = torch.zeros(2, 2, 3, requires_grad=True)
-        valid = torch.tensor([[[1., 0., 0.], [0., 0., 0.]], [[1., 1., 1.], [1., 1., 1.]]])
+        logits = torch.zeros(2, 2, len(CHANNELS), requires_grad=True)
+        valid = torch.tensor([[[1., 0., 0., 0., 0.], [0., 0., 0., 0., 0.]], [[1., 1., 1., 1., 1.], [1., 1., 1., 1., 1.]]])
         mask = torch.tensor([[1., 0.], [1., 0.]])
         losses = wm.loss(S, O_bad, S, O, logits, torch.zeros_like(logits), valid, mask)
         torch.testing.assert_close(losses["contact"], torch.tensor(.6931472))
@@ -322,6 +324,61 @@ class NetworksTest(unittest.TestCase):
         altered_eps.object_in_norm.eps = .5
         with self.assertRaises(ValueError):
             load_checkpoint(checkpoint, pi, altered_eps, critic, physics=PHYSICS, data_identity=DATA)
+
+    def test_feet_supervision_reaches_each_head_row_and_shared_dynamics_features(self):
+        _, wm, _ = modules()
+        S, O = states(2)
+        S1, O1, logits = wm.step(S, O, torch.randn(2, 29), torch.randn(2, 33),
+                                  torch.randn(2, 12), torch.randn(2, 128, 3))
+        self.assertEqual(CHANNELS, ("left_hand_object", "right_hand_object", "object_ground",
+                                    "left_foot_object", "right_foot_object"))
+        self.assertEqual(logits.shape, (2, 5))
+        # Two distinct executed labels: left kick then right kick. Only the
+        # feet are supervised here, so old channels cannot create this gradient.
+        targets = torch.tensor([[0., 0., 0., 1., 0.], [0., 0., 0., 0., 1.]])
+        valid = torch.tensor([[0, 0, 0, 1, 1]], dtype=torch.bool).expand(2, -1)
+        loss = wm.loss(S1, O1, S1, O1, logits, targets, valid, torch.ones(2),
+                       pos_weight=torch.tensor([1., 1., 1., 3., 7.]))["contact"]
+        logits.retain_grad()
+        loss.backward()
+        self.assertTrue(bool((logits.grad[:, 3:] * (1 - 2 * targets[:, 3:]) > 0).all()))
+        self.assertEqual(float(logits.grad[:, :3].abs().sum()), 0.)
+        self.assertTrue(bool((wm.contact_head[-1].weight.grad[3:].abs().sum(-1) > 0).all()))
+        self.assertEqual(float(wm.contact_head[-1].weight.grad[:3].abs().sum()), 0.)
+        self.assertGreater(float(wm.net[0].weight.grad.abs().sum()), 0.)
+        self.assertGreater(sum(float(p.grad.abs().sum()) for p in wm.shape_encoder.parameters() if p.grad is not None), 0.)
+        # Invalid labels do not contribute, even for a foot-positive target.
+        wm.zero_grad(set_to_none=True)
+        independent = torch.zeros(2, 5, requires_grad=True)
+        valid = valid.clone()
+        valid[:, 3] = False
+        wm.loss(S1, O1, S1, O1, independent, targets, valid, torch.ones(2))["contact"].backward()
+        self.assertEqual(float(independent.grad[:, 3].abs().sum()), 0.)
+        self.assertGreater(float(independent.grad[:, 4].abs().sum()), 0.)
+        with self.assertRaisesRegex(ValueError, "dimension 5"):
+            wm.loss(S1, O1, S1, O1, independent[:, :3], targets[:, :3], valid[:, :3], torch.ones(2))
+
+    def test_three_channel_hoi_checkpoint_is_rejected_before_any_mutation(self):
+        models = modules()
+        optimizers = {key: torch.optim.Adam(model.parameters()) for key, model in zip(("pi", "wm", "critic"), models)}
+        checkpoint = make_checkpoint(*models, optimizers, iteration=12, physics=PHYSICS,
+                                     data_identity=DATA, initialization={"kind": "fresh"})
+        self.assertEqual(checkpoint["feature_schema"]["contact"], list(CHANNELS))
+        self.assertEqual(checkpoint["feature_schema"]["actual_contact_label"]["schema"], LABEL_SCHEMA)
+        old = copy.deepcopy(checkpoint)
+        old["feature_schema"]["version"] = "supermimic_hoi_v1_full_reference_1"
+        old["feature_schema"]["contact"] = list(CHANNELS[:3])
+        old["feature_schema"]["actual_contact_label"]["schema"] = "hoi_v1_pair_normal_impulse_v1"
+        last = str(len(models[1].contact_head) - 1)
+        for field in ("weight", "bias"):
+            key = "contact_head." + last + "." + field
+            old["wm"][key] = old["wm"][key][:3].clone()
+        before = [copy.deepcopy(model.state_dict()) for model in models]
+        with self.assertRaisesRegex(ValueError, "old three-channel HOI checkpoints"):
+            load_checkpoint(old, *models, optimizers, physics=PHYSICS, data_identity=DATA)
+        for model, state in zip(models, before):
+            for name, value in model.state_dict().items():
+                torch.testing.assert_close(value, state[name], rtol=0, atol=0)
 
     def test_legacy_unknown_physics_and_no_critic(self):
         lpi, lwm, _ = legacy_models()

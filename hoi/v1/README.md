@@ -1,5 +1,7 @@
 # SuperMimic HOI v1
 
+最新实验修订：用户已授权五通道从零训练，并要求足部几何与作者ULTRA对齐。新profile使用同SHA的完整脚STL和零安装变换，在不可变手overlay上单独关闭旧脚球并追加CoACD5hull/16vertex凸包；原VHACD60000仅记为作者配置，不冒称相同cooker。train/eval80使用显式新foot manifest和新bundle身份，原缓存只读复用。source15已通过八资产严格原生门及全量4096/H32/64prefill反传资源验证（job1461502，COMPLETED0:0），新正式from-scratch job1461591已注册独立W&B并进入采集。详见[ULTRA足部对齐](../../notes/hoi_v1_ultra_foot_alignment_20261023.md)和[新实验启动记录](../../notes/hoi_v1_contact5_scratch_experiment_20261023.md)。
+
 设计依据：`notes/supermimic_hoi_v1_final_design.md`。新入口位于 `hoi.v1`；现有 `hoi.run` 仍是冻结、无物体 policy observation 的 zero-shot 入口。
 
 ## 数据与真实几何
@@ -14,6 +16,10 @@ python -m hoi.v1.native --bundle /new/bundle/bundle.json --asset-id 0 \
 ```
 
 `--limit` 仅生成显式 subset，正式配置拒绝 subset。Native gate 需覆盖全部训练静态 geometry groups，验证四个5ms子步的 pair normal impulse、手/物体/地面身份、正负碰撞控制、实际物理与 reward geometry 一致性、真实掌面 probe 选择。未完成的项目保持 blocked。
+
+本分支新增左右脚—物体真实监督：contact head 为 `2048→128→5`，顺序固定为左手—物体、右手—物体、物体—地面、左脚—物体、右脚—物体。足部绑定实际 G1 `left_ankle_roll_link` / `right_ankle_roll_link` 的有效碰撞几何，按同一20ms区间内四个5ms子步累加法向冲量，再以平均法向力严格大于1N标记正例；脚—地面不计入脚—物体，源39个body flags不作为pair监督。Replay、BCE权重、holdout、评估和W&B同步扩为五通道；reference expected-contact与contact-match reward仍只对应双手。
+
+标签schema升级为 `hoi_v1_pair_normal_impulse_v2`，网络feature版本为 `supermimic_hoi_v1_full_reference_2`。旧三通道HOI checkpoint不能直接resume，新分支明确拒绝并要求显式迁移；motion-only legacy初始化仍保留。旧三通道native证据不能授权新版；source15已重新验证五通道正负例。原head扩展的243项CPU记录为历史时点，最新mesh版本完整CPU为261项（260通过/1本机USD库缺失skip，GPU实际USD创建与原生检查另通过）。详见[双脚contact扩展](../../notes/hoi_v1_foot_contact_20261023.md)。
 
 完整recipe格式、固定`native_robot_asset`手部overlay和显式CPU并行预处理见 [PREPARATION.md](PREPARATION.md)。同recipe独立CoACD重算可能改变hull，因此worker复用哈希绑定的已验证overlay，不为每个进程重新生成手碰撞体。
 

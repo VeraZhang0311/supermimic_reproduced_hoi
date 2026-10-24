@@ -19,11 +19,11 @@ from urllib.parse import urlsplit
 import uuid
 
 from .config import TrainConfig, fresh_directory, write_json
+from .contacts import CHANNELS, LABEL_SCHEMA
 from .variants import VARIANTS
 
 ENTITY = "tianzizh-university-of-pennsylvania"
 PROJECT = "SuperMimic_Upstream_Reproduction"
-CHANNELS = ("left_hand_object", "right_hand_object", "object_ground")
 CASE_SCALARS = (
     "control_steps", "state_frames", "full_reference_completed", "first_supermimic_failure_step", "first_hoi_failure_step",
     "supermimic_norm_return", "human_normalized_return", "hoi_normalized_return", "hoi_reference_mask_normalized_return",
@@ -88,8 +88,22 @@ def _nested(value, *keys):
     return value
 
 
+def _contact_identity(value):
+    if "contact_channels" not in value and "contact_label_schema" not in value:
+        return False
+    channels = value.get("contact_channels")
+    if (not isinstance(channels, (list, tuple)) or tuple(channels) != CHANNELS or
+            value.get("contact_label_schema") != LABEL_SCHEMA):
+        raise ValueError("tracking requires the current five-channel contact label contract")
+    return True
+
+
 def _configuration(plan, evaluation):
     out = {"method": "HOI_v1_full_reference", "tracking_schema": "hoi_v1_curated_tracking_1"}
+    plan_contact, evaluation_contact = _contact_identity(plan), _contact_identity(evaluation)
+    if plan_contact or evaluation_contact:
+        out["contact/label_schema"] = LABEL_SCHEMA
+        out["contact/channel_count"] = len(CHANNELS)
     raw = _mapping(plan.get("config"))
     for key, default in TrainConfig().to_dict().items():
         value = raw.get(key)
@@ -146,6 +160,7 @@ def _training_event(record):
     if type(record.get("iteration")) is not int or record["iteration"] < 0:
         raise ValueError("training metric rows require a nonnegative integer iteration")
     metrics = {}
+    _contact_identity(record)
     for key in ("iteration", "sim_steps", "lr", "elapsed_seconds", "wm_updates", "policy_updates"):
         _put(metrics, "train/" + key, record.get(key))
     for key in ("total", "robot", "object", "contact"):
@@ -159,7 +174,9 @@ def _training_event(record):
         _put(metrics, "real/" + key, _mean(values))
     for source, prefix in (("fit_contact_positive", "contact/fit_positive"), ("fit_contact_negative", "contact/fit_negative")):
         values = record.get(source)
-        if isinstance(values, list) and len(values) == 3:
+        if values is not None and (not isinstance(values, list) or len(values) != len(CHANNELS)):
+            raise ValueError("tracking fit contact counts must use all five actual channels")
+        if isinstance(values, list):
             for index, channel in enumerate(CHANNELS):
                 _put(metrics, prefix + "/" + channel, values[index])
     if type(_nested(record, "policy_gate", "passed")) is bool:
@@ -186,6 +203,16 @@ def _evaluation_summary(report):
             for statistic in ("mean", "p95", "max", "final"):
                 _put(metrics, prefix + key + "/" + statistic, _nested(case, key, statistic))
         contact = _mapping(case.get("contact"))
+        if "channels" in contact or "label_schema" in contact:
+            _contact_identity({"contact_channels": contact.get("channels"), "contact_label_schema": contact.get("label_schema")})
+        for key in ("actual_positive_intervals", "actual_valid_intervals", "actual_pair_valid_fraction",
+                    "actual_contact_fraction", "maximum_interval_normal_impulse_Ns"):
+            values = contact.get(key)
+            if values is not None and (not isinstance(values, list) or len(values) != len(CHANNELS)):
+                raise ValueError("tracking actual contact metrics require all five channels")
+            if isinstance(values, list):
+                for channel, value in zip(CHANNELS, values):
+                    _put(metrics, prefix + "contact/" + key + "/" + channel, value)
         for key in ("expected_positive_intervals", "expected_contact_coverage", "expected_valid_fraction", "all_known_expected_contact_matched"):
             _put(metrics, prefix + "contact/" + key, contact.get(key))
         for key in ("missing_contact_intervals", "extra_contact_intervals", "max_missing_streak_steps", "max_missing_streak_seconds", "missing_streak_ge16"):
@@ -223,6 +250,7 @@ def _validate_payload(payload):
     enum_fields = {"method": ("HOI_v1_full_reference",), "tracking_schema": ("hoi_v1_curated_tracking_1",),
                    "training/amp": ("none", "bf16"), "training/experiment_kind": ("formal", "smoke"),
                    "training/variant": VARIANTS, "evaluation/variant": VARIANTS,
+                   "contact/label_schema": (LABEL_SCHEMA,), "contact/channel_count": (len(CHANNELS),),
                    "evaluation/partition": ("train", "eval80", "test40", "validation", "regression", "test")}
     numeric_fields = {"training/" + key for key, value in TrainConfig().to_dict().items() if type(value) in (int, float, bool)}
     numeric_fields.add("training/wm_quality_gate_enabled")
@@ -256,6 +284,9 @@ def _validate_payload(payload):
                  "human_normalized_return", "hoi_normalized_return", "hoi_reference_mask_normalized_return", "objective_normalized_return", "checkpoint_iteration",
                  "optimizer_updates", "normalization_updates", "no_failure_reset", "physical_objects", "elapsed_seconds"}
     case_keys = set(CASE_SCALARS)
+    case_keys.update("contact/" + key + "/" + channel for key in (
+        "actual_positive_intervals", "actual_valid_intervals", "actual_pair_valid_fraction", "actual_contact_fraction",
+        "maximum_interval_normal_impulse_Ns") for channel in CHANNELS)
     case_keys.update(group + "/" + statistic for group in ERROR_GROUPS for statistic in ("mean", "p95", "max", "final"))
     case_keys.update("contact/" + key for key in ("expected_positive_intervals", "expected_contact_coverage", "expected_valid_fraction", "all_known_expected_contact_matched"))
     case_keys.update("contact/" + key + "/" + side for key in ("missing_contact_intervals", "extra_contact_intervals", "max_missing_streak_steps", "max_missing_streak_seconds", "missing_streak_ge16") for side in ("left", "right"))

@@ -20,6 +20,7 @@ from hoi.data.timebase import CanonicalTimebase
 from hoi.ultra_metrics import clip_metrics
 from .checkpoint import load_checkpoint, checkpoint_variant, checkpoint_training_progress
 from .config import fresh_directory, write_json, source_identity
+from .contacts import CHANNELS, LABEL_SCHEMA
 from .networks import Policy, WorldModel, Critic
 from .state import unflatten_state, unflatten_object
 
@@ -88,10 +89,11 @@ def _state_record(snapshot, motion, fk39, joint_order):
 
 
 def _contact_metrics(control, expected, valid):
-    from .diagnostics import contact_transition_events
-    expected_transitions = contact_transition_events(expected, valid, ("left_hand_object", "right_hand_object"))
+    from .diagnostics import contact_transition_events, validate_actual_contact_fields
+    validate_actual_contact_fields(control, len(expected))
+    expected_transitions = contact_transition_events(expected, valid, CHANNELS[:2])
     actual_transitions = contact_transition_events(control["contact"], control["contact_valid"],
-                                                   ("left_hand_object", "right_hand_object", "object_ground_support"))
+                                                   tuple("object_ground_support" if name == "object_ground" else name for name in CHANNELS))
     actual = control["contact"][:, :2] > .5
     pair_valid = control["contact_valid"][:, :2].bool()
     expected, valid = expected.bool(), valid.bool() & pair_valid
@@ -106,7 +108,10 @@ def _contact_metrics(control, expected, valid):
     expected_total = int(positive.sum())
     covered = int((positive & actual).sum())
     has_pair_truth = bool(valid.any())
-    return {"expected_positive_intervals": expected_total,
+    return {"channels": list(CHANNELS), "label_schema": LABEL_SCHEMA,
+            "actual_positive_intervals": ((control["contact"] > .5) & control["contact_valid"].bool()).sum(0).tolist(),
+            "actual_valid_intervals": control["contact_valid"].bool().sum(0).tolist(),
+            "expected_positive_intervals": expected_total,
             "expected_contact_coverage": covered / expected_total if expected_total else None,
             "expected_valid_fraction": float(valid.float().mean()),
             "actual_pair_valid_fraction": control["contact_valid"].float().mean(0).tolist(),
@@ -118,7 +123,7 @@ def _contact_metrics(control, expected, valid):
             "missing_streak_ge16": (maximum >= 16).tolist(),
             "all_known_expected_contact_matched": bool(not missing.any()) if has_pair_truth and expected_total else None,
             "actual_transition_events": actual_transitions, "expected_transition_events": expected_transitions,
-            "definition": "actual pair interval labels versus valid expected LR schedule; no grasp-success assertion"}
+            "definition": "five actual pair interval channels; expected/missing/reward labels remain LR hands only; no grasp-success assertion"}
 
 
 def score_rollout(states, control, motion, clip_id, joint_order, *, max_human_reward=.1, source_body_names=None, variant="hoi_v1"):
@@ -197,6 +202,13 @@ def evaluate_group(policy, motion, mdp, shapes, workers, clip_ids, *, fk39, join
     group_metadata.setdefault("checkpoint_training_source_content_sha256", None)
     group_metadata.setdefault("checkpoint_training_source_identity_status", "unknown")
     group_metadata.setdefault("checkpoint_training_progress", checkpoint_training_progress({}))
+    if (group_metadata.get("contact_label_schema", LABEL_SCHEMA) != LABEL_SCHEMA or
+            tuple(group_metadata.get("contact_channels", CHANNELS)) != CHANNELS):
+        raise ValueError("evaluation metadata differs from the current five-channel contact contract")
+    group_metadata["contact_channels"] = list(CHANNELS)
+    group_metadata["contact_label_schema"] = LABEL_SCHEMA
+    if "contact_schema" in group_metadata:
+        _validate_contact_contract(group_metadata["contact_schema"])
     if len(fk39.body_names) != 39 or len(set(fk39.body_names)) != 39:
         raise ValueError("PHC requires the bound original 39-body name order")
     if len(joint_names) != 29 or len(set(joint_names)) != 29 or len(fk39.dof_names) != 29 or set(joint_names) != set(fk39.dof_names):
@@ -246,6 +258,9 @@ def evaluate_group(policy, motion, mdp, shapes, workers, clip_ids, *, fk39, join
             if not bool(torch.isfinite(action).all()):
                 raise FloatingPointError("frozen evaluation policy produced nonfinite actions")
             transition = workers.step(action)
+            from .diagnostics import validate_actual_contact_fields
+            validate_actual_contact_fields({"contact": transition["contact"], "contact_valid": transition["contact_valid"],
+                                            "contact_impulse_Ns": transition["impulse"]}, workers.N)
             after = workers.snapshot()
             f1 = torch.minimum(f + 1, ends)
             if not torch.equal(after["f"], f1) or not torch.equal(transition["f"], f):
@@ -320,6 +335,7 @@ def evaluate_group(policy, motion, mdp, shapes, workers, clip_ids, *, fk39, join
         case_reports.append({"id": motion.names[clip], "clip_id": clip, "asset_id": int(assets[index]),
                              "rollout": str(path.resolve()), "rollout_sha256": sha256_file(path), **metrics})
     write_json(output / "evaluation.json", {"cases": case_reports, "optimizer_updates": 0, "normalization_updates": 0,
+                                           "contact_channels": list(CHANNELS), "contact_label_schema": LABEL_SCHEMA,
                                            "no_failure_reset": True, "physical_objects": True})
     return case_reports
 
@@ -372,10 +388,11 @@ def validate_evaluation_identity(training_bundle, evaluation_bundle):
 def _validate_contact_contract(contact):
     from .networks import FEATURE_SCHEMA
     label = FEATURE_SCHEMA["actual_contact_label"]
-    if (contact.get("schema") != label["schema"] or contact.get("threshold_N") != label["threshold_N"] or
+    if (label["schema"] != LABEL_SCHEMA or tuple(FEATURE_SCHEMA["contact"]) != CHANNELS or
+            contact.get("schema") != LABEL_SCHEMA or contact.get("threshold_N") != label["threshold_N"] or
             contact.get("num_substeps") != label["num_substeps"] or contact.get("substep_dt") != .005 or
             contact.get("interval") != "(t,t+1]" or
-            list(contact.get("channels", ())) != FEATURE_SCHEMA["contact"]):
+            tuple(contact.get("channels", ())) != CHANNELS):
         raise ValueError("evaluation actual-pair contact labels differ from the checkpoint feature contract")
 
 
@@ -451,6 +468,7 @@ def main(argv=None):
     for key in ("human_normalized_return", "hoi_normalized_return", "hoi_reference_mask_normalized_return", "objective_normalized_return"):
         aggregate_values[key] = sum(case[key] for case in results) / len(results)
     report = {"protocol": "HOI v1 full-reference oracle-pose policy evaluation; full-duration physical evaluation",
+              "contact_channels": list(CHANNELS), "contact_label_schema": LABEL_SCHEMA,
               "partition": bundle["partition"], "scope": bundle["scope"], "checkpoint_sha256": checkpoint_sha,
               "variant": variant, "objective_max_step_reward": max_step_reward(variant), "common_hoi_comparison_step_reward": .15,
               "checkpoint_iteration": checkpoint["iteration"], "physics": asdict(settings), "cases": results,
