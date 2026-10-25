@@ -2,9 +2,9 @@
 
 ## 当前开发入口
 
-统一使用本仓库的 `hoi/zero_shot` 分支。新实验默认开启橡胶手碰撞体和身体自碰撞；
-用 `--no-self-collision` 关闭身体自碰撞，用 `--no-hand-collision` 复核旧物理配置。
-完整入口、参数、历史结果边界和视频命令见 [DEVELOPMENT.md](DEVELOPMENT.md)。
+统一在 `codex/hoi-v1-no-quality-gate` 分支开发：无持续WM质量门、完整手脚碰撞、五通道learned contact head。`main`保留初始fork复现代码供对照。
+新版hand/self均ON，脚采用同源ULTRA完整STL及已验证CoACD overlay；旧zero-shot入口保留。
+设计与8500pt验收见 [notes索引](notes/README.md)，完整开发入口和实验边界见 [DEVELOPMENT.md](DEVELOPMENT.md)。
 以下上游复现说明中的历史成绩对应其原始配置，不代表新的默认碰撞组合。
 
 **Unofficial** reproduction of *SuperMimic: Scaling Humanoid Whole-Body Control with One Differentiable World

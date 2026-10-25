@@ -1,8 +1,8 @@
 # SuperMimic HOI v1
 
-最新实验修订：用户已授权五通道从零训练，并要求足部几何与作者ULTRA对齐。新profile使用同SHA的完整脚STL和零安装变换，在不可变手overlay上单独关闭旧脚球并追加CoACD5hull/16vertex凸包；原VHACD60000仅记为作者配置，不冒称相同cooker。train/eval80使用显式新foot manifest和新bundle身份，原缓存只读复用。source15已通过八资产严格原生门及全量4096/H32/64prefill反传资源验证（job1461502，COMPLETED0:0），新正式from-scratch job1461591已注册独立W&B并进入采集。详见[ULTRA足部对齐](../../notes/hoi_v1_ultra_foot_alignment_20261023.md)和[新实验启动记录](../../notes/hoi_v1_contact5_scratch_experiment_20261023.md)。
+当前开发基线为 `codex/hoi-v1-no-quality-gate`：无持续WM质量门、完整手脚碰撞、五通道contact head。使用同SHA的完整ULTRA脚STL/零安装变换，在不可变手overlay上关闭旧脚球并追加CoACD5hull/16vertex凸包，保留原质量/COM/惯量。原VHACD60000只作作者配置溯源，不冒称相同cooker。Train/eval必须显式绑定foot manifest、USD和新bundle身份，不能只依赖默认机器人路径。
 
-设计依据：`notes/supermimic_hoi_v1_final_design.md`。新入口位于 `hoi.v1`；现有 `hoi.run` 仍是冻结、无物体 policy observation 的 zero-shot 入口。
+设计依据为[v1最终设计](../../notes/supermimic_hoi_v1_final_design.md)。新版source15的原生/资源与正式训练身份，以及最后8500pt完整HOI80和固定20条视频证据，见[最终验收报告](../../notes/hoi_v1_final8500_eval_handoff_20261025.md)。训练已因24h作业时限结束，没有完成20k；操作示例不自动授权续训。原 `hoi.run` 仍为冻结、无物体policy observation的zero-shot入口。
 
 ## 数据与真实几何
 
@@ -15,17 +15,22 @@ python -m hoi.v1.native --bundle /new/bundle/bundle.json --asset-id 0 \
   --num-envs 8 --steps 64 --output /new/native --hand-collision --self-collision
 ```
 
-`--limit` 仅生成显式 subset，正式配置拒绝 subset。Native gate 需覆盖全部训练静态 geometry groups，验证四个5ms子步的 pair normal impulse、手/物体/地面身份、正负碰撞控制、实际物理与 reward geometry 一致性、真实掌面 probe 选择。未完成的项目保持 blocked。
+`--limit` 仅生成显式 subset，正式配置拒绝 subset。Native硬门须覆盖全部训练geometry groups，验证显式完整脚profile/compiled hulls与原物性、四个5ms子步pair normal impulse、五类实体pair正例、手脚碰地负对照、实际物理与reward geometry一致性及掌面probe。旧三通道或球脚证据不能替代新版验收。
 
 本分支新增左右脚—物体真实监督：contact head 为 `2048→128→5`，顺序固定为左手—物体、右手—物体、物体—地面、左脚—物体、右脚—物体。足部绑定实际 G1 `left_ankle_roll_link` / `right_ankle_roll_link` 的有效碰撞几何，按同一20ms区间内四个5ms子步累加法向冲量，再以平均法向力严格大于1N标记正例；脚—地面不计入脚—物体，源39个body flags不作为pair监督。Replay、BCE权重、holdout、评估和W&B同步扩为五通道；reference expected-contact与contact-match reward仍只对应双手。
 
-标签schema升级为 `hoi_v1_pair_normal_impulse_v2`，网络feature版本为 `supermimic_hoi_v1_full_reference_2`。旧三通道HOI checkpoint不能直接resume，新分支明确拒绝并要求显式迁移；motion-only legacy初始化仍保留。旧三通道native证据不能授权新版；source15已重新验证五通道正负例。原head扩展的243项CPU记录为历史时点，最新mesh版本完整CPU为261项（260通过/1本机USD库缺失skip，GPU实际USD创建与原生检查另通过）。详见[双脚contact扩展](../../notes/hoi_v1_foot_contact_20261023.md)。
+标签schema为 `hoi_v1_pair_normal_impulse_v2`，feature版本为 `supermimic_hoi_v1_full_reference_2`。旧三通道HOI checkpoint明确拒绝resume，未实现3→5自动迁移；motion-only legacy初始化路径仍保留。完整脚profile为 `ultra_g1_stl_coacd5v16_v1`，不会自动改写其他motion-only/zero-shot入口的裸机器人。
 
 完整recipe格式、固定`native_robot_asset`手部overlay和显式CPU并行预处理见 [PREPARATION.md](PREPARATION.md)。同recipe独立CoACD重算可能改变hull，因此worker复用哈希绑定的已验证overlay，不为每个进程重新生成手碰撞体。
 
 ## 训练与启动检查
 
+已验收生产运行使用下列allocator/线程设置，parent与8个worker继承相同值。新运行先核对已准备runtime支持；不改共享环境，原无step资源probe不保证长期无碎片OOM。
+
 ```bash
+export PYTORCH_ALLOC_CONF=expandable_segments:True
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export OMP_NUM_THREADS=3 MKL_NUM_THREADS=3
 python -m hoi.v1.train --config configs/hoi_v1_first.json \
   --bundle /absolute/train/bundle.json --native-evidence /absolute/native_reports.json \
   --eval-bundle /absolute/eval80/bundle.json \
@@ -33,18 +38,16 @@ python -m hoi.v1.train --config configs/hoi_v1_first.json \
 python -m hoi.v1.train --config configs/hoi_v1_first.json \
   --bundle /absolute/train/bundle.json --native-evidence /absolute/native_reports.json \
   --eval-bundle /absolute/eval80/bundle.json \
-  --init-checkpoint /absolute/motion_checkpoint.pt \
-  --no-legacy-hand-collision --legacy-self-collision --allow-initialization-physics-change \
-  --hand-collision --self-collision --output /new/run
+  --from-scratch --hand-collision --self-collision --output /new/run
 ```
 
-旧 checkpoint 缺失 physics 时必须显式声明来源的两项开关。新增列采用零扩展，保留旧网络和 normalizer；新物体分支有独立统计。迁移不继承旧 optimizer/iteration。相同 schema `--resume` 恢复三个 optimizer 和 iteration，但使用全新输出目录及真实 replay prefill，不是逐位恢复。
+当前新版从零实验使用显式 `--from-scratch`。可选motion-only迁移才使用 `--init-checkpoint`；来源缺失physics时必须显式声明legacy手/self两项，physics变更需显式标注。新增输入列零扩展、保留旧网络/normalizer、新分支统计独立，迁移不继承旧optimizer/iteration。相同五通道schema的 `--resume` 恢复三个optimizer及iteration，但必须新输出与fresh真实replay prefill，不是逐位恢复。
 
-训练保留原默认4096环境、32步BPTT、8步WM、10×2048 WM batch、4096 policy batch及优化设置。`configs/hoi_v1_pipeline_smoke.json` 显式减少环境/batch/迭代，仅做管线验证，网络生产尺寸不变。多 geometry worker 的环境总和保持4096，单一中央 learner；完整资源可行性需另有 GPU 实测。
+训练保留原默认4096环境、32步BPTT、8步WM、10×2048 WM batch、4096 policy batch及优化设置。`configs/hoi_v1_pipeline_smoke.json` 显式减少环境/batch/迭代，仅做管线验证，网络生产尺寸不变。多geometry worker的环境总和保持4096，单一中央learner；当前完整脚新版全量bundle已通过独立GPU资源验证，证据范围见最终报告。
 
 按用户最新要求，`hoi_v1_first.json`与v1默认把上限设为20000迭代，每500迭代保存完整checkpoint。250000迭代的原LR decay schedule及其余优化配置保持原值。
 
-每5000迭代自动提交一次独立GPU作业，对刚保存的固定checkpoint跑完整canonical HOI80：5000、10000、15000、20000。必须预先准备同manifest/recipe/固定手部资产的完整`eval80` bundle；校验失败会在训练前拒绝。评估与训练有独立进程/显存/输出，提交记录防止重复producer；异步排队不等于评估完成。全部80条跑完整时长、无optimizer/normalizer更新，不用这些评测结果修改WM启动阈值。
+每5000迭代自动提交一次独立GPU作业，对刚保存的固定checkpoint跑完整canonical HOI80：5000、10000、15000、20000。必须预先准备同manifest/recipe/固定手部资产的完整`eval80` bundle；校验失败会在训练前拒绝。评估与训练有独立进程/显存/输出，提交记录防止重复producer；异步排队不等于评估完成。全部80条跑完整时长、无optimizer/normalizer更新，不把验证集用于训练holdout或改变固定WM warmup日程。
 
 actor的固定shape只在一次imagination开始时编码，整个32步复用同一计算图，保留encoder梯度；不会跨optimizer更新缓存。critic仍在每个value minibatch重新计算shape encoder。
 
@@ -54,13 +57,13 @@ actor的固定shape只在一次imagination开始时编码，整个32步复用同
 
 本分支 `codex/hoi-v1-no-quality-gate` 保留500迭代WM-only warmup，之后每轮正常更新actor/critic。真实holdout的1/8/32步误差、zero-increment/constant-velocity对照、contact/onset/release coverage及pair概率仍按原 `gate_every=50` 周期计算，但只作诊断，不再阻断策略更新。历史文件名 `wm_gate_*.json` 保留，并明确 `controls_policy_updates=false`；plan/checkpoint/completion记录固定更新日程。Native/数据身份检查以及非有限数据、loss/梯度和holdout诊断的硬错误仍保留。
 
-W&B的 `gate/policy_passed` 表示固定warmup后是否允许策略更新，`diagnostics/wm_quality_passed` 单独表示WM质量比较是否达标，配置记录 `training/wm_quality_gate_enabled=false`。`hoi/v1.0` 保留旧持续质量门。当前两个正式实验仍用原冻结source13，本分支未部署或启动新实验；见[分支变更记录](../../notes/hoi_v1_no_quality_gate_20261023.md)。
+W&B的 `gate/policy_passed` 表示固定warmup日程，`diagnostics/wm_quality_passed` 表示独立质量比较；配置记录 `training/wm_quality_gate_enabled=false`。质量未通过、回落或合法holdout暂缺都不重新关闭actor/critic；非有限诊断仍立即失败。旧分支/冻结source的质量门行为不因整理当前文档而改变。
 
 ## 冻结完整时长评估
 
 ```bash
 python -m hoi.v1.evaluate --training-bundle /absolute/train/bundle.json \
-  --bundle /absolute/eval80/bundle.json --checkpoint /absolute/checkpoint_002000.pt \
+  --bundle /absolute/eval80/bundle.json --checkpoint /absolute/checkpoint_008500.pt \
   --output /new/eval80 --hand-collision --self-collision
 ```
 
@@ -73,10 +76,10 @@ CPU检查：`python -m unittest discover -s tests -v` 和 `python -m unittest ho
 ```bash
 python -m hoi.v1.render --evaluation /absolute/evaluation.json \
   --bundle /absolute/eval80/bundle.json --robot-urdf /absolute/g1_visual.urdf \
-  --use-collision-geometry --output /new/render
+  --output /new/render
 ```
 
-只回放已保存的真实世界状态，不重新推理policy、FK或物理步进。actual保留原色/橙物体，reference半透明蓝色；共享固定世界相机。完整保留并独立解码校验T+1帧。缺少物体美术资产时需显式`--object-visual`或`--use-collision-geometry`，后者在报告中注明collision display，不悄悄替代视觉资产。旧`tools/render_hoi_rollouts.py`仍保留自己的输入协议。
+只回放已保存的真实世界状态，不重新推理policy、FK或物理步进。actual保留原色/橙物体，reference半透明蓝色；共享固定世界相机。完整保留并独立解码校验T+1帧。此例要求bundle可解析绑定的原USD美术资产；单资产可用显式 `--object-visual`。只有另行要求碰撞展示时才使用 `--use-collision-geometry`，并在报告注明collision display，不能悄悄替代原视觉资产。固定20条需要按canonical manifest映射选择四类各080/084/089/094/099；该底层命令未传 `--case` 时默认全部case，不自动筛选20条或生成合集。旧`tools/render_hoi_rollouts.py`仍保留自己的输入协议。
 
 ## 私有W&B配置/指标同步
 

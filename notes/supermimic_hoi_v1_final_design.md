@@ -1,18 +1,10 @@
-# SuperMimic + HOI v1.0 最终设计方案
+# SuperMimic + HOI v1 最终设计
 
-最新足部物理修订：用户随后授权五通道新版从零实验，并要求与原ULTRA足部一致。实际ULTRA HOI入口为整脚STL collision+VHACD；新profile改用同源STL/原变换的explicit CoACD5hull/16vertex碰撞，保留原foot质量/COM/惯量与其他科学参数，跨引擎/cooker差异明确记录。source15已通过八资产严格原生门和全量4096/H32/64prefill资源验证（1461502，COMPLETED0:0），独立正式from-scratch job1461591已进入初始化/采集，见[足部对齐与验收](hoi_v1_ultra_foot_alignment_20261023.md)与[启动记录](hoi_v1_contact5_scratch_experiment_20261023.md)。旧zero-start继续使用不可变原球体足source13；不把旧原生或显存证据冒充网格足通过。
+现行开发基线：`codex/hoi-v1-no-quality-gate`，2026-10-25整理。本文保留v1增量架构与数据契约，并统一为当前已实现、已验收的新版：完整手/脚碰撞、身体自碰撞、五通道learned contact、固定500 iteration WM-only后交替更新。WM质量比较只作诊断；native、数据身份和有限性硬检查保留。
 
-双脚接触修订：按用户最新要求，`codex/hoi-v1-no-quality-gate` 的learned contact head扩为5通道，保留原左手—物体、右手—物体、物体—地面顺序，再追加左脚—物体、右脚—物体。真实监督使用足部碰撞几何与物体的区间法向冲量，不把脚—地面混入。Reference expected-contact和contact-match reward仍为双手定义；无新增脚接触奖励。旧三通道HOI checkpoint/native验收证据不能直接复用；用户后续授权已停止warm1461248、保留旧zero1461253，独立部署新版从零实验，未覆盖旧源码或结果。详细契约见[双脚contact扩展](hoi_v1_foot_contact_20261023.md)。
+当前实验为全部from-scratch，最后完整8500pt已完成canonical HOI80及同固定20条视频验收；训练因24h作业时限结束，没有完成20k，不宣称收敛。冻结权重、源码、bundle、物理、数值与媒体证据见[8500pt最终验收](hoi_v1_final8500_eval_handoff_20261025.md)。设计与本次记录不自动授权续训或新实验。
 
-分支修订：用户已要求保留并推送 `hoi/v1.0` 基线，在独立的 `codex/hoi-v1-no-quality-gate` 分支恢复固定500 iter WM-only后的交替更新。该分支的WM holdout质量比较仅作诊断，不控制actor/critic更新；native和非有限值等硬错误检查保留。具体语义与CPU验证见[无质量门分支记录](hoi_v1_no_quality_gate_20261023.md)。现有两个source13正式实验保留原行为继续运行，新分支尚未部署或启动实验；下文原始准备阶段的「尚未启动」属于历史时点。
-
-日期：2026-10-23。目标分支：`hoi/v1.0`。本文是设计规格；前两轮为设计与数据交接修订，第一阶段数据层证据见 [数据阶段实现记录](hoi_v1_data_stage1_20261023.md)。随后按用户要求实施完整v1，代码、CPU检查、独立集群数据/原生smoke及首次实验准备状态见 [实现与验收记录](hoi_v1_implementation_20261023.md)。正式训练尚未启动，不能把smoke称为正式实验或收敛。
-
-2026-10-23 22:44 UTC更新：完整实现及首次实验前要求的全量缓存、八资产原生门、4096/H32与64步资源诊断、最终CPU preflight已全部通过。实际冻结身份、证据与未执行的正式启动命令见[首次实验就绪记录](hoi_v1_first_experiment_readiness_20261023.md)；正式训练仍未提交。
-
-原始构思保留在 [supermimic_hoi_v1.md](supermimic_hoi_v1.md)。本文以当前仓库源码和两个参考仓库的实际接口为依据，修正原笔记中与实现不一致的地方。新增维度、网络宽度、reward 权重和阈值均为本方案的起始设计，不冒充原论文配置或已验证最优值。
-
-数据说明已于同日依据 [ULTRA 数据与时间基准交接](ULTRA_DATASET_AND_TIMEBASE_HANDOFF_20261023.zh-CN.md) 更新：补充实际集群 v4 数据、冻结 selection、连续时间采样与证据状态，区分历史 consumer 的源速度处理和本版适配器设计。网络扩展方案沿用原设计。该次文档修订没有重新连接集群、复制数据或运行实验；后续第一阶段的实际只读数据核验及 CPU 检查单独记录，不倒写为当时已取得的证据。
+数据依据为[ULTRA数据与时间基准交接](ULTRA_DATASET_AND_TIMEBASE_HANDOFF_20261023.zh-CN.md)。发布数据真实生成时钟尚未证实；本版使用canonical 60Hz解释与50Hz控制。网络尺寸、物体分支、奖励权重和阈值属于本项目设计，不冒充论文原配置或已验证最优值。外部仓库与操作入口见[文档索引](README.md)。
 
 ## 1. 结论与范围
 
@@ -34,9 +26,9 @@ v1 暂不加入 sparse goal、teacher/DAgger、CVAE/prior/posterior、flow match
 
 ## 2. 已核实的基线及“只增不减”含义
 
-本仓库设计基点为从 `hoi/zero_shot` 创建分支时的 Git HEAD；具体 SHA 见文末溯源。以下是代码事实，而不是从论文示意图推测的结构。
+设计基点为原motion-only/zero-shot实现，v1设计创建基点为 `2318dfd604d0a254686760e15c034231a94aa0aa`。下表列出原网络与当前HOI增量；原始fork分支及既有zero-shot入口保留，当前开发分支为 `codex/hoi-v1-no-quality-gate`。
 
-| 组件 | 当前实现 | v1 处理 |
+| 组件 | 原motion-only结构 | 当前HOI处理 |
 | --- | --- | --- |
 | Robot physical state | `S_R=(p,R,v,w,q,qd)`；运行时 rotation 为矩阵，replay 为 71D | 保持原字段、顺序、含义；另存 object block |
 | Robot observation | 99D；10 帧为 990D | 原样保留，独立追加 object history |
@@ -82,9 +74,9 @@ SHA256: 8c141eb60650b9df79b92acfeeea785f796c7f18f52bf179467562c7cc315b23
 /mnt/projects/ll/tianzizh/ProtoMotions/runs/dagger_object5800_G_recovery_from18600_to20200_20261021_01/evaluations/requested_19500/inputs/evaluation_cases.json
 ```
 
-这些 `cases`/entries 绑定 motion 路径、motion SHA256、source_group 和 object/asset。目录中的全部 4066 个文件不是训练集；训练范围仍是 selection 指定的 2651 motions / 381 groups。后续第一阶段已读取实际 selection 和 eval80 并逐项核对；eval80 的实读 SHA 与本地 canonical 相同，见 [实现记录](hoi_v1_data_stage1_20261023.md)。
+这些 `cases`/entries 绑定 motion 路径、motion SHA256、source_group 和 object/asset。目录中的全部 4066 个文件不是训练集；训练范围仍是 selection 指定的 2651 motions / 381 groups。实际适配已读取selection和eval80并逐项核对，eval80实读SHA与canonical `459a3925faf0f66bee258ce98635c67802ddda00d47d007ecdeb45035f576002` 相同。完整训练2651条逐SHA/schema/时间审计已通过：908982个源状态生成756524个50Hz状态、753873个完整控制间隔；当前新版验收入口见[8500pt最终报告](hoi_v1_final8500_eval_handoff_20261025.md)。
 
-新项目建立自己的独立 manifest，保存 source selection 路径与 SHA、逐 motion SHA、case/source-group、asset/scale/transform 绑定。先与第 3.2 节的本地四分区 manifest 和 canonical 名单逐项核对；不得仅因条数相同就认定两份清单等价。集群 eval80 清单的 SHA 未在交接中提供，不能直接套用本地 `459a...` hash，实施时需读取核对。保留既有 test40 名单及其所有同源 variants 隔离。
+新项目建立自己的独立 manifest，保存 source selection 路径与 SHA、逐 motion SHA、case/source-group、asset/scale/transform 绑定。先与第 3.2 节的本地四分区 manifest 和 canonical 名单逐项核对；不得仅因条数相同就认定两份清单等价。集群eval80实读身份核对已完成；后续加载仍要按登记SHA验证，不能仅凭名单路径或数量沿用身份。保留既有 test40 名单及其所有同源 variants 隔离。
 
 交接中重算的样例 SHA 为：
 
@@ -94,7 +86,7 @@ SHA256: 8c141eb60650b9df79b92acfeeea785f796c7f18f52bf179467562c7cc315b23
 SHA256: 1a0bac419adab2bf6d7f5d10d480e40d0f3c39a74605a7063c7f48b0f99bf97c
 ```
 
-该核查确认了清单路径存在，并抽查上述文件字节；**没有重新扫描全部 4066 个文件的 SHA**，也没有逐文件重新解码全部 tensor。新项目实际加载所选 motion 时核对其已登记的 SHA/schema。源目录只读使用；新 manifest、缓存、派生 reference 和输出写入独立项目目录，保留源 `.pt` 字节。`[T,630]` 源 reference 与 50 Hz `rollout.pt`、checkpoint 必须按 schema 区分，不凭 `.pt` 后缀混用。
+该核查确认了清单路径存在，并抽查上述文件字节；**没有重新扫描全部4066个文件的SHA**。本项目随后逐文件解码并审计所选2651条训练动作，没有把全部4066文件当成训练集。新项目实际加载所选 motion 时核对其已登记的 SHA/schema。源目录只读使用；新 manifest、缓存、派生 reference 和输出写入独立项目目录，保留源 `.pt` 字节。`[T,630]` 源 reference 与 50 Hz `rollout.pt`、checkpoint 必须按 schema 区分，不凭 `.pt` 后缀混用。
 
 ### 3.2 复用现有分组划分，禁止增强泄漏
 
@@ -132,6 +124,8 @@ SHA256: 1a0bac419adab2bf6d7f5d10d480e40d0f3c39a74605a7063c7f48b0f99bf97c
 
 差分规则沿用原 `MotionLib`：`dt=0.02s`，位置和 joint angle 内部点用中心差分，首尾用单边差分；world angular velocity 内部点为 `log(R[j+1]*R[j-1]^T)/(2dt)`，首尾对应单边旋转差分。新 object 使用同式。保存 `source_v/source_omega` 与 `derived_ref_v/derived_ref_omega` 的不同字段名、差分方法、参考点及派生 cache hash；不足两个 control-grid 状态的 clip 不能构造速度，需在数据 gate 中报告，不能静默伪造或丢弃。
 
+首条训练动作的独立source39/FK只读诊断覆盖266个源状态和221个采样状态：原ULTRA link FK相对source39的最大位置差0.736微米；采样后独立body pose插值与q/root插值再FK存在最大0.633mm的非线性差异，未重新对齐或重算reference来消除。该单clip证据支持link-origin pose解释，不能证明全部源velocity参考点或真实生成时钟。
+
 连续时间重采样、reference velocity 派生、source/API 的 COM→link-origin 转换是三项独立操作。只有确认源 velocity 参考点后才能做可解释的逐项差异审计；未知项标为 unknown。复核 ProtoMotions 历史结果时必须沿用它原来的 velocity mode，不用本版新派生速度改写其结果。
 
 ### 3.4 Canonical 60 Hz 解释 + 50 Hz 控制
@@ -142,7 +136,7 @@ SHA256: 1a0bac419adab2bf6d7f5d10d480e40d0f3c39a74605a7063c7f48b0f99bf97c
 | --- | --- | --- |
 | Source timebase | consumer 按 60 fps 解释；生成间隔未证实 | 沿用 `canonical_60hz`，标为协议假定 |
 | Control dt | 已有实现/运行验证为 0.02s，即 50 Hz | 保留原 `CONTROL_DT=0.02`，不因交接改变 |
-| Physics | 0.005s × decimation4 | 保留本仓库 `SimulationCfg(dt=0.02)` + Newton `num_substeps=4`；其 native 执行与有效积分步长另行核验，不能冒用 ProtoMotions 的运行证据 |
+| Physics | 0.005s × decimation4 | 保留本仓库 `SimulationCfg(dt=0.02)` + Newton `num_substeps=4`；本版native recorder逐个5ms子步积分pair impulse，四子步及20ms控制区间已独立验证 |
 
 对 N 个源状态帧，canonical duration 为 `(N-1)/60` 秒。从 clip 时间零开始，第 j 个控制 tick 查询 `t_j=j*0.02`，机器人与物体共用同一 `t_j`：
 
@@ -175,9 +169,9 @@ action/observation/goal/reward frames = T
 
 | 结论 | 当前证据状态 |
 | --- | --- |
-| 集群 v4 数据存在、冻结训练/验证路径存在、样例 hash 相符 | 交接中的 2026-10-23 实际只读核查，本轮未重查 |
+| 集群v4数据、冻结训练/验证路径及字节身份 | 数据交接与本项目后续完整2651训练数据审计、canonical80加载验收；原4066目录数为交接时观察 |
 | ProtoMotions 按 60 Hz reference 解释，并以 50 Hz 控制运行 | 交接的源码及已有运行证据 |
-| Robot/object reference 以连续时间同轴采样 | 交接源码及本仓库历史适配约定 |
+| Robot/object reference以连续时间同轴采样 | 本项目适配器、完整缓存CPU审计与8500pt完整80验收 |
 | 发布数据真实生成间隔为 1/60s | 未由生成来源或原始时间戳证实 |
 | 发布数据真实生成间隔为 17ms | 同样未由生成来源或原始时间戳证实 |
 
@@ -216,6 +210,18 @@ action/observation/goal/reward frames = T
 - 保存 `T_object_from_mesh`、mesh scale、物理 COM、惯量及 inertia frame。Point cloud 采用 **object-local、真实米制尺寸**；不做未记录的单位化或单独居中。若使用中心化点云，必须把中心偏移纳入 transform，不能当 object origin 或 COM。
 - 机器人 logical hand marker、wrist link、真实手部 collider 是三个接口。Protomotions 的 logical marker 有 wrist-x=0.12m 的偏移；本仓库橡胶手 mesh 安装约为 x=0.0415m、y=±0.003m。通过名称和固定变换映射，不能把 body index 28/38 或 wrist 原点直接当掌面。
 
+### 3.6 当前完整手脚碰撞profile
+
+当前HOI训练强制hand collision ON、body self-collision ON，保留引擎相邻/焊接link过滤。双手使用原橡胶手STL、已验证安装变换和不可变hand overlay；双脚profile为 `ultra_g1_stl_coacd5v16_v1`，foot manifest schema为 `hoi_v1_ultra_g1_foot_mesh_overlay_v1`。
+
+ULTRA HOI训练实际从 `g1_teacher.yaml` / `humanoid_g1.py` 加载 `g1/g1_29dof.urdf`，两脚collision为完整 `left_ankle_roll_link.STL` / `right_ankle_roll_link.STL`，mount xyz/rpy均0、scale1。当前overlay绑定同SHA原STL和原变换，只关闭每脚旧4个球碰撞，追加CoACD最多5hull/每hull最多16vertex；已验收cook实际为每脚5hull。原质量、COM、惯量、visual、PD和其他碰撞均保留。
+
+作者PhysX使用VHACD5/16/resolution60000；本版Newton/MuJoCo使用CoACD，`equivalent_to_physx_vhacd=false`，不把60000映射为CoACD参数，不声称凸块、接触或物理逐位相同。训练与评估要求bundle显式绑定foot manifest、cooked USD、原hand receipt及实际native compiled audit；只改默认资产路径不能代替此身份。此profile不自动改写原zero-shot或motion-only入口的裸机器人。
+
+HOI runtime使用独立容量 `nconmax=512/njmax=2048`，原motion-only/zero-shot的128/500保留。碰撞/约束overflow立即失败且不写入replay，不能把截断的pair数据当合法负例。原生CUDA graph关闭，使用已准备runtime支持的配置，不修改共享驱动或安装。
+
+新原生门覆盖八资产、实际编译脚凸块及原物性、左右脚—物体正例、脚—地面负对照、四子步冲量与环境隔离；旧三通道/球脚的报告不能给新版背书。当前source15与8500pt验收身份见[最终报告](hoi_v1_final8500_eval_handoff_20261025.md)。
+
 ## 4. Actor：保留 human 分支，追加 object 分支
 
 定义当前实际/imagined robot heading 为 `H_t`，物体状态为 `O_t=(pO,RO,vO,wO)`，reference 用上标 `ref`。所有需要实际坐标变换的新特征，在每个 imagined step 使用**当步预测**的 robot/object 重算。
@@ -240,7 +246,7 @@ v1 actor 不额外读取 privileged object velocity、真实 contact force、mas
 - `H_t^T vO_ref(f+k)` 与 `H_t^T wO_ref(f+k)`：6D。
 - 左/右 expected contact：2D；对应 valid masks：2D，未知标签以零值和 mask=0 表示。
 
-每帧 19D，总计 190D。Object encoder 建议 `190 → 256 → 128 → 32`，ELU + tanh。`z_goal=[zH32,zO32]` 在语义上是 64D 联合目标，但实现时保持原 decoder 的输入前缀，不能为了相邻拼接两 latent 打乱旧输入列。
+每帧 19D，总计 190D。Object encoder为 `190 → 256 → 128 → 32`，ELU + tanh。`z_goal=[zH32,zO32]` 在语义上是 64D 联合目标，但实现时保持原 decoder 的输入前缀，不能为了相邻拼接两 latent 打乱旧输入列。
 
 原 human goal 仍是 reference-only；新 object goal 是 state-conditioned reference encoding。reference 原始轨迹固定，依赖当前状态的只是坐标变换。每个 tick 都重算新 goal，包括 imagined rollout，不能缓存起点坐标变换用满 32 步。越过 clip end 的新增 object future pose 复用末帧，与 human future clamp 一致，但相应 contact validity 置零，不假造尾端接触命令。
 
@@ -248,7 +254,7 @@ v1 actor 不额外读取 privileged object velocity、真实 contact force、mas
 
 点云为每个 asset/scale 离线确定性 FPS 的 `128×3`。先在真实 surface 上生成足量候选点，再做 FPS；保存采样 seed、候选来源、输出点云 hash 及 transform。Ultra 当前使用 `sample_surface_even(256)` 后减 mesh vertex mean，并不是 FPS；本方案的 FPS128 是新设计。
 
-Shape encoder 建议 PointNet：逐点 `3 → 64 → 128 → 128`，max pool，再 `128 → 64`。Actor、WM、critic 各自拥有 shape encoder，禁止训练参数共享；点云原始数组可共用缓存。形状固定不代表 embedding 固定，encoder 更新后不能继续使用上个 update 的已编码 feature。
+Shape encoder采用PointNet：逐点 `3 → 64 → 128 → 128`，max pool，再 `128 → 64`。Actor、WM、critic 各自拥有 shape encoder，禁止训练参数共享；点云原始数组可共用缓存。形状固定不代表 embedding 固定，encoder 更新后不能继续使用上个 update 的已编码 feature。
 
 Decoder 输入固定布局：
 
@@ -294,9 +300,9 @@ Robot height 已在原 invariant 中，配合 relative object height 可确定 o
 
 从联合 WM 的最终 hidden feature 新接 `2048 → 128 → 5` 的 contact logits，预测 `(X_t,a_t,shape,xi) → b_actual(t+1)`，固定顺序为左手—物体、右手—物体、物体—地面、左脚—物体、右脚—物体。它与 dynamics 共享 WM backbone。脚通道使踢箱子等真实交互进入辅助监督；新增脚与原ground channel用于动力学辅助监督和诊断，当前不增加reference expected-contact目标或脚接触奖励。这里 ground 严格指场景地面，不能把桌面或其他 support 接触合并命名为 ground；若数据要求额外支撑物，需显式扩展场景与 pair schema。
 
-实际标签按**碰撞实体 pair**收集，对一个 control interval 内的接触 normal impulse 求和，再除以 `dt` 得到平均法向力；每个 pair 默认 `>1N` 记为接触。`b_actual(t+1)` 表示 `(t,t+1]` 这个已执行控制区间的汇总接触，和末端 `X_(t+1)` 一起记录；不是只读取最后一个 physics substep。保存原 impulse/force 数值、单位、聚合方式、有效 mask 和 threshold，同时输出轻触检出率。此 1N 是起始定义，需用已知手—物体、手—地面、物体—地面 probe 校准；标签定义改变必须版本化并在训练前锁定。
+实际标签按**碰撞实体 pair**收集，对一个 control interval 内的接触 normal impulse 求和，再除以 `dt` 得到平均法向力；每个pair的平均法向力严格 `>1N` 记为接触。`b_actual(t+1)` 表示 `(t,t+1]` 这个已执行控制区间的汇总接触，和末端 `X_(t+1)` 一起记录；不是只读取最后一个 physics substep。保存原 impulse/force 数值、单位、聚合方式、有效 mask 和 threshold，同时输出轻触检出率。该1N为当前已锁定标签定义；五个pair正例以及手/脚—地面负对照已通过新版原生校准。标签定义改变必须版本化并重新验收。
 
-Native tensor 是否能提供带 entity IDs 的 GPU pair impulse 是实现前必须验证的能力。若不可用，应实现受支持的 pair filter/contact instrumentation；不能用手腕 net force 替代后宣称配对监督成立。Contact head 不输入 reference contact，也不以 expected contact 作为 BCE 真值。
+当前recorder由Newton/MuJoCo-Warp solver的实体pair解码接触法向力，逐子步积分；由编译模型的有效碰撞几何绑定双手、物体、地面及左右 `ankle_roll_link`，按环境隔离并支持geom顺序颠倒。脚—地面、手—地面与自碰撞均不进入脚/手—物体监督。源39个net-contact flags只作annotation。Contact head不读取reference contact，expected contact不作为BCE真值。固定标签schema为 `hoi_v1_pair_normal_impulse_v2`，feature版本为 `supermimic_hoi_v1_full_reference_2`，与checkpoint、replay、诊断、完整评估同步保存。
 
 ### 5.3 WM loss、冻结与梯度
 
@@ -304,9 +310,9 @@ Native tensor 是否能提供带 entity IDs 的 GPU pair impulse 是实现前必
 
 `L_WM = L_robot_original + lambda_O * L_object + lambda_C * L_contact`。
 
-起始建议 `lambda_O=1, lambda_C=0.1`；object 四组误差先各自按维度取均值，再等权平均，防止单位和维度主导。Object output normalizer 与 component error floors 独立维护，初值参考原同物理量 floors（position 0.003m、rotation 0.005rad、v 0.02m/s、omega 0.05rad/s）。Contact BCE 按真实训练数据估计类别比例，报告逐类 precision/recall/calibration，不能只报由 no-contact 样本主导的 accuracy。
+当前 `lambda_O=1, lambda_C=0.1`；object 四组误差先各自按维度取均值，再等权平均，防止单位和维度主导。Object output normalizer 与 component error floors 独立维护，初值参考原同物理量 floors（position 0.003m、rotation 0.005rad、v 0.02m/s、omega 0.05rad/s）。Contact BCE逐通道按fit真实接触数据的N/P比例加权，权重clip到 `[1e-3,100]`，无正例时权重1；每步只对有效的五通道取平均，时间mask求和后除以batch数，与原WM窗口归约一致。报告逐类precision/recall/Brier及正负覆盖，不能只报由no-contact主导的accuracy。
 
-训练使用真实 actions 的多步 autoregressive rollout，同时监督各步 object state 和 contact；mask 保留 terminal transition，屏蔽跨 reset 的后续步。检查 1/8 步 holdout WM error，并用独立真实 action sequences 检查 32 步漂移；只报训练 MSE 不足以开放 actor 更新。
+训练使用真实 actions 的多步 autoregressive rollout，同时监督各步 object state 和 contact；mask 保留 terminal transition，屏蔽跨 reset 的后续步。检查1/8步holdout WM error及真实action序列的32步漂移，分层报告双手no-contact/contact/onset/release及五通道预测质量。它们只作诊断：固定500迭代WM-only后正常更新actor/critic，质量未达baseline或合法holdout覆盖不足都不重新关闭策略更新；非有限loss/梯度/holdout诊断仍立即失败。
 
 Actor update 时冻结**整个 WM**，包括 WM PointNet、contact head 和 normalizer 更新，但保留其输入 Jacobian。`requires_grad_(False)` 用于 WM 参数，不能用 `torch.no_grad()` 包裹 imagined transition，不能 detach 预测 object state 或 contact probability。Critic 参数同样冻结但保留输入梯度。
 
@@ -396,135 +402,82 @@ Critic 自己的 shape encoder 由 value loss 更新；actor update 冻结它及
 
 默认组织为 central learner + 固定 asset 的 rollout workers：统一 batch inference 后拆分 action，各 worker step 后汇总 transition。保守实现每个 worker 使用独立仿真进程；只有经 native probe 确认 backend 支持时，才合并成一个 `SimulationContext` 下的分组 scenes。不能在单进程循环实例化现有 `TrackingSim` 产生多个互相覆盖的 context，也不能假定 `replicate_physics=True` 支持任意不同 USD。跨进程通信、总环境预算和吞吐需要原生实测。
 
-原 `hoi/evaluate.py` 的逐 asset 独立评估及 scene monkeypatch 可作为物性读回和评估边界参考，不能直接拿来当异构训练 scene 管理。先验证一个 asset 的物理与梯度闭环，再验证多 asset 的采样/隔离/显存；若 4096 预算放不下，不静默减环境、batch 或 horizon，另行记录并定义资源缩减实验。
+原 `hoi/evaluate.py` 的逐 asset 独立评估及 scene monkeypatch 可作为物性读回和评估边界参考，不能直接拿来当异构训练 scene 管理。先验证一个 asset 的物理与梯度闭环，再验证多 asset 的采样/隔离/显存；当前新版显式足部profile及全量bundle已通过4096/H32资源验证；后续若真实OOM，保留phase/worker证据，先定位实现或allocator问题，不静默改环境、batch或horizon。
 
-## 8. 训练阶段与 checkpoint 迁移
+## 8. 训练日程、初始化与checkpoint
 
-首次正式实验执行配置按用户最新要求固定为：最大 **20000 iterations**，每 **500 iterations** 保存完整 checkpoint，分别在 **5000 / 10000 / 15000 / 20000** 使用刚保存的权重自动提交完整 canonical HOI80 冻结评估。评估使用独立 Slurm GPU 作业与新目录，保存提交身份以防重复；排队和提交不代表完成。其余生产优化配置保留，LR decay schedule 仍为250000 iterations。配置位于 `configs/hoi_v1_first.json`，实际验收状态另见实现记录。
+生产配置位于 `configs/hoi_v1_first.json`：4096环境、replay1000、WM window8、每轮10×batch2048 WM fit、actor batch4096/H32、UTD0.4、Adam lr2e-4、gamma.99、lambda.95、critic5epochs×4minibatches、原探索/gradient clipping与bf16设置保留。上限20000 iterations、每500保存、5000/10000/15000/20000自动完整canonical80冻结评估；原LR decay250000不随20k上限缩短。评估为独立GPU任务/新输出，记录claim与回执防止重复；提交或排队不等于完成。
 
-1. **数据与 native gate。** 依据交接的实际 v4 路径核对冻结 selection SHA、逐 motion SHA、四分区及 canonical 名单；记录 source timebase 的证据状态，验证连续时间 60→50 采样、integer frame-count 和源/派生 velocity 模式。再核对 joint/body name mapping、object transforms、COM velocity、physics readback、pair contact、实际碰撞过滤，以及 reference 与当前手部 geometry 的误差。交接中的存在性/样例核查不替代新项目加载时的身份校验。
-2. **旧权重初始化。** 保留 human encoder/decoder/robot WM 的可映射权重及统计，新增分支初始化，创建全新的 HOI run、optimizer 和 replay。Physics 必须匹配并显式记录。
-3. **真实 replay prefill + WM warmup。** 保留已有 64 vector steps prefill、500 iterations WM-only 起始配置；从训练分区不同 reference phases（no-contact/approach/contact/transport/release）初始化 robot/object，采集真实 dynamics 与实际接触。这要求阶段/接触模式覆盖，不要求尚未训练的策略先成功完成搬运。若真实正接触样本不足，应标明 coverage gate 未过，检查 reference 接触 reset、几何与探索采样；延长 warmup 不能代替覆盖证据。所有动作后状态仍由物理模拟产生，不把 reference transition 当真实动力学样本。
-4. **交替联合训练。** 原 collect/fit/BPTT/critic 顺序不变。原起始参数保留：WM window8，WM batches10×batch2048，BPTT horizon32，policy batch4096，UTD0.4，Adam lr2e-4，gamma.99，lambda.95，原 exploration/gradient clipping/critic epochs 设置。
-5. **eval80 选择与锁定。** 冻结权重与统计，用 canonical eval80 做真实 simulator 全程评估；选择规则使用真实 object/contact/human 指标，不能只选 imagined return 最大者。
-6. **test40。** 锁定数据、reward、threshold、checkpoint、seed 计划后运行，完整记录全部动作与失败。新训练结果不能改写旧 zero-shot 报告。
+已验收正式运行对parent和8个CPU-IPC workers使用 `PYTORCH_ALLOC_CONF=expandable_segments:True` 与兼容别名 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`，OMP/MKL各3线程。这是实际runtime内存/线程配置，应在新生产启动前显式保留并核对runtime支持；不向共享环境写配置。现有critic target在 `no_grad` 下按原critic minibatch上限分块，完整保留135168个bootstrap rows及相同λ-return，PointNet仍在每个训练minibatch中重算。该数学等价内存修复不改变batch、H或优化配比；资源探针不保证长期无allocator碎片。
 
-新 run 从物理配置一致的 SuperMimic checkpoint 初始化优先；旧 hand/self 配置缺失时必须显式指定两项并核对。如果来源配置不同，不能称 resume；作为清楚标注 physics change 的新迁移实验。本版默认 hand ON、body self-collision ON，保留相邻/焊接 link exclusions、真实物体重力/惯量和已有 CoACD recipe。
+日程固定为：64 vector steps真实fresh replay prefill；全局前500个iteration只训练WM；从第501个已完成iteration开始，每轮正常进行actor/critic更新。`policy_update_schedule.mode=fixed_after_wm_warmup`，`wm_quality_gate_enabled=false`。每50轮仍对真实holdout计算1/8/32步质量、zero-increment/constant-velocity对照、覆盖和接触概率；`wm_gate_*.json`与checkpoint的历史字段名保留，但 `controls_policy_updates=false`。W&B `gate/policy_passed` 表示固定warmup日程，`diagnostics/wm_quality_passed` 表示独立质量比较。没有质量回落后反复暂停actor的行为。
 
-Checkpoint schema 至少记录：feature version/字段顺序/维度，shape sampling与encoder定义，dataset/source selection 身份及逐 motion manifest hash，data/split/timebase/contact-label hashes、source timebase 的证据状态、实际 control/physics 配置、reference velocity mode/method 与派生 cache hash，asset与physics，三个网络及各自 shape encoder，所有 normalizers，optimizer，iteration 和初始化 checkpoint hash。
+训练reset从各资产兼容的全部训练bins采样，并在bin内随机取帧，包含动作中段及reference接触阶段；沿用50%均匀/40%回报soft分布/10%其EMA。没有专门接触阶段quota，也没有contact-aware replay window oversampling。Robot和object在同一reference时刻联合重置，保留原robot扰动，不能保证reference接触帧立即有实际冲量。真实接触仍来自后续物理，不把reference transition伪装为实测动力学。
 
-迁移细节必须显式实现而不是 `strict=False`：
+每20个50帧训练bin保留1个WM holdout，fit与normalizer不使用holdout行；这仍属于train split，与eval80/test40隔离。窗口包含terminal transition，之后reset、reference jump、跨asset部分不得串接。稀少合法holdout窗口保留32轮快速拒绝采样，预算不足后枚举相同元数据合法起点均匀有放回补齐；真正无合法起点只记录coverage不足诊断，不伪造窗口，也不控制actor日程。非有限诊断或其他异常仍为硬失败。
 
-- Decoder 扩宽首层时旧 1022 列复制，新列零初始化；原后续层完整复制。
-- WM 首层旧 133 列复制、其余列零初始化；原 output70 行保留，新增 output12 行独立初始化。独立旧/新输入输出 normalizer 避免旧 count 冻结新增特征；共享 backbone 允许训练时学到双向物体作用。
-- Critic 首层旧 914 列仅在完整来源含 critic 时可复制，其余新列零初始化；若只有周期 `ckpt_*.pt`，critic 从头初始化并明确记录。
-- 现有 `last.pt` 有 critic/三个 Adam 状态；小 `ckpt_*.pt` 仅含 pi/wm。架构扩展 run 重新建立 optimizer，不强行加载形状不匹配的 Adam tensors，也不延用旧 iteration 假装连续 HOI 训练。
-- 初始 action / robot WM 输出的兼容检查，应在冻结旧 normalizer、新增输入权重为零、相同 robot 输入下比较；新增特征归一化不能改变旧块数值。迁移完成不代表 HOI 动力学已经学会。
-- 同 schema 续训仍需 fresh replay prefill；当前 checkpoint 没有完整 replay / simulator / RNG 状态，不能称逐位恢复。
+当前新版首选显式 `--from-scratch`：三个网络与optimizer从零，不使用旧motion或三通道HOI权重。保留可选motion-only legacy迁移接口，必须逐项验证，而非 `strict=False`：
 
-训练不增加 teacher producer，不调用旧 DAgger/flow losses。所有阶段使用新输出目录；不覆盖既有日志、checkpoint、rollout 或渲染。
+- Human encoder及normalizer完整保留；decoder旧1022列复制、新276列零初始化，后续层完整复制。
+- WM首层旧133列、原70行输出及旧normalizer复制；新输入列零初始化、object输出12行独立初始化。联合backbone后续可微调。
+- Critic只在来源含critic时迁移旧914列；若仅有周期pi/wm小checkpoint，则critic从零。新增normalizer独立维护。
+- 来源physics缺失时显式声明hand/self；不同physics属于新迁移实验，不能标作同实验resume。架构扩展重新建立Adam，不加载形状不匹配的旧moments或伪沿用iteration。
 
-## 9. 验收、实验对照与报告
+新checkpoint严格保存feature schema/version、五通道顺序与标签定义、三网络及各自PointNet、全部normalizers/三个Adam、iteration/update counts、variant、固定日程、source/dataset/bundle/timebase/物理和初始化身份。旧三通道HOI checkpoint明确拒绝，未实现3→5自动迁移，不静默补标签或Adam行。相同schema可在新输出目录resume，但必须fresh replay prefill；不含完整replay/模拟器/RNG，不能称逐位连续恢复。
 
-### 9.1 实现后必须通过的 gate
+所有训练或评估使用独立新输出，不覆盖现有权重、rollout、日志和渲染。原 `supermimic.train` / `hoi.run` 的motion-only/zero-shot入口继续保留，不向它们自动增加物体policy观测。
 
-| Gate | 验证内容 | 不满足时的含义 |
+## 9. 验收、评估与对照
+
+### 9.1 硬性验收与学习质量诊断
+
+| 类别 | 验证内容 | 约束 |
 | --- | --- | --- |
-| CPU data/schema | selection/逐 motion SHA、`[T,630]` 与 rollout/checkpoint 类型区分、有限值、quat/关节名、分组及 canonical 名单、源/派生 velocity、contact mask、history/reset/window 对齐 | 数据或接口错误，不能解释为学习难度 |
-| Time/frame alignment | 独立核对 source60/control50、robot/object 同 `t/i0/i1/alpha`、N−1 时长、整数步数与 T+1/T；601→500 actions/501 states；不把 protocol assumption 当生成事实 | 采样错速或少/多一帧，不以总帧数偶然相同代替时间核对 |
-| Legacy compatibility | 相同输入下迁移前后 human latent、initial action、robot WM 输出一致；原 reward/termination 数值一致 | “只增不减”或迁移没有成立 |
-| Native physics | hand/self ON 编译配置、真实 object gravity/mass/COM/inertia/friction、无异常穿透/接触overflow；pair probe 排除手碰地误标 | CPU 检查不能替代此 gate |
-| Geometry | 单一世界下 robot FK / hand collider / object cloud 对齐，mesh/COM 不混淆，表面距离误差可量化 | 交互 reward/contact label 不可信 |
-| WM holdout | 按 no-contact/contact/onset/release 分层报告 1/8-step error、32-step drift；与 zero-increment/constant-velocity baseline 比较 | 总体 MSE 低仍可能没学会接触 |
-| Contact | 真实 pair 数据中逐类 PR、positive coverage、概率校准及 native force 定义；失败例可回放 | 不能用 net-force accuracy 替代 |
-| BPTT | object reward 对 action 的非零有限梯度；固定观测噪声及输入的小批 rollout 做有限差分方向检查；WM/critic 参数与统计在 actor update 不变 | 梯度断链、错误detach或参数泄漏 |
-| Simulator evidence | 短 smoke 之后完整 reference-duration 的真实验证，报告 simulated 与 imagined reward gap | WM 自我奖励不能证明 HOI 成功 |
+| CPU data/schema | selection/逐motion SHA、630D/schema、joint/body/quat、分组、source与derived速度、cache/contact/history/window对齐 | 身份或接口错误立即失败 |
+| Time/frame alignment | source60/control50共时轴，整数N−1时长及T+1/T，601帧→500actions/501states | 不以相同总帧数替代采样核验，不冒称真实生成时钟已确认 |
+| Legacy compatibility | 仅针对显式迁移：human latent、初始action/robot WM及原reward/termination数值一致 | 迁移不兼容不得假称“只增不减”成立 |
+| Native physics / geometry | hand/self ON、显式ULTRA足部manifest、八资产真实物性、compiled hull/FK/palm/距离一致性、五pair正例与手脚碰地负对照、无overflow | 硬门；旧球脚/三通道证据不能替代新版 |
+| BPTT | object reward对action有限非零梯度、有限差分方向、actor更新时WM/critic参数和统计不变 | 梯度断链或泄漏立即失败 |
+| Resource | 全量bundle、实际4096配额、replay1000、64prefill、WM2048×8/actor4096×32/critic生产尺寸 | CPU或小fixture不代替全量native资源验证 |
+| WM / contact质量 | 双手phase分层1/8/32步误差、简单baseline、五通道precision/recall/Brier及正负覆盖 | 只作诊断，不控制固定warmup后的actor/critic；非有限仍硬失败 |
+| Simulator evidence | 完整动作时长真实验证、human/object/contact与imagined/real gap分别报告 | imagined回报不能证明真实HOI成功 |
 
-WM/contact gate 的数值合格线在 train-only native calibration 样本上预先登记，至少要求相关任务分层优于上述简单预测基线、接触正例可检出且 BPTT 方向检查通过；不编造尚未测量的成功率阈值。
+本分支不设置持续WM质量门。Native/数据/有限性和梯度等实现硬约束，与WM是否优于简单预测baseline属于不同判断。当前已完成的八资产、全量资源、正式训练及完整80/视频证据见[8500pt验收](hoi_v1_final8500_eval_handoff_20261025.md)，不得以表中规范反向虚构未做的实验。
 
-后续实现时运行仓库要求的 CPU 单测与 HOI 边界检查；新增训练/物理在已准备的 Linux GPU runtime 检查。此次文档阶段没有运行仿真、smoke 或正式训练。
+### 9.2 独立对照入口
 
-### 9.2 最小实验矩阵
-
-| 名称 | 定义 | 回答的问题 |
+| 名称 | 定义 | 用途 |
 | --- | --- | --- |
-| ZS | 冻结旧策略，物体真实物理；明确 checkpoint 和碰撞 profile | 原 motion tracker 在相同条件下的下限 |
-| HOI-v1 | 本文完整新增分支、联合 WM、contact辅助、全部新 reward、无16-step硬终止 | 主方法是否在真实 simulator 改善交互 |
-| No-contact-objective | 保留网络与 contact 预测诊断，仅将 contact match reward 权重置0，独立训练 | 接触目标是否有额外作用 |
-| No-geometry-input | 保留输入接口及网络，将 actor/WM/critic shape feature 一致置0，独立训练 | 显式几何是否帮助跨 asset/scale 学习 |
-| Contact-timeout16（后续） | 加完整 task counter、critic与可微规则后独立训练 | 硬 contact termination 的收益及探索代价 |
+| ZS | 原冻结motion策略、真实物体、显式checkpoint/碰撞profile | 保留原zero-shot边界 |
+| HOI-v1 | 当前五通道/完整手脚碰撞/固定更新日程，全部新增目标，无16步硬终止 | 当前主开发基线 |
+| No-contact-objective | 仅contact-match权重0，保留head/BCE/诊断 | 独立配置 `hoi_v1_no_contact_objective.json` |
+| No-geometry-input | 三套PointNet与接口保留，shape feature一致置0 | 独立配置 `hoi_v1_no_geometry_input.json` |
+| Contact-timeout16（后续设计） | 需完整counter state/critic及可微规则，当前未启用 | 另行设计与授权，不能直接改终止 |
 
-所有对照使用新 run。增加训练输入的 full-reference HOI 不再称 zero-shot；Ultra/Protomotions teacher 因引擎、控制与训练数据不同，仅作注明条件的外部参考，不作为公平 matched baseline。正式主对照建议使用预先固定的 3 个 seeds，开发 smoke 使用单 seed；预算变化需在运行前记录。
+这些入口不是启动授权。每个新对照用独立run；full-reference HOI不称zero-shot。Ultra/ProtoMotions因引擎/观测/训练范式不同，只作注明条件的外部参考。多个变量同时改变的旧三通道/球脚和新版比较不能被当作单变量消融。eval80用于开发/选模；test40及额外seeds须在数据、模型、奖励、阈值和checkpoint计划锁定并获授权后独立执行。
 
-### 9.3 评估与交付数据
+### 9.3 完整评估与交付
 
-- 保留作者 human normalized return / termination，现有 39-body PHC、object-pose pass、human+object pose joint pass，并分别报告；`supermimic_n_failed=0` 不等于 HOI 全成功。
-- 新增物体 position/rotation/velocity error 分布、pair actual/expected contact 覆盖、missing/extra contact、连续缺失时长、support/contact transitions，以及阶段可解释时的 drop/release 诊断。
-- “交互成功”需在锁定协议中定义为 pose+human+expected-contact 条件的联合结果，并报告标签有效覆盖；object pose pass 或 contact probability 高不能直接称 grasp success。没有经过验证的抓取判据时沿用诊断名称。
-- 评估冻结 checkpoint、无 optimizer / normalizer 更新；从 clip 开头到末尾保存真实完整轨迹，failure 后不 reset、不截断。作者 return 可另按首次 failure 停止累计，full-duration HOI 指标仍保留。
-- 完整时长按第 3.4 节 canonical `(N-1)/60` 及完整 control ticks 定义。`state/reference=T+1`，`action/observation/goal/reward=T`，同时保存真实时间、源 N/索引/插值方式、协议时长/尾端余量、timebase证据状态、velocity mode、quat、source selection/逐 motion SHA、object/contact schema；不能凭帧数相同认定对齐。
-- 完整 raw 明确包含 `body_rot`，允许独立 CPU 从保存状态/reference 重算既有 PHC 与 object 指标，核对模型/normalizer 不变及 physics/API 门禁。ProtoMotions G19500 的验收格式可参考，其成绩属于该模型/观测/物理/训练组合，不作为 SuperMimic 的成功阈值。不同长度 clip padding 只用于 batch，评分严格按各自真实长度 mask。
-- 离线视频只回放记录状态，不重跑 policy 或物理；reference robot/object 半透明蓝色，actual 独立配色，同世界、同相机、不分开对齐，保存全帧并核对真实解码帧数。
-- W&B 保持现有私有项目，每个对照新 run，仅配置/指标/汇总；不上传权重、原始数据、完整 rollout、源码或凭据。
+评估冻结checkpoint及全部统计，optimizer/normalizer updates均0；每条从开头到完整canonical时长，failure后继续真实物理，无reset或截断。状态/reference为T+1，action/observation/goal/reward为T，保存body_rot、实际时间/source N/indices/尾余、速度模式、quat、数据/物理/标签身份。不同长度padding仅服务batch，评分按各条真实长度mask。
 
-## 10. 后续实现拆分与当前边界
+当前 `hoi.v1.evaluate` 按八资产组依次执行，组内多环境batch inference与物理并行，canonical80的batch为15/5/16/4/14/9/11/6；既非逐环境串行，也非80路同时。原39body PHC独立于14body human reward。分别报告human normalized return/作者终止、HOI normalized return/HOI终止、人体与手部误差、物体位置/角度误差、object-pose及PHC+object联合通过、五通道实际接触与双手expected/missing/extra/timeout诊断。
 
-实现顺序建议按可独立审查的里程碑推进：
+PHC要求所有评分帧39体平均世界位置误差≤0.5m；object pose使用位置0.1m或角度30deg超限持续≥0.3s的工程规则。误差逐clip均值后宏平均，不分别对齐轨迹。作者终止、PHC与object-pose是不同判据；`supermimic_n_failed=0`或object-pose通过不代表抓取成功。没有锁定并验证的抓取判据时沿用诊断名称。
 
-1. 新 HOI training data/schema/manifest 层，从只读 v4 源目录与冻结 selection 建立身份绑定，验证连续时间/帧数及派生 velocity；复用并保护 canonical zero-shot 输入与评估，不更改旧协议常量。
-2. Native 单 asset scene、object state、pair-contact recorder、联合 reset 与几何/物性 probe。
-3. 增量 actor / WM / critic 与 legacy migration，先通过静态尺寸和原输出兼容检查。
-4. Replay / observation / reward / soft termination / imagined rollout 全路径接入，完成有限差分检查。
-5. 多 asset 分组采样、warmup / WM gate、eval80 / test40 的新训练评估入口。
-6. 小规模 train-only smoke 后，再单独准备正式训练配置与资源记录。
+离线视频仅回放已保存状态，0policy/physics/FK重构。固定四类各080/084/089/094/099，不按成绩选；720p/50fps全部T+1帧，reference机器人/物体半透明蓝色RGBA[.08,.43,1,.35]，actual原色/橙物体，共世界固定相机，不单独对齐或隐藏漂移，使用绑定原USD视觉。远端和本地20单条+合集均完整解码及SHA核对，并实际查看contact sheet与四类首中末帧后才称媒体验收完成。
 
-预计新建独立 HOI training 入口及专用 data/MDP/network wrapper；共享层可在必要处增加显式扩展接口。具体文件名在实现时确定，避免仅靠修改全局 `OBS_DIM` / `STATE_DIM` 破坏既有 `supermimic.train` 和 `hoi.run`。不复制第二套未经共享配置管理的 physics 默认值。
+W&B项目保持私有，各对照独立run，仅配置/指标/评估汇总；不上传权重、源码、原数据、完整rollout或视频。源码、资产、数据与报告使用哈希及新输出目录绑定，已完成阶段不因同步失败重跑推理/物理。
 
-交接已提供集群数据存在、冻结训练/验证引用存在及样例 SHA 的既有证据；第一阶段另已完成 selection/分区与集群 eval80 身份核对、一条真实 motion 的字节解码和 CPU 时间校验。当前仍需取得的证据包括：全量逐 motion 解码、发布数据实际 timebase、source/derived velocity 物理语义与源/native object velocity 参考点、pair-contact GPU instrumentation 能力、完整 asset/scale 的异构 scene 支持、初始 reference 接触质量及显存预算。CPU 数据验收不等于上述 native 或训练验收；当前实现与实际数据读取范围见 [实现记录](hoi_v1_data_stage1_20261023.md)。
+## 10. 当前实现与资料索引
 
-ProtoMotions distill 已按用户要求停止、相关监控暂停；历史20200续训目标已被停训要求覆盖。这里只复用数据/协议和证据格式，不恢复其训练或监控，也不将交接中已有任务终态当成本项目新任务状态。
+当前完整实现位于 `hoi/v1/`：`networks.py` / `learner.py` 定义网络与优化，`contacts.py` / `native.py` / `foot_collision.py` 定义五pair实体监督与显式碰撞profile，`buffer.py` / `motion.py` 管理真实replay和reference，`mdp.py`定义解析观测/奖励/终止，`train.py` / `evaluate.py` / `render.py`分别提供训练、完整冻结评估和保存状态渲染。数据schema与60→50适配位于 `hoi/data/`，原共享组件位于 `supermimic/`。
 
-## 11. 源码与资料溯源
+使用入口、资产recipe与preflight方式见[HOI v1 README](../hoi/v1/README.md)、[准备说明](../hoi/v1/PREPARATION.md)、[数据适配README](../hoi/data/README.md)。先读[DEVELOPMENT.md](../DEVELOPMENT.md)及[AGENTS.md](../AGENTS.md)，CPU回归和Linux native检查各有证据边界，不把提交或RUNNING当成稳定训练。
 
-### 本仓库
+目前仍未证实发布数据真实生成间隔及源velocity全部物理参考点；当前reference使用已记录的pose-derived control-grid模式。Native证据、完整缓存及8500pt评估已通过，不再把早期“全量数据/接触instrumentation/显存待验证”作为当前待办。新引擎、资产、schema或物理变更必须另行验收。
 
-分支创建基点：`2318dfd604d0a254686760e15c034231a94aa0aa`。首轮新增本文，本轮依据数据交接更新本文；用户原始 v1 笔记与交接文件不改动。
+外部资料索引见[notes/README](README.md)及[数据时基交接](ULTRA_DATASET_AND_TIMEBASE_HANDOFF_20261023.zh-CN.md)：
 
-- [DEVELOPMENT.md](../DEVELOPMENT.md)：物理默认、历史边界与实验保护。
-- [networks.py](../supermimic/networks.py)、[mdp.py](../supermimic/mdp.py)、[motion.py](../supermimic/motion.py)：原网络/解析 heads/goal 定义。
-- [train.py](../supermimic/train.py)、[buffer.py](../supermimic/buffer.py)、[env.py](../supermimic/env.py)：BPTT、replay、normalization、checkpoint 和 native state/control。
-- [hoi/prepare.py](../hoi/prepare.py)、[ultra_reference.py](../hoi/ultra_reference.py)、[evaluate.py](../hoi/evaluate.py)、[hand_collision.py](../hoi/hand_collision.py)：历史 canonical 时间契约、真实物体和手部资产审计。
-
-### 新增数据交接证据
-
-- [ULTRA_DATASET_AND_TIMEBASE_HANDOFF_20261023.zh-CN.md](ULTRA_DATASET_AND_TIMEBASE_HANDOFF_20261023.zh-CN.md)：本轮数据更新的直接依据；读取时 SHA256 为 `d4d1e6472b327054ddffb10a555f636b39821da71a28d74247ed464dbfca8fda`。
-- 交接引用的 Windows 核查记录：`C:/Users/张天姿/Documents/ChatGPT/ProtoMotions/.local/hoi_dagger_G_continue15200_20261020/data_timebase_20261023/CLUSTER_DATA_OBSERVED.json` 与同目录 `DATASET_COUNT.json`。文档修订阶段通过交接接收其结论，没有独立重读这些记录或重新 SSH；后续第一阶段的只读连接及取样另见实现记录。
-- 实际集群源路径、训练 selection SHA、eval80 路径与样例 SHA 见第 3.1 节。数据引用和派生物只写新目录，不覆盖共享源数据及历史结果。
-
-### Protomotions：`hoi/dagger_distillation`
-
-前轮本地审查 HEAD：`79b94ef15ea5dd4bcdb479ecc430d3907a3a851e`。交接明确这是后续验收证据提交，**不是 G19500 的新 worker 源码身份**；该次实际训练/评测的源快照为 `faefebd52e1e5872f008532f48606d86568d86b6`（512 个源文件）。两种身份分别保存，不互相替代。前轮跨仓库 `git status` 受本地权限/工作树路径问题影响，未确认全部已有改动；数据交接文档修订轮未重新审计外仓或连接集群，第一阶段的数据只读核验单独记录。
-
-- `D:/Protomotions/repro/ultra_hoi_20261016/reference/dr/inputs/data_manifest.json`：seed20261013、分组规则和四分区；SHA256 `7d66cd15b27b41988ac3ef761fb82f15204b5ab741a696f95102801dac8b62e2`。
-- 同目录 `evaluation_cases.json`：canonical eval80；SHA256 `459a3925faf0f66bee258ce98635c67802ddda00d47d007ecdeb45035f576002`。
-- `D:/Protomotions/scripts/hoi/ultra_migration/experiments/grasp_nativehands_adaptive_20261015/test40_triplet_20261017/preregistered/setup/test40_cases.json`：canonical test40；SHA256 `b7e61757f230930fe18672f619149d7201ccdb6ab7a6ac06de0ae1634cf7674d`。
-- `D:/Protomotions/scripts/hoi/dagger_train.py:290` 的 net-force contact 使用、`D:/Protomotions/protomotions/envs/hoi/virtual_markers.py:12` 的逻辑 marker 定义，仅作为迁移审计依据，不复用 DAgger/teacher 训练。
-- `D:/Protomotions/repro/ultra_hoi_20261016/reference/dr/inputs/baseline/runtime.json:3983`：逻辑 hand marker 的固定偏移；真实 collider 仍以本仓库 `hoi/hand_collision.py` 的可追溯安装变换为准。
-- 交接列出的运行协议源码：`D:/Protomotions/protomotions/envs/hoi/ultra_reference.py`、`ultra_motion_bank.py`（同目录），`D:/Protomotions/scripts/hoi/dagger_train.py`、`dagger_evaluation.py`，以及 `D:/Protomotions/protomotions/envs/hoi/failure_segment_sampler.py`：连续时间采样、SHA加载、控制时间断言、完整评测步数及整数源帧时长。浮点尾端规范化不等同确认真实源 FPS。
-- `D:/Protomotions/notes/ULTRA_HOI_FROZEN_RUNBOOK.zh-CN.md`：交接引用的50Hz/5ms×4与运行边界。G19500 目录中的 `acceptance/CHECKPOINT_CPU_ACCEPTED.json`、`FINAL_CPU_ACCEPTED.json`、`CLOUD_ACCEPTED.json` 和逐 case `rollout.pt` 仅作历史验收格式溯源，不是本项目验收结果。
-
-### Ultra：`main`
-
-前轮本地审查 HEAD：`ebe4aa276dd3208c33a8604084c0a3aeb37d9061`。当时整体 `git status` 未确认；已只读核对的关键 exporter/consumer/config 与其 Git index 一致。本机该 checkout 没有发布动作目录，前轮未核验数据实物；这不否定新增交接中集群已有 v4 数据的只读观测。本轮未重新读取该外仓。
-
-- `D:/Ultra/ultra/env/tasks/ultra_g1_retarget.py:166`：630D consumer；`:571/:612` 为 contact counter 与 `>20`；`:1198` 附近为 contact/reward。
-- `D:/Ultra/ultra/env/tasks/ultra_g1.py:31`：当前 exporter 的状态捕获、39 flags 与启动帧裁切。
-- `D:/Ultra/ultra/env/tasks/ultra.py:259`：object cooking；`:278` 为 surface-even 点云与 mesh-mean 中心化。
-- `D:/Ultra/ultra/data/cfg/g1_teacher.yaml:15`、`ultra/utils/config.py:39`、`docs/deploy.md:16`：17ms 与 60Hz 的区别。
-- `D:/Ultra/ultra/env/tasks/humanoid.py:924`：名为 SDF 的最近点位移，不是 signed-distance field。
-
-### 论文资料
-
-- [SuperMimic](https://arxiv.org/abs/2610.28480)：联合训练 WM 与 policy、通过短 imagined rollout 的 BPTT 学习；本文网络尺寸以本仓库实现为准。
-- [ULTRA v3](https://arxiv.org/html/2603.03279v3)：dense-reference teacher 到 multimodal student 的框架；其训练范式不属于本版迁移范围。论文中的 contact mismatch 20 frames 概述与本地具体 `>20` 规则分开记录。
-- [ContactMimic v1](https://arxiv.org/html/2607.08742v1)：明确区分 reference 几何接触标签与执行中的力学接触。本文的 2/4cm mask 与 contact-head 方案是新设计，并非该文原配置。
+- `D:/Protomotions` 的 `hoi/dagger_distillation`：分组manifest SHA `7d66cd15b27b41988ac3ef761fb82f15204b5ab741a696f95102801dac8b62e2`；canonical eval80 SHA `459a3925faf0f66bee258ce98635c67802ddda00d47d007ecdeb45035f576002`；test40 SHA `b7e61757f230930fe18672f619149d7201ccdb6ab7a6ac06de0ae1634cf7674d`。历史G19500 worker源为 `faefebd52e1e5872f008532f48606d86568d86b6`，后续证据提交 `79b94ef15ea5dd4bcdb479ecc430d3907a3a851e` 不替代worker身份；只复用数据/评分经验，不恢复其训练。
+- `D:/Ultra` 原审查HEAD `ebe4aa276dd3208c33a8604084c0a3aeb37d9061`：实际HOI训练URDF/整脚STL、630D consumer、exporter与参考接触规则的核对依据；当前exporter不是发布数据生成时钟证据。
+- 本仓库源代码为网络尺寸与实际语义依据；[SuperMimic](https://arxiv.org/abs/2610.28480)、[ULTRA v3](https://arxiv.org/html/2603.03279v3)、[ContactMimic v1](https://arxiv.org/html/2607.08742v1)为概念参考。本文新增encoder、2/4cm几何schedule、五通道head及新reward是本项目定义，不宣称论文原配置。
