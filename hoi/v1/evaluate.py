@@ -189,7 +189,8 @@ def score_rollout(states, control, motion, clip_id, joint_order, *, max_human_re
 
 @torch.no_grad()
 def evaluate_group(policy, motion, mdp, shapes, workers, clip_ids, *, fk39, joint_names, output, metadata=None,
-                   verify_tracked_fk=True, wm=None, diagnostic_batch_size=128, variant="hoi_v1"):
+                   verify_tracked_fk=True, wm=None, diagnostic_batch_size=128, variant="hoi_v1",
+                   torso_mass_context=None):
     """Evaluate one fixed-asset worker group; failure never truncates a case.
 
     Worker snapshots must use global bank frames and retain the post-action
@@ -198,6 +199,12 @@ def evaluate_group(policy, motion, mdp, shapes, workers, clip_ids, *, fk39, join
     if motion.source_reference is None:
         raise ValueError("evaluation must retain the original source reference630")
     group_metadata = deepcopy(metadata or {})
+    from .robot_context import MASS_FIELDS, mass_context_from, torso_mass_contract
+    mass_enabled = getattr(wm, "torso_mass_context", False) if torso_mass_context is None else torso_mass_context
+    if type(mass_enabled) is not bool or (wm is not None and getattr(wm, "torso_mass_context", False) != mass_enabled):
+        raise ValueError("evaluation torso mass context differs from its frozen WM")
+    if mass_enabled:
+        group_metadata["robot_mass_context"] = torso_mass_contract()
     group_metadata.setdefault("evaluation_source_content_sha256", source_identity()["content_sha256"])
     group_metadata.setdefault("checkpoint_training_source_content_sha256", None)
     group_metadata.setdefault("checkpoint_training_source_identity_status", "unknown")
@@ -214,6 +221,9 @@ def evaluate_group(policy, motion, mdp, shapes, workers, clip_ids, *, fk39, join
     if len(joint_names) != 29 or len(set(joint_names)) != 29 or len(fk39.dof_names) != 29 or set(joint_names) != set(fk39.dof_names):
         raise ValueError("runtime/ULTRA joint names do not match")
     device = next(policy.parameters()).device
+    from .observations import ActorObservations, observation_contract
+    actor_obs = ActorObservations(mdp, policy.observation_profile)
+    group_metadata["actor_observation_contract"] = observation_contract(policy.observation_profile)
     ids = torch.tensor(clip_ids, device=device, dtype=torch.long)
     if len(ids) != workers.N or len(set(clip_ids)) != len(clip_ids):
         raise ValueError("one unique evaluation clip is required per worker environment")
@@ -226,6 +236,9 @@ def evaluate_group(policy, motion, mdp, shapes, workers, clip_ids, *, fk39, join
         raise ValueError("evaluate_group only accepts one fixed geometry group")
     order = [joint_names.index(name) for name in fk39.dof_names]
     snapshot = workers.reset(starts)
+    if mass_enabled:
+        if bool((mass_context_from(snapshot) != 0).any()):
+            raise ValueError("nominal evaluation requires actual torso mass equal to pre-DR nominal mass")
     if not torch.equal(snapshot["f"], starts) or not torch.equal(snapshot["asset_id"], assets):
         raise ValueError("evaluation reset must reach the exact clip start and asset")
     if not bool((snapshot["ep_step"] == 0).all()):
@@ -245,13 +258,15 @@ def evaluate_group(policy, motion, mdp, shapes, workers, clip_ids, *, fk39, join
     records.append(first)
     try:
         for step in range(int(lengths.max())):
+            if mass_enabled:
+                mass_context = mass_context_from(snapshot)
             f = torch.minimum(starts + step, ends)
             if not torch.equal(snapshot["f"], f):
                 raise RuntimeError("worker reset/jumped frames during full-duration evaluation")
             S, O = unflatten_state(snapshot["s"]), unflatten_object(snapshot["o"])
-            robot = mdp.obs(S, snapshot["a_prev"], snapshot["xi"], f)
-            obj = mdp.object_obs(S, O, f)
-            hg, og = motion.goal(f, 10), motion.object_goal(S, O, f, 10)
+            robot = actor_obs.robot(S, snapshot["a_prev"], snapshot["xi"], f)
+            obj = actor_obs.object(S, O, f)
+            hg, og = actor_obs.human_goal(S, f), actor_obs.object_goal(S, O, f)
             robot_hist = robot[:, None].expand(-1, 10, -1).clone() if robot_hist is None else torch.cat((robot_hist[:, 1:], robot[:, None]), 1)
             object_hist = obj[:, None].expand(-1, 10, -1).clone() if object_hist is None else torch.cat((object_hist[:, 1:], obj[:, None]), 1)
             action = policy(robot_hist, hg, object_hist, og, shapes.points(assets))
@@ -262,6 +277,12 @@ def evaluate_group(policy, motion, mdp, shapes, workers, clip_ids, *, fk39, join
             validate_actual_contact_fields({"contact": transition["contact"], "contact_valid": transition["contact_valid"],
                                             "contact_impulse_Ns": transition["impulse"]}, workers.N)
             after = workers.snapshot()
+            if mass_enabled:
+                mass_context_from(transition)
+                mass_context_from(after)
+                if any(not torch.equal(snapshot[key], transition[key]) or not torch.equal(snapshot[key], after[key])
+                       for key in MASS_FIELDS):
+                    raise RuntimeError("torso mass changed or differs across frozen evaluation collection")
             f1 = torch.minimum(f + 1, ends)
             if not torch.equal(after["f"], f1) or not torch.equal(transition["f"], f):
                 raise RuntimeError("post-action frame alignment failed; possible failure reset")
@@ -281,6 +302,9 @@ def evaluate_group(policy, motion, mdp, shapes, workers, clip_ids, *, fk39, join
                       "expected_contact": expected, "expected_valid": expected_valid,
                       "contact_missing_counter": transition["contact_missing_counter"],
                       "xi": snapshot["xi"], "xi_o": snapshot["xi_o"]}
+            if mass_enabled:
+                values.update({key: snapshot[key] for key in MASS_FIELDS})
+                values["torso_mass_context"] = mass_context
             if "contact_force" in transition:
                 values["contact_force_N"] = transition["contact_force"]
             if "failure_reason" in transition:
@@ -410,6 +434,10 @@ def main(argv=None):
     args, launcher = parser.parse_known_args(argv)
     checkpoint, checkpoint_sha, provenance = _load_evaluation_snapshot(args.checkpoint)
     variant = checkpoint_variant(checkpoint)
+    from .checkpoint import checkpoint_observation_profile, checkpoint_randomization_profile, checkpoint_torso_mass_context
+    observation_profile = checkpoint_observation_profile(checkpoint)
+    dr_profile = checkpoint_randomization_profile(checkpoint)
+    mass_enabled = checkpoint_torso_mass_context(checkpoint)
     from .variants import geometry_input_enabled, reward_config, max_step_reward
     settings, _ = resolve_arguments(args, checkpoint.get("physics"), require_legacy_explicit=True)
     training_bundle, header = _read_bundle_header(args.training_bundle), _read_bundle_header(args.bundle)
@@ -429,8 +457,9 @@ def main(argv=None):
     joint_names = manifest["bindings"]["target_joint_names"]
     fk39 = _load_fk39(bundle, joint_names, args.device)
     mdp = HOIMDP(kin, motion, torch.tensor(default_joint_pos_list(), device=args.device), shapes, cfg=reward_config(variant))
-    policy, wm, critic = [model(geometry_input_enabled=geometry_input_enabled(variant)).to(args.device)
-                          for model in (Policy, WorldModel, Critic)]
+    policy = Policy(geometry_input_enabled=geometry_input_enabled(variant), observation_profile=observation_profile).to(args.device)
+    wm, critic = [model(geometry_input_enabled=geometry_input_enabled(variant), torso_mass_context=mass_enabled).to(args.device)
+                  for model in (WorldModel, Critic)]
     load_checkpoint(checkpoint, policy, wm, critic, physics=asdict(settings), data_identity=identity, variant=variant)
     legacy_networks.AMP_DTYPE = None
     output = fresh_directory(args.output)
@@ -444,6 +473,7 @@ def main(argv=None):
         config = {"physics": asdict(settings), "output": str(output / f"native_{spec.asset_id:04d}"),
                   "bundle": str(args.bundle.resolve()), "device": args.device, "require_train": False,
                   "eval_mode": True, "reset_noise": False, "launcher_args": launcher,
+                  "domain_randomization_profile": dr_profile,
                   "robot_mjcf": args.robot_mjcf, "seed": args.seed, "variant": variant}
         with torch.no_grad():
             workers = WorkerGroup([spec], config, device=args.device)
@@ -468,6 +498,8 @@ def main(argv=None):
     for key in ("human_normalized_return", "hoi_normalized_return", "hoi_reference_mask_normalized_return", "objective_normalized_return"):
         aggregate_values[key] = sum(case[key] for case in results) / len(results)
     report = {"protocol": "HOI v1 full-reference oracle-pose policy evaluation; full-duration physical evaluation",
+              "observation_profile": observation_profile, "training_domain_randomization_profile": dr_profile,
+              "evaluation_domain_randomization_enabled": False,
               "contact_channels": list(CHANNELS), "contact_label_schema": LABEL_SCHEMA,
               "partition": bundle["partition"], "scope": bundle["scope"], "checkpoint_sha256": checkpoint_sha,
               "variant": variant, "objective_max_step_reward": max_step_reward(variant), "common_hoi_comparison_step_reward": .15,

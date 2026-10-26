@@ -122,6 +122,14 @@ def _configuration(plan, evaluation):
             out["training/experiment_kind"] = value
         elif key == "variant" and value in VARIANTS:
             out["training/variant"] = value
+        elif key == "observation_profile":
+            from .observations import PROFILES
+            if value in PROFILES:
+                out["training/observation_profile"] = value
+        elif key == "domain_randomization_profile":
+            from .randomization import DR_PROFILES
+            if value in DR_PROFILES:
+                out["training/domain_randomization_profile"] = value
     quality_gate = _nested(plan, "policy_update_schedule", "wm_quality_gate_enabled")
     if type(quality_gate) is bool:
         out["training/wm_quality_gate_enabled"] = quality_gate
@@ -252,6 +260,10 @@ def _validate_payload(payload):
                    "training/variant": VARIANTS, "evaluation/variant": VARIANTS,
                    "contact/label_schema": (LABEL_SCHEMA,), "contact/channel_count": (len(CHANNELS),),
                    "evaluation/partition": ("train", "eval80", "test40", "validation", "regression", "test")}
+    from .observations import PROFILES
+    from .randomization import DR_PROFILES
+    enum_fields["training/observation_profile"] = PROFILES
+    enum_fields["training/domain_randomization_profile"] = DR_PROFILES
     numeric_fields = {"training/" + key for key, value in TrainConfig().to_dict().items() if type(value) in (int, float, bool)}
     numeric_fields.add("training/wm_quality_gate_enabled")
     numeric_fields.update({"physics/hand_collision", "physics/self_collision", "dataset/selected_motions", "dataset/available_motions", "dataset/is_subset"})

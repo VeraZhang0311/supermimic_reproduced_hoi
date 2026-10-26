@@ -10,6 +10,10 @@ data/
 # training runs: checkpoints, logs
 logs/
 *.pt
+*.pth
+*.ckpt
+*.safetensors
+*.onnx
 # rendered videos and recorded trajectories (derived from CC BY-NC-ND LAFAN1 motions)
 *.mp4
 *.npz
@@ -27,6 +31,9 @@ results/analysis/
 
 # Private runtime receipts and derived local experiment deliveries
 /tmp/
+/results/
+/wandb/
+/checkpoints/
 /results/eval_*/
 /results/hoi80_*/
 /results/paired-case-comparison-*.json

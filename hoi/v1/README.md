@@ -1,5 +1,18 @@
 # SuperMimic HOI v1
 
+实验分支 `hoi/v1.1-observation-matching` 使用显式配置
+[`hoi_v1_1_observation_matching.json`](../../configs/hoi_v1_1_observation_matching.json)。
+它替换actor观测/输入层并增加指定DR，继续原MLP融合；WM/critic分别扩为225D/1215D，追加torso质量上下文。
+质量来自模拟器实际读回，按`(实际−DR前名义质量)/3kg`编码；actor不读取该字段，奖励/终止保持原定义。
+完整合同、保留的V5差异和CPU验证边界见[设计的v1.1章节](../../notes/supermimic_hoi_v1_final_design.md#v11-observation-matching)。
+原v1仍是默认profile；8500权重不能直接resume为v1.1。新DR未完成Linux GPU原生验证前，训练入口会拒绝启动。
+用户2026-10-25追加独立物体RMS：历史9D跨10帧共享统计、未来63D逐槽位逐维统计；eps=0.01，无裁剪，统计只在真实采集更新。
+按用户后续要求，独立排队1467536/1467537已取消，合并为单GPU作业1467570，当前仍在排队。
+L40×1/24CPU/96GiB、总时限96小时：先跑最多2小时的native/完整反传验证，成功后同一allocation用新进程从零训练20k，失败即退出，无二次训练排队。
+完整HOI80评估仍为独立作业、单独预留2小时。排队不代表验证通过或训练已开始。
+可复用启动/验证代码已整理到[cluster/hoi_v1_1](../../cluster/hoi_v1_1/README.md)，入口为`cluster/hoi_v1_1_combined.sbatch.sh`；不再依赖ignored目录里的Python辅助源码。
+stage/operations manifest、证据和运行产物仍作为外部输入/输出，不提交到Git。已排队1467570保留原冻结快照，代码整理不改变该作业。
+
 当前开发基线为 `codex/hoi-v1-no-quality-gate`：无持续WM质量门、完整手脚碰撞、五通道contact head。使用同SHA的完整ULTRA脚STL/零安装变换，在不可变手overlay上关闭旧脚球并追加CoACD5hull/16vertex凸包，保留原质量/COM/惯量。原VHACD60000只作作者配置溯源，不冒称相同cooker。Train/eval必须显式绑定foot manifest、USD和新bundle身份，不能只依赖默认机器人路径。
 
 设计依据为[v1最终设计](../../notes/supermimic_hoi_v1_final_design.md)。新版source15的原生/资源与正式训练身份，以及最后8500pt完整HOI80和固定20条视频证据，见[最终验收报告](../../notes/hoi_v1_final8500_eval_handoff_20261025.md)。训练已因24h作业时限结束，没有完成20k；操作示例不自动授权续训。原 `hoi.run` 仍为冻结、无物体policy observation的zero-shot入口。

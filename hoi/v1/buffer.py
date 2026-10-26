@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import torch
 from .contacts import CHANNELS
+from .robot_context import MASS_FIELDS, mass_context_from
 
 
 FIELDS = {
@@ -20,19 +21,27 @@ FIELDS = {
 }
 
 
+def replay_fields(torso_mass_context=False):
+    return {**FIELDS, **(MASS_FIELDS if torso_mass_context else {})}
+
+
 class ReplayBuffer:
-    def __init__(self, T, N, device="cpu"):
+    def __init__(self, T, N, device="cpu", *, torso_mass_context=False):
         if min(T, N) < 1:
             raise ValueError("replay dimensions must be positive")
         self.T, self.N, self.device = T, N, torch.device(device)
+        if type(torso_mass_context) is not bool:
+            raise ValueError("torso_mass_context must be boolean")
+        self.torso_mass_context = torso_mass_context
+        self.fields = replay_fields(torso_mass_context)
         self.data = {key: torch.zeros((T, N) + ((shape,) if isinstance(shape, int) else shape),
                                       dtype=dtype, device=device)
-                     for key, (shape, dtype) in FIELDS.items()}
+                     for key, (shape, dtype) in self.fields.items()}
         self.ptr = self.size = 0
 
     @torch.no_grad()
     def add(self, transition):
-        for key, (shape, _) in FIELDS.items():
+        for key, (shape, _) in self.fields.items():
             if key not in transition:
                 raise ValueError(f"joint replay transition is missing {key}")
             expected = (self.N,) + ((shape,) if isinstance(shape, int) else shape)
@@ -44,7 +53,9 @@ class ReplayBuffer:
             raise ValueError("real pair-contact labels must be binary")
         if bool((transition["impulse"] < 0).any()):
             raise ValueError("normal contact impulse must be nonnegative")
-        for key in FIELDS:
+        if self.torso_mass_context:
+            mass_context_from(transition)
+        for key in self.fields:
             self.data[key][self.ptr].copy_(transition[key].detach())
         self.ptr = (self.ptr + 1) % self.T
         self.size = min(self.size + 1, self.T)
@@ -168,6 +179,8 @@ class ReplayBuffer:
             hrows = self._row(ages[:, None] - back)
             henv = env[:, None].expand_as(hrows)
             keys = ("s", "o", "a_prev", "xi", "xi_o", "f", "asset_id", "contact_missing_counter")
+            if self.torso_mass_context:
+                keys += tuple(MASS_FIELDS)
             starts.append({key: self.data[key][rows, env] for key in keys})
             histories.append({key: self.data[key][hrows, henv] for key in keys})
             remaining -= len(ids)

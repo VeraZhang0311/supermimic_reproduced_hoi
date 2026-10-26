@@ -86,6 +86,20 @@ class PeriodicEvaluationTests(unittest.TestCase):
     def request(self, receipt):
         return json.loads(Path(receipt["dispatch"]).read_text(encoding="utf-8"))
 
+    def test_checkpoint_reader_accepts_v11_mass_schema_without_dispatch(self):
+        from hoi.v1.networks import feature_schema
+        from hoi.v1.observations import MATCHING
+        from hoi.v1.randomization import MATCHING_DR, randomization_contract
+        from hoi.v1.periodic_eval import _checkpoint
+        self.checkpoint["feature_schema"] = feature_schema(MATCHING, torso_mass_context=True)
+        self.checkpoint["extra"]["config"] = {"domain_randomization_profile": MATCHING_DR}
+        self.checkpoint["experiment_contract"] = {"observation_profile": MATCHING,
+                                                "domain_randomization": randomization_contract(MATCHING_DR)}
+        torch.save(self.checkpoint, self.ck)
+        with patch("hoi.v1.periodic_eval.source_identity", return_value=self.source):
+            digest, _, _, _ = _checkpoint(self.ck, 5000, self.train)
+        self.assertEqual(digest, sha256_file(self.ck))
+
     def test_dry_run_reviewable_exact_hashes_no_scheduler_or_credentials(self):
         with patch("hoi.v1.periodic_eval.subprocess.run", side_effect=AssertionError("no scheduler in dry run")):
             result = self.call(dry_run=True)

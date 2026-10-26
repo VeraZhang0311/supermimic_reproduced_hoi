@@ -17,6 +17,8 @@ from .config import TrainConfig
 from .contacts import CHANNELS
 from .networks import frozen_parameters
 from .state import object_features, unflatten_object, unflatten_state
+from .observations import ActorObservations
+from .robot_context import uses_torso_mass, mass_context_from
 
 
 def _stack(states):
@@ -41,14 +43,21 @@ class Learner:
         self.config = (config if config is not None else TrainConfig()).validate()
         self.pi, self.wm, self.critic = policy, wm, critic
         self.motion, self.mdp, self.shapes, self.buffer = motion, mdp, shapes, replay
+        self.torso_mass_context = uses_torso_mass(self.config.domain_randomization_profile)
+        if any(getattr(value, "torso_mass_context", False) != self.torso_mass_context
+               for value in (wm, critic, replay)):
+            raise ValueError("WM, critic and replay torso mass context must match the DR profile")
         self.device = next(policy.parameters()).device
         self.optimizers = {
             "pi": torch.optim.Adam(policy.parameters(), lr=self.config.lr, betas=(.9, .95)),
             "wm": torch.optim.Adam(wm.parameters(), lr=self.config.lr),
             "critic": torch.optim.Adam(critic.parameters(), lr=self.config.lr),
         }
-        self.robot_history = torch.zeros((replay.N, 10, 99), device=self.device)
-        self.object_history = torch.zeros((replay.N, 10, 18), device=self.device)
+        if policy.observation_profile != self.config.observation_profile:
+            raise ValueError("actor observation profile differs from learner configuration")
+        self.actor_obs = ActorObservations(mdp, self.config.observation_profile)
+        self.robot_history = torch.zeros((replay.N, 10, self.actor_obs.spec.robot_dim), device=self.device)
+        self.object_history = torch.zeros((replay.N, 10, self.actor_obs.spec.object_dim), device=self.device)
         self.iteration = self.sim_steps = 0
         self.contact_positive = torch.zeros(len(CHANNELS), device=self.device, dtype=torch.float64)
         self.contact_negative = torch.zeros(len(CHANNELS), device=self.device, dtype=torch.float64)
@@ -63,6 +72,12 @@ class Learner:
     def _points(self, assets):
         return self.shapes.points(assets)
 
+    def _mass_kwargs(self, values, index=None):
+        if not getattr(self, "torso_mass_context", False):
+            return {}
+        context = mass_context_from(values)
+        return {"mass_context": context if index is None else context[index]}
+
     def _check_assets(self, frames, assets):
         if not torch.equal(self.motion.asset_ids[frames], assets):
             raise ValueError("collector asset geometry does not match the reference frame")
@@ -72,15 +87,15 @@ class Learner:
         S, O = unflatten_state(snapshot["s"]), unflatten_object(snapshot["o"])
         f, xi, assets = snapshot["f"], snapshot["xi"], snapshot["asset_id"]
         self._check_assets(f, assets)
-        robot = self.mdp.add_noise(self.mdp.obs(S, snapshot["a_prev"], xi, f))
-        obj = self.mdp.object_obs(S, O, f)
+        robot = self.actor_obs.add_noise(self.actor_obs.robot(S, snapshot["a_prev"], xi, f))
+        obj = self.actor_obs.object(S, O, f)
         fresh = snapshot["ep_step"] == 0
         self.robot_history = torch.where(fresh[:, None, None], robot[:, None].expand_as(self.robot_history),
                                         torch.cat((self.robot_history[:, 1:], robot[:, None]), 1))
         self.object_history = torch.where(fresh[:, None, None], obj[:, None].expand_as(self.object_history),
                                          torch.cat((self.object_history[:, 1:], obj[:, None]), 1))
-        human_goal = self.motion.goal(f, 10)
-        object_goal = self.motion.object_goal(S, O, f, 10)
+        human_goal = self.actor_obs.human_goal(S, f)
+        object_goal = self.actor_obs.object_goal(S, O, f)
         if update_statistics:
             # Match the upstream current-observation count, not ten repeated
             # histories per tick; each new normalizer has its own count.
@@ -122,7 +137,8 @@ class Learner:
                 next_s, next_o, active_contact = self.wm.step(
                     tuple(value[active] for value in S), tuple(value[active] for value in O),
                     window["a"][active, step], normalize_xi(window["xi"][active, step]),
-                    window["xi_o"][active, step], self._points(window["asset_id"][active, step]))
+                    window["xi_o"][active, step], self._points(window["asset_id"][active, step]),
+                    **self._mass_kwargs(window, (active, step)))
                 S = tuple(previous.index_copy(0, active, value) for previous, value in zip(S, next_s))
                 O = tuple(previous.index_copy(0, active, value) for previous, value in zip(O, next_o))
                 contact = contact.index_copy(0, active, active_contact)
@@ -149,21 +165,27 @@ class Learner:
         optimizer.step()
         return {key: float(value.detach()) / self.config.wm_window for key, value in losses.items()}
 
-    def _critic_args(self, S, O, f, xi_n, xi_o, assets):
+    def _critic_args(self, S, O, f, xi_n, xi_o, assets, mass_context=None):
         expected, valid = self.motion.expected(f)
         legacy = torch.cat((self.mdp.legacy_critic_features(S, f, xi_n), self.motion.goal(f, 10)), -1)
-        return (legacy, self.motion.object_goal(S, O, f, 10), object_features(S, O),
+        arguments = (legacy, self.motion.object_goal(S, O, f, 10), object_features(S, O),
                 self.mdp.object_errors(S, O, f), xi_o, torch.cat((expected, valid), -1), self._points(assets))
+        if self.torso_mass_context:
+            if mass_context is None:
+                raise ValueError("critic is missing torso mass context")
+            arguments += (mass_context,)
+        return arguments
 
     def imagine(self, start, history, *, fixed_robot_noise=None):
         c = self.config
         S, O = unflatten_state(start["s"]), unflatten_object(start["o"])
         xi, xi_o, f, previous = start["xi"], start["xi_o"], start["f"], start["a_prev"]
         assets, xi_n = start["asset_id"], normalize_xi(xi)
+        mass_kwargs = self._mass_kwargs(start)
         with torch.no_grad():
-            robot_hist = self.mdp.obs(unflatten_state(history["s"]), history["a_prev"], history["xi"], history["f"])
-            obj_hist = self.mdp.object_obs(unflatten_state(history["s"]), unflatten_object(history["o"]), history["f"])
-        robot_hist = self.mdp.add_noise(robot_hist) if fixed_robot_noise is None else robot_hist + fixed_robot_noise[0]
+            robot_hist = self.actor_obs.robot(unflatten_state(history["s"]), history["a_prev"], history["xi"], history["f"])
+            obj_hist = self.actor_obs.object(unflatten_state(history["s"]), unflatten_object(history["o"]), history["f"])
+        robot_hist = self.actor_obs.add_noise(robot_hist) if fixed_robot_noise is None else robot_hist + fixed_robot_noise[0]
         states, objects, frames = [S], [O], [f]
         actions, rewards, failures, contact_probabilities = [], [], [], []
         points = self._points(assets)
@@ -171,18 +193,18 @@ class Learner:
         # not a detached embedding or a cache across parameter updates.
         policy_shape = self.pi.shape_encoder(points)
         for step in range(c.horizon):
-            human_goal = self.motion.goal(f, 10)
-            object_goal = self.motion.object_goal(S, O, f, 10)
+            human_goal = self.actor_obs.human_goal(S, f)
+            object_goal = self.actor_obs.object_goal(S, O, f)
             action = self.pi(robot_hist, human_goal, obj_hist, object_goal, points, shape_embedding=policy_shape)
-            S, O, logits = self.wm.step(S, O, action, xi_n, xi_o, points)
+            S, O, logits = self.wm.step(S, O, action, xi_n, xi_o, points, **mass_kwargs)
             f = f + 1
             probabilities = torch.sigmoid(logits)
             rewards.append(self.mdp.reward(S, O, f, action, previous, probabilities))
             failures.append(self.mdp.soft_termination(S, O, f))
-            observation = self.mdp.obs(S, action, xi, f)
-            observation = self.mdp.add_noise(observation) if fixed_robot_noise is None else observation + fixed_robot_noise[step + 1]
+            observation = self.actor_obs.robot(S, action, xi, f)
+            observation = self.actor_obs.add_noise(observation) if fixed_robot_noise is None else observation + fixed_robot_noise[step + 1]
             robot_hist = torch.cat((robot_hist[:, 1:], observation[:, None]), 1)
-            obj_hist = torch.cat((obj_hist[:, 1:], self.mdp.object_obs(S, O, f)[:, None]), 1)
+            obj_hist = torch.cat((obj_hist[:, 1:], self.actor_obs.object(S, O, f)[:, None]), 1)
             states.append(S)
             objects.append(O)
             frames.append(f)
@@ -196,7 +218,7 @@ class Learner:
         returns = (discounts[:, None] * survival * reward).sum(0)
         if not c.no_critic:
             returns = returns + c.gamma ** c.horizon * alive[-1] * self.critic(
-                *self._critic_args(S, O, f, xi_n, xi_o, assets))
+                *self._critic_args(S, O, f, xi_n, xi_o, assets, **mass_kwargs))
         return {"objective": returns.mean(), "reward": reward, "failure": failure, "survival": survival,
                 "states": states, "objects": objects, "frames": frames, "actions": actions,
                 "contact": contact_probabilities, "terminal_survival": alive[-1]}
@@ -210,10 +232,12 @@ class Learner:
             S, O = _flatten(_stack([_detach(state) for state in trajectory["states"]])), _flatten(_stack([_detach(state) for state in trajectory["objects"]]))
             f = torch.stack(trajectory["frames"]).flatten()
             expand = lambda value: value[None].expand((H + 1,) + value.shape).flatten(0, 1)
-            arguments = self._critic_args(S, O, f, expand(normalize_xi(start["xi"])), expand(start["xi_o"]), expand(start["asset_id"]))
+            mass_kwargs = {key: expand(value) for key, value in self._mass_kwargs(start).items()}
+            arguments = self._critic_args(S, O, f, expand(normalize_xi(start["xi"])), expand(start["xi_o"]),
+                                          expand(start["asset_id"]), **mass_kwargs)
         # Cache raw inputs/points only. PointNet remains inside each minibatch
         # forward so it is trained by the value loss.
-        self.critic.update_normalizers(*arguments[:-1])
+        self.critic.update_normalizers(*arguments[:6])
         with torch.no_grad():
             # Bound PointNet's temporary activations by the existing largest
             # training minibatch; include every bootstrap row in time order.
@@ -304,7 +328,8 @@ class Learner:
             if bool(active.any()):
                 _, selected_o, selected_c = self.wm.step(unflatten_state(window["s"][active, step]), unflatten_object(window["o"][active, step]),
                                                         window["a"][active, step], normalize_xi(window["xi"][active, step]),
-                                                        window["xi_o"][active, step], self._points(window["asset_id"][active, step]))
+                                                        window["xi_o"][active, step], self._points(window["asset_id"][active, step]),
+                                                        **self._mass_kwargs(window, (active, step)))
                 for target, source in zip(one_o, selected_o):
                     target[active] = source
                 one_c[active] = selected_c

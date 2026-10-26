@@ -60,6 +60,18 @@ class G1Kinematics:
         self.q_lo = torch.tensor(lo, dtype=torch.float32, device=device)
         self.q_hi = torch.tensor(hi, dtype=torch.float32, device=device)
 
+    def body_pose(self, name, p, R, q):
+        """Differentiable named-body pose, evaluating only its ancestor chain."""
+        index = self.body_names.index(name)
+        chain = []
+        while self.parent[index] >= 0:
+            chain.append(index)
+            index = self.parent[index]
+        for index in reversed(chain):
+            p = p + (R @ self.off_p[index].unsqueeze(-1)).squeeze(-1)
+            R = R @ self.off_R[index] @ axis_angle_to_mat(self.axes[index], q[..., self.joint_idx[index]])
+        return p, R
+
     def forward(self, p, R, v, w, q, qd, all_bodies: bool = False):
         """Tracked-body world positions, rotations, linear (link-origin) and angular velocities.
 

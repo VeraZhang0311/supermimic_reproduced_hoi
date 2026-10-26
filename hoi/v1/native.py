@@ -408,7 +408,8 @@ def make_hoi_sim(device, args):
 
 class HOITrackingSim:
     def __init__(self, sim_cfg, num_envs, motion, mdp, asset, output, *, gamma=.99,
-                 eval_mode=False, reset_noise=True, max_episode_steps=500, robot_asset=None):
+                  eval_mode=False, reset_noise=True, max_episode_steps=500, robot_asset=None,
+                  domain_randomization_profile="v1"):
         import isaaclab.sim as sim_utils
         import warp as wp
         from isaaclab.assets import RigidObjectCfg
@@ -464,6 +465,17 @@ class HOITrackingSim:
         self.env.G_max = mdp.max_step_reward / (1 - gamma)
         self.contact_missing_counter = torch.zeros(num_envs, 2, device=self.device, dtype=torch.int32)
         self.physics_report = self._apply_and_read_physics()
+        from .randomization import NativeRandomization, randomization_contract, randomization_enabled
+        from .robot_context import uses_torso_mass
+        self.domain_randomization_profile = domain_randomization_profile
+        self.torso_mass_context = uses_torso_mass(domain_randomization_profile)
+        if self.torso_mass_context:
+            torso = self.env.torso_id
+            self.torso_mass_nominal = self.env.robot.data.body_mass.torch[:, torso:torso + 1].clone()
+        self.physics_report["domain_randomization"] = randomization_contract(domain_randomization_profile)
+        self.physics_report["domain_randomization"]["enabled"] = not eval_mode
+        self.randomizer = (NativeRandomization(self) if
+                           randomization_enabled(domain_randomization_profile, eval_mode) else None)
         # MuJoCo-Warp exposes this supported scheduling option independently of
         # Newton's outer graph setting. No package/runtime files are patched.
         solver = self.env.sim.backend_manager._solver
@@ -486,9 +498,30 @@ class HOITrackingSim:
         self.physics_report["compiled_foot_audit"] = self.compiled_foot_audit
         self.reset(torch.arange(num_envs, device=self.device), self.env.f.clone())
         self.physics_report["robot_fk_comparison"] = self._verify_native_fk()
+        if self.torso_mass_context:
+            from .robot_context import mass_context_from
+            mass_fields = self.robot_mass_fields()
+            self.physics_report["domain_randomization"]["initial_samples"] = {
+                "torso_mass_kg": mass_fields["torso_mass"].squeeze(-1).cpu().tolist(),
+                "torso_mass_nominal_kg": mass_fields["torso_mass_nominal"].squeeze(-1).cpu().tolist(),
+                "torso_mass_context": mass_context_from(mass_fields).squeeze(-1).cpu().tolist(),
+                "object_context12": self.xi_o.detach().cpu().tolist()}
+        if self.randomizer is not None:
+            self.physics_report["property_report_scope"] = "nominal_before_DR; initial realized samples are recorded separately"
 
     def __getattr__(self, name):
         return getattr(self.env, name)
+
+    def robot_mass_fields(self):
+        """Effective pre-action mass; nominal is captured before any torso DR."""
+        if not self.__dict__.get("torso_mass_context", False):
+            return {}
+        from .robot_context import mass_context_from
+        torso = self.env.torso_id
+        fields = {"torso_mass": self.env.robot.data.body_mass.torch[:, torso:torso + 1].clone(),
+                  "torso_mass_nominal": self.torso_mass_nominal.clone()}
+        mass_context_from(fields)
+        return fields
 
     def _apply_and_read_physics(self):
         import warp as wp
@@ -594,6 +627,8 @@ class HOITrackingSim:
         if frames is not None and not bool((self.motion.asset_ids[frames] == self.asset_id[env_ids]).all()):
             raise ValueError("Cannot reset a geometry group to an incompatible motion")
         self.env.reset(env_ids, frames)
+        if getattr(self, "randomizer", None) is not None:
+            self.randomizer.reset(env_ids)
         f = self.env.f[env_ids]
         p, R, v, w = self.motion.ref_object(f)
         q = mat_to_quat(R)
@@ -855,6 +890,7 @@ class HOITrackingSim:
             raise ValueError("Expected finite [N,29] G1 PD-offset actions")
         S, O = self.state()
         f, a_prev, ep_step = e.f.clone(), e.a_prev.clone(), e.ep_step.clone()
+        mass_fields = self.robot_mass_fields()
         pair = self._advance(action)
         S1, O1 = self.state()
         # Frames only clamp for full-duration batched evaluation; training resets
@@ -880,7 +916,7 @@ class HOITrackingSim:
               "ep_step": ep_step, "done": done, "term": term, "asset_id": self.asset_id.clone(),
               "failure_reason": failure_reason,
               "r": reward, "r_human": terms["human_reward"], "r_hoi": reward - terms["human_reward"],
-              "contact_missing_counter": self.contact_missing_counter.clone(), "terms": terms, **pair}
+              "contact_missing_counter": self.contact_missing_counter.clone(), "terms": terms, **pair, **mass_fields}
         e.ep_disc_ret += (e.gamma ** ep_step.float()) * reward
         e.ep_ret += reward
         e.f, e.ep_step, e.a_prev = f1, ep_step + 1, action.clone()

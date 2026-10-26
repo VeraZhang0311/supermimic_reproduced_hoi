@@ -1,5 +1,9 @@
 # Cluster entry points
 
+HOI v1.1 uses `hoi_v1_1_combined.sbatch.sh` to validate and train in one GPU
+allocation. Reusable helpers, required frozen manifests and CPU checks are
+documented in [hoi_v1_1/README.md](hoi_v1_1/README.md).
+
 Use `train.sbatch.sh` for new unified runs. Supply a fresh development checkout
 through `SUPERMIMIC_ROOT`, and a new `RUN_DIR`. `SELF_COLLISION` and `HAND_COLLISION`
 default to 1. Pass the matching flags when resuming legacy checkpoints.

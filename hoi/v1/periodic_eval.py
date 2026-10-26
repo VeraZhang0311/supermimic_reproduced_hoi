@@ -22,7 +22,6 @@ from hoi.data.manifest import read_manifest, sha256_file
 from .checkpoint import CHECKPOINT_SCHEMA, checkpoint_variant
 from .config import bundle_identity, json_identity, source_identity, write_json
 from .evaluate import _read_bundle_header, validate_evaluation_identity
-from .networks import FEATURE_SCHEMA
 from .track import destination, _base_url
 
 DISPATCH_SCHEMA = "supermimic_hoi_v1_periodic_eval_1"
@@ -99,8 +98,10 @@ def _checkpoint(path, iteration, training_header):
     digest = hashlib.sha256(raw).hexdigest()
     checkpoint = torch.load(io.BytesIO(raw), map_location="cpu", weights_only=False)
     if (not isinstance(checkpoint, dict) or checkpoint.get("schema_version") != CHECKPOINT_SCHEMA or
-            checkpoint.get("feature_schema") != FEATURE_SCHEMA or checkpoint.get("iteration") != iteration):
+            checkpoint.get("iteration") != iteration):
         raise ValueError("evaluation checkpoint schema, features or iteration differ")
+    from .checkpoint import validate_checkpoint_features
+    validate_checkpoint_features(checkpoint)
     physics = checkpoint.get("physics", {})
     if physics.get("hand_collision") is not True or physics.get("self_collision") is not True:
         raise ValueError("v1 periodic evaluation requires checkpoint hand ON and self ON")

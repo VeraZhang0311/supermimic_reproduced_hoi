@@ -12,6 +12,8 @@ from supermimic.networks import RunningNorm, WorldModel as RobotWorldModel, mlp,
 from supermimic.rotations import so3_exp, yaw_mat
 from .contacts import CHANNELS, LABEL_SCHEMA
 from .state import integrate_object, object_features, object_state_error, object_targets
+from .observations import LEGACY, MATCHING, observation_spec, observation_contract
+from .robot_context import append_mass_context, torso_mass_contract
 
 FEATURE_VERSION = "supermimic_hoi_v1_full_reference_2"
 FEATURE_SCHEMA = {
@@ -37,6 +39,35 @@ FEATURE_SCHEMA = {
 }
 
 
+def feature_schema(profile=LEGACY, *, torso_mass_context=False):
+    from copy import deepcopy
+    result = deepcopy(FEATURE_SCHEMA)
+    if profile != LEGACY:
+        observation_spec(profile)
+        result["version"] = "supermimic_hoi_v1_1_observation_matching_3"
+        result["actor"] = ["human_latent32", "robot_history10x93", "object_history10x9", "object_latent32", "shape64"]
+        result["object_observation"] = "HtorsoT*(pO-pTorso)3,rotation_X_then_Z(HtorsoT*RO)6"
+        result["critic_object_goal_tick"] = result.pop("object_goal_tick")
+        result["actor_object_goal_tick"] = "HtorsoT*(pOref-pTorso)3,rotation_X_then_Z(HtorsoT*ROref)6"
+        result["actor_observation_contract"] = observation_contract(profile)
+    if torso_mass_context:
+        result["version"] = ("supermimic_hoi_v1_1_observation_matching_3" if profile == MATCHING
+                             else "supermimic_hoi_v1_mass_context_1")
+        result["wm"].append("torso_mass_delta_over_3kg1")
+        result["critic"].append("torso_mass_delta_over_3kg1")
+        result["robot_mass_context"] = torso_mass_contract()
+    return result
+
+
+class ClippedRunningNorm(RunningNorm):
+    """V5-style standardization/clipping, with fresh real-data statistics."""
+    def __init__(self, dim):
+        super().__init__(dim, eps=1e-5 ** .5)
+
+    def forward(self, value):
+        return super().forward(value).clamp(-5., 5.)
+
+
 def _dim(x, dim, name):
     if x.shape[-1] != dim:
         raise ValueError(f"{name} must have dimension {dim}; got {x.shape[-1]}")
@@ -55,33 +86,43 @@ class ShapeEncoder(nn.Module):
 
 
 class Policy(nn.Module):
-    def __init__(self, obs_dim=99, goal_dim=730, hist=10, z_dim=32,
-                 hidden=(2048, 1024, 512, 256), object_hidden=(256, 128), *, geometry_input_enabled=True):
+    def __init__(self, obs_dim=None, goal_dim=None, hist=10, z_dim=32,
+                 hidden=(2048, 1024, 512, 256), object_hidden=(256, 128), *, geometry_input_enabled=True,
+                 observation_profile=LEGACY):
         super().__init__()
         if type(geometry_input_enabled) is not bool:
             raise ValueError("geometry_input_enabled must be boolean")
         self.geometry_input_enabled = geometry_input_enabled
-        if (obs_dim, goal_dim, hist, z_dim) != (99, 730, 10, 32):
-            raise ValueError("v1 schema requires obs99, human_goal730, history10, latent32")
+        spec = observation_spec(observation_profile)
+        obs_dim = spec.robot_dim if obs_dim is None else obs_dim
+        goal_dim = spec.human_goal_dim if goal_dim is None else goal_dim
+        if (obs_dim, goal_dim, hist, z_dim) != (spec.robot_dim, spec.human_goal_dim, 10, 32):
+            raise ValueError("actor dimensions differ from its observation profile")
+        self.observation_profile, self.spec = observation_profile, spec
         self.hist = hist
         self.enc = mlp(goal_dim, list(hidden), z_dim)
-        self.object_enc = mlp(190, list(object_hidden), 32)
+        self.object_enc = mlp(spec.object_goal_dim, list(object_hidden), 32)
         self.shape_encoder = ShapeEncoder()
-        self.dec = mlp(1298, list(hidden), NUM_J)
+        self.dec = mlp(32 + hist * (obs_dim + spec.object_dim) + 32 + 64, list(hidden), NUM_J)
         with torch.no_grad():
             self.dec[-1].weight.mul_(0.01)
             self.dec[-1].bias.zero_()
-        self.obs_norm, self.goal_norm = RunningNorm(99), RunningNorm(730)
-        self.object_obs_norm, self.object_goal_norm = RunningNorm(18), RunningNorm(190)
+        norm = RunningNorm if observation_profile == LEGACY else ClippedRunningNorm
+        self.obs_norm, self.goal_norm = norm(obs_dim), norm(goal_dim)
+        # Separate real-data statistics: the 9D RMS is shared across history
+        # ticks; the 63D RMS retains a separate distribution for each goal slot.
+        # RunningNorm's eps=.01 keeps the denominator >=.01, without clipping.
+        self.object_obs_norm = RunningNorm(spec.object_dim)
+        self.object_goal_norm = RunningNorm(spec.object_goal_dim)
 
     def human_latent(self, human_goal):
-        _dim(human_goal, 730, "human goal")
+        _dim(human_goal, self.spec.human_goal_dim, "human goal")
         return torch.tanh(run_mlp(self.enc, self.goal_norm(human_goal)))
 
     def forward(self, robot_hist, human_goal, object_hist, object_goal, points, *, shape_embedding=None):
-        if robot_hist.shape[-2:] != (10, 99) or object_hist.shape[-2:] != (10, 18):
-            raise ValueError("actor requires robot (...,10,99) and object (...,10,18) histories")
-        _dim(object_goal, 190, "object goal")
+        if robot_hist.shape[-2:] != (10, self.spec.robot_dim) or object_hist.shape[-2:] != (10, self.spec.object_dim):
+            raise ValueError("actor histories differ from its observation profile")
+        _dim(object_goal, self.spec.object_goal_dim, "object goal")
         if shape_embedding is None:
             shape_embedding = self.shape_encoder(points)
         elif not isinstance(shape_embedding, torch.Tensor) or shape_embedding.shape != robot_hist.shape[:-2] + (64,):
@@ -103,15 +144,19 @@ class Policy(nn.Module):
 
 
 class WorldModel(nn.Module):
-    def __init__(self, hidden=(2048, 2048, 2048), contact_hidden=128, *, geometry_input_enabled=True):
+    def __init__(self, hidden=(2048, 2048, 2048), contact_hidden=128, *, geometry_input_enabled=True,
+                 torso_mass_context=False):
         super().__init__()
         if type(geometry_input_enabled) is not bool:
             raise ValueError("geometry_input_enabled must be boolean")
         self.geometry_input_enabled = geometry_input_enabled
+        if type(torso_mass_context) is not bool:
+            raise ValueError("torso_mass_context must be boolean")
+        self.torso_mass_context = torso_mass_context
         if not hidden:
             raise ValueError("joint WM requires hidden layers")
-        self.in_dim, self.out_dim = 224, 82
-        self.net = mlp(224, list(hidden), 82, act=nn.SiLU, layer_norm=True)
+        self.in_dim, self.out_dim = 224 + int(torso_mass_context), 82
+        self.net = mlp(self.in_dim, list(hidden), 82, act=nn.SiLU, layer_norm=True)
         # Preserve the legacy zero-increment start for the robot block. New
         # object rows are independently initialized and immediately trainable.
         with torch.no_grad():
@@ -132,13 +177,14 @@ class WorldModel(nn.Module):
         _dim(xi_o, 12, "object physical context")
         return torch.cat((invariant_features(S), a, xi_n), -1), torch.cat((object_features(S, O), xi_o), -1)
 
-    def inputs(self, S, O, a, xi_n, xi_o, points):
+    def inputs(self, S, O, a, xi_n, xi_o, points, *, mass_context=None):
         old, new = self.raw_inputs(S, O, a, xi_n, xi_o)
         new = self.object_in_norm(new)
         shape = self.shape_encoder(points)
         if not self.geometry_input_enabled:
             shape = shape * 0
-        return torch.cat((self.in_norm(old), new[..., :15], shape, new[..., 15:]), -1)
+        features = torch.cat((self.in_norm(old), new[..., :15], shape, new[..., 15:]), -1)
+        return append_mass_context(features, mass_context, self.torso_mass_context)
 
     @staticmethod
     def targets(S, O, S1, O1):
@@ -148,8 +194,8 @@ class WorldModel(nn.Module):
     def state_error(S_hat, O_hat, S, O):
         return torch.cat((RobotWorldModel.state_error(S_hat, S), object_state_error(S, O_hat, O)), -1)
 
-    def step(self, S, O, a, xi_n, xi_o, points):
-        hidden = run_mlp(self.net[:-1], self.inputs(S, O, a, xi_n, xi_o, points))
+    def step(self, S, O, a, xi_n, xi_o, points, *, mass_context=None):
+        hidden = run_mlp(self.net[:-1], self.inputs(S, O, a, xi_n, xi_o, points, mass_context=mass_context))
         y = run_mlp(self.net[-1], hidden)
         dr = y[..., :70] * self.out_norm.std() + self.out_norm.mean
         do = y[..., 70:] * self.object_out_norm.std() + self.object_out_norm.mean
@@ -191,12 +237,15 @@ class WorldModel(nn.Module):
 
 
 class Critic(nn.Module):
-    def __init__(self, hidden=(256, 128), *, geometry_input_enabled=True):
+    def __init__(self, hidden=(256, 128), *, geometry_input_enabled=True, torso_mass_context=False):
         super().__init__()
         if type(geometry_input_enabled) is not bool:
             raise ValueError("geometry_input_enabled must be boolean")
         self.geometry_input_enabled = geometry_input_enabled
-        self.net = mlp(1214, list(hidden), 1)
+        if type(torso_mass_context) is not bool:
+            raise ValueError("torso_mass_context must be boolean")
+        self.torso_mass_context = torso_mass_context
+        self.net = mlp(1214 + int(torso_mass_context), list(hidden), 1)
         self.norm, self.object_norm = RunningNorm(914), RunningNorm(236)
         self.shape_encoder = ShapeEncoder()
 
@@ -207,7 +256,7 @@ class Critic(nn.Module):
             _dim(x, d, "critic object feature")
         return torch.cat(tuple(x for x, _ in values), -1)
 
-    def forward(self, legacy, object_goal, object_feat, errors, xi_o, expected, points):
+    def forward(self, legacy, object_goal, object_feat, errors, xi_o, expected, points, mass_context=None):
         _dim(legacy, 914, "legacy critic features")
         raw = self.raw_object_features(object_goal, object_feat, errors, xi_o, expected)
         # Must remain in forward, including value-fitting minibatches.
@@ -215,6 +264,7 @@ class Critic(nn.Module):
         if not self.geometry_input_enabled:
             shape = shape * 0
         x = torch.cat((self.norm(legacy), self.object_norm(raw), shape), -1)
+        x = append_mass_context(x, mass_context, self.torso_mass_context)
         return run_mlp(self.net, x).squeeze(-1)
 
     @torch.no_grad()

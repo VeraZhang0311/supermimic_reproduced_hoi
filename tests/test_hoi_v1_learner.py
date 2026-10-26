@@ -113,6 +113,9 @@ def transition(learner, f, ep_step, a=None, a_prev=None):
                  asset_id=learner.motion.asset_ids[f], contact=torch.ones(n, len(CHANNELS)), contact_valid=torch.ones(n, len(CHANNELS), dtype=torch.bool))
     value["xi"][:, 0] = .75
     value["xi_o"][:, 0] = 1.
+    if learner.buffer.torso_mass_context:
+        value["torso_mass_nominal"] = torch.full((n, 1), 8.)
+        value["torso_mass"] = 8. + .3 * (torch.arange(n, dtype=torch.float32)[:, None] + 1)
     return value
 
 

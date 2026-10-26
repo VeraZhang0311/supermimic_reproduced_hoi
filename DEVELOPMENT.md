@@ -6,6 +6,17 @@
 
 ## 当前新版
 
+本地实验分支 `hoi/v1.1-observation-matching` 另提供显式配置
+`configs/hoi_v1_1_observation_matching.json`：actor-only V5字段/坐标约定加新版质量/物体DR。
+torso质量另以1D训练上下文接入WM/critic（225D/1215D），actor不读取质量；采集/replay/评估/checkpoint使用版本化合同。
+不传该配置仍是下述v1基线，旧8500权重不作为v1.1直接resume。
+2026-10-25按用户追加要求，物体历史/未来分别使用独立9D/63D RMS，不裁剪；只在真实采集更新统计。
+按用户后续要求已取消独立排队1467536/1467537，合并为单GPU作业1467570：先验证，成功后同一allocation从零训练20k，失败退出；总时限96小时，验证单阶段最多2小时。
+当前合并作业仍在排队，尚无原生通过或训练运行结论；模型CPU证据见ignored `tmp/hoi_v1_1_object_rms_20261025_01/`，合并流程/作业回执见`tmp/hoi_v1_1_object_rms_combined_20261025_01/`及下述v1.1设计章节。
+完整合同和V5差异见[设计中的v1.1章节](notes/supermimic_hoi_v1_final_design.md#v11-observation-matching)。
+可复用的同GPU验证→训练入口为`cluster/hoi_v1_1_combined.sbatch.sh`，辅助代码统一在`cluster/hoi_v1_1/`，说明见其README。
+本次Git整理保留原数值逻辑，不热改或重提1467570；该作业仍使用提交前已冻结的源码/启动器。运行manifest、回执和结果继续留在ignored目录。
+
 - 无持续WM质量门。前500轮WM-only，之后按固定日程更新actor/critic；WM holdout质量只作诊断。数据/资产身份、原生物理和非有限值硬错误检查保留。
 - 原机器人网络结构保留，追加物体观测/目标/几何及联合动力学。learned contact head输出依次为左手—物体、右手—物体、物体—地面、左脚—物体、右脚—物体。
 - hand/self均ON。脚使用与ULTRA同源完整STL、原安装变换和已验证CoACD hull，关闭旧脚球，原质量/COM/惯量不变；不等同PhysX VHACD cooked geometry。

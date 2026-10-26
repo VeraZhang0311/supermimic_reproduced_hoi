@@ -35,7 +35,8 @@ def read_config(path=None):
     # Changes to the reproduction's numerical training profile are explicit
     # smoke experiments, never silently labelled the default formal run.
     defaults = TrainConfig().to_dict()
-    protected = set(defaults) - {"iterations", "seed", "ckpt_every", "eval_every", "log_every", "gate_every", "experiment_kind", "variant"}
+    protected = set(defaults) - {"iterations", "seed", "ckpt_every", "eval_every", "log_every", "gate_every", "experiment_kind", "variant",
+                               "observation_profile", "domain_randomization_profile"}
     changed = {key: {"default": defaults[key], "actual": getattr(config, key)}
                for key in protected if getattr(config, key) != defaults[key]}
     if changed and config.experiment_kind != "smoke":
@@ -215,7 +216,12 @@ def main(argv=None):
     checkpoint, checkpoint_sha = read_checkpoint(args.resume) if args.resume else (None, None)
     if checkpoint is not None:
         from .checkpoint import validate_checkpoint_features
-        validate_checkpoint_features(checkpoint)
+        validate_checkpoint_features(checkpoint, config.observation_profile)
+        from .checkpoint import checkpoint_randomization_profile
+        if checkpoint_randomization_profile(checkpoint) != config.domain_randomization_profile:
+            raise ValueError("continuation domain randomization profile differs")
+    if args.init_checkpoint and config.observation_profile != "v1":
+        raise ValueError("v1.1 requires explicit from-scratch or same-profile resume; legacy actor initialization is incompatible")
     settings, _ = resolve_arguments(args, checkpoint.get("physics") if checkpoint else None)
     physics = asdict(settings)
     if not (settings.hand_collision and settings.self_collision):
@@ -255,6 +261,14 @@ def main(argv=None):
                                        "legacy_self_collision": args.legacy_self_collision,
                                        "allow_physics_change": args.allow_initialization_physics_change},
             "launcher_args": launcher, "training_started": False}
+    from .observations import observation_contract
+    from .randomization import randomization_contract, validate_dr_evidence
+    plan["actor_observation_contract"] = observation_contract(config.observation_profile)
+    plan["domain_randomization"] = randomization_contract(config.domain_randomization_profile)
+    from .robot_context import uses_torso_mass, torso_mass_contract
+    mass_enabled = uses_torso_mass(config.domain_randomization_profile)
+    plan["robot_mass_context"] = torso_mass_contract() if mass_enabled else None
+    plan["native_dr_gate"] = validate_dr_evidence(args.native_evidence, config.domain_randomization_profile)
     plan["periodic_evaluation"] = {"every_iterations": config.eval_every, "checkpoint_every": config.ckpt_every,
                                    "bundle": str(args.eval_bundle.resolve()) if args.eval_bundle else None,
                                    "bundle_content_sha256": evaluation_header["bundle_content_sha256"] if evaluation_header else None,
@@ -268,10 +282,10 @@ def main(argv=None):
     plan["tracking"] = {"enabled": tracking_enabled == "1", "entity": tracking_entity, "project": tracking_project,
                         "base_url": _base_url(), "resume": "never", "mode": "live_training" if tracking_enabled == "1" else "disabled",
                         "source_weight_raw_rollout_uploads": False}
-    from .buffer import FIELDS
+    from .buffer import replay_fields
     import math
     per_transition = sum(math.prod((shape,) if isinstance(shape, int) else shape) * dtype.itemsize
-                         for shape, dtype in FIELDS.values())
+                         for shape, dtype in replay_fields(mass_enabled).values())
     plan["resource_proposal"] = {"required_static_groups": len(required_assets), "num_envs": config.num_envs,
                                  "replay_bytes": per_transition * config.buffer_steps * config.num_envs,
                                  "full_gpu_memory_and_throughput_validated": False,
@@ -283,6 +297,8 @@ def main(argv=None):
     require_native_evidence(args.native_evidence, expected_physics=physics,
                    required_asset_ids=required_assets,
                    expected_bundle_sha256=bundle["bundle_content_sha256"])
+    if not plan["native_dr_gate"]["passed"]:
+        raise ValueError("new DR profile requires independent native readback/subset-reset/nominal-evaluation evidence before training")
     if not str(args.device).startswith("cuda") or not torch.cuda.is_available():
         raise ValueError("native HOI training requires the prepared Linux GPU runtime")
     torch.manual_seed(config.seed)
@@ -303,9 +319,11 @@ def main(argv=None):
     motion, shapes, bundle = load_bundle(args.bundle, kin, device=args.device)
     mdp = HOIMDP(kin, motion, torch.tensor(default_joint_pos_list(), device=args.device), shapes,
                  cfg=reward_config(config.variant))
-    models = [model(geometry_input_enabled=geometry_input_enabled(config.variant)).to(args.device)
-              for model in (Policy, WorldModel, Critic)]
-    replay = ReplayBuffer(config.buffer_steps, config.num_envs, args.device)
+    models = [Policy(geometry_input_enabled=geometry_input_enabled(config.variant),
+                     observation_profile=config.observation_profile).to(args.device),
+              WorldModel(geometry_input_enabled=geometry_input_enabled(config.variant), torso_mass_context=mass_enabled).to(args.device),
+              Critic(geometry_input_enabled=geometry_input_enabled(config.variant), torso_mass_context=mass_enabled).to(args.device)]
+    replay = ReplayBuffer(config.buffer_steps, config.num_envs, args.device, torso_mass_context=mass_enabled)
     learner = Learner(*models, motion, mdp, shapes, replay, config)
     initialization = {"mode": "explicit_from_scratch"}
     if args.init_checkpoint:
@@ -319,9 +337,9 @@ def main(argv=None):
         del old
     elif checkpoint:
         load_checkpoint(checkpoint, *models, learner.optimizers, physics=physics, data_identity=identity,
-                        variant=config.variant)
+                         variant=config.variant, domain_randomization_profile=config.domain_randomization_profile)
         if checkpoint["extra"]["config"] != config.to_dict():
-            previous = checkpoint["extra"]["config"]
+            previous = {**TrainConfig().to_dict(), **checkpoint["extra"]["config"]}
             allowed = {"iterations", "log_every", "gate_every", "ckpt_every", "eval_every"}
             if any(previous[k] != v for k, v in config.to_dict().items() if k not in allowed):
                 raise ValueError("continuation training profile differs")
@@ -342,6 +360,7 @@ def main(argv=None):
     write_json(output / "resources.json", resources)
     worker_config = {"bundle": str(args.bundle.resolve()), "output": str(output / "workers"), "physics": physics,
                      "variant": config.variant,
+                     "domain_randomization_profile": config.domain_randomization_profile,
                      "robot_mjcf": args.robot_mjcf,
                      "seed": config.seed,
                      "device": args.device, "gamma": config.gamma, "launcher_args": launcher,
