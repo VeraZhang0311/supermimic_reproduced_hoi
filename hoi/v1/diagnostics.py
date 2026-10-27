@@ -97,6 +97,15 @@ def executed_action_reward_gap(wm, mdp, states, control, frames, points, *, hori
         if control[key].shape != (T, dim):
             raise ValueError(f"paired reward diagnostic {key} shape differs")
     validate_actual_contact_fields(control, T, ("contact_valid",))
+    from .robot_context import mass_context_from
+    mass_context = mass_context_from(control) if getattr(wm, "torso_mass_context", False) else None
+    if mass_context is not None:
+        if mass_context.shape != (T, 1):
+            raise ValueError("paired reward diagnostic torso mass context shape differs")
+        if "torso_mass_context" in control and not torch.equal(control["torso_mass_context"], mass_context):
+            raise ValueError("saved torso mass context differs from raw kg fields")
+        if not bool((mass_context == mass_context[:1]).all()):
+            raise ValueError("paired reward diagnostic torso mass must be constant within a clip")
     if control["reward"].shape != (T,) or not bool(torch.isfinite(control["reward"]).all()):
         raise ValueError("paired reward diagnostic requires finite saved simulator rewards")
     device = next(wm.parameters()).device
@@ -125,8 +134,9 @@ def executed_action_reward_gap(wm, mdp, states, control, frames, points, *, hori
                 for offset in range(horizon):
                     indices, cpu_indices = chunk + offset, cpu_chunk + offset
                     action = control["action"][cpu_indices].to(device)
+                    mass_kwargs = {} if mass_context is None else {"mass_context": mass_context[cpu_indices].to(device)}
                     S, O, logits = wm.step(S, O, action, normalize_xi(control["xi"][cpu_indices].to(device)),
-                                             control["xi_o"][cpu_indices].to(device), cloud)
+                                             control["xi_o"][cpu_indices].to(device), cloud, **mass_kwargs)
                     if logits.shape != (len(chunk), len(CHANNELS)):
                         raise ValueError("paired reward diagnostic WM contact logits differ from the five-channel contract")
                     if not bool(torch.isfinite(logits).all()):

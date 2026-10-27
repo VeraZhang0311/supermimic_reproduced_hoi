@@ -1,0 +1,5 @@
+{
+  "observation_profile": "v1_1_observation_matching",
+  "domain_randomization_profile": "v1_1_mass_object",
+  "actor_architecture": "five_token_fusion_v1"
+}

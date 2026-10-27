@@ -94,11 +94,14 @@ def _snapshot(env):
     from .state import flatten_object
     S, O = env.state()
     f = env.f
-    return {"s": flatten_state(S), "o": flatten_object(O), "a_prev": env.a_prev.clone(),
+    snapshot = {"s": flatten_state(S), "o": flatten_object(O), "a_prev": env.a_prev.clone(),
             "xi": env.xi.clone(), "xi_o": env.xi_o.clone(),
             "f": env.motion.global_frame_index[f] if hasattr(env.motion, "global_frame_index") else f.clone(),
             "ep_step": env.ep_step.clone(), "asset_id": env.asset_id.clone(),
             "contact_missing_counter": env.contact_missing_counter.clone()}
+    if getattr(env, "robot_mass_fields", None) is not None:
+        snapshot.update(env.robot_mass_fields())
+    return snapshot
 
 
 def _worker_main(connection, spec, config):
@@ -139,12 +142,16 @@ def _worker_main(connection, spec, config):
         with launch_simulation(cfg, args), torch.no_grad():
             env = HOITrackingSim(cfg, spec.num_envs, bank, mdp, asset, output, gamma=config.get("gamma", .99),
                                  eval_mode=config.get("eval_mode", False), reset_noise=config.get("reset_noise", True),
-                                 robot_asset=bundle["native_robot_asset"])
+                                  robot_asset=bundle["native_robot_asset"],
+                                  domain_randomization_profile=config.get("domain_randomization_profile", "v1"))
             recipe, compiled = env.export_compiled_geometry(output / "compiled_geometry")
             env.verify_compiled_geometry(compiled, compiled_hands=recipe["hands"])
             initial = {"physics": env.physics_report, "contact": env.contacts.manifest(), "spec": asdict(spec),
                        "seed": worker_seed, "startup_timeout_seconds": config.get("startup_timeout", 1800),
                        "variant": config.get("variant", "hoi_v1")}
+            if config.get("validate_domain_randomization", False):
+                from .dr_validation import validate_native_randomization
+                initial["domain_randomization_validation"] = validate_native_randomization(env)
             (output / "native.json").write_text(json.dumps(initial, indent=2) + "\n", encoding="utf-8")
             connection.send(("ready", _cpu(_snapshot(env)), initial))
             while True:

@@ -1,6 +1,10 @@
 # 当前开发文档
 
-开发仓库：`D:/supermimic_reproduced_hoi`，分支 `codex/hoi-v1-no-quality-gate`。后续开发以无持续质量门、完整手脚碰撞、五通道contact head的新版为基线；固定500 iteration WM-only之后正常更新actor/critic，质量比较保留为诊断。原始fork分支只作溯源。
+当前实验工作区：`D:/supermimic_reproduced_hoi/tmp/hoi_v1_2_perception_fusion`，分支 `hoi/v1.2-perception-fusion`。
+原 `D:/supermimic_reproduced_hoi` 的 `hoi/v1.1-observation-matching` 及未提交改动保持原状。
+v1.2的五模态token融合合同原地维护在[v1最终设计的v1.2章节](supermimic_hoi_v1_final_design.md#v12-perception-fusion)；
+v1科学基线仍为 `codex/hoi-v1-no-quality-gate`：无持续质量门、完整手脚碰撞、五通道contact head，
+固定500 iteration WM-only之后正常更新actor/critic，质量比较保留为诊断。原始fork分支只作溯源。
 
 | 文档 | 用途 |
 | --- | --- |

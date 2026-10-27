@@ -15,7 +15,11 @@ import re
 
 import torch
 
-from .networks import FEATURE_SCHEMA
+from .networks import feature_schema
+from .observations import LEGACY, MATCHING
+from .actor_fusion import MLP_ACTOR, FUSION_ACTOR, actor_architecture_contract
+from .randomization import LEGACY_DR, randomization_contract
+from .robot_context import uses_torso_mass, torso_mass_contract
 
 CHECKPOINT_SCHEMA = "supermimic_hoi_v1_checkpoint_1"
 MODEL_KEYS = ("pi", "wm", "critic")
@@ -42,13 +46,18 @@ def _data(value):
 
 
 def _signature(module):
-    return {
+    result = {
         "geometry_input_enabled": module.geometry_input_enabled,
         "state_shapes": {key: list(value.shape) for key, value in module.state_dict().items()},
         "module_types": {key: type(value).__name__ for key, value in module.named_modules()},
         "normalizers": {key: {"eps": value.eps, "max_count": value.max_count}
                         for key, value in module.named_modules() if hasattr(value, "max_count") and hasattr(value, "eps")},
     }
+    if getattr(module, "actor_architecture", MLP_ACTOR) == FUSION_ACTOR:
+        result["actor_architecture_contract"] = actor_architecture_contract(module.actor_architecture, module.observation_profile)
+    if getattr(module, "torso_mass_context", False):
+        result["robot_mass_context"] = torso_mass_contract()
+    return result
 
 
 def _models(policy, wm, critic):
@@ -71,11 +80,16 @@ def make_checkpoint(policy, wm, critic, optimizers, *, iteration, physics, data_
         raise ValueError("record initialization checkpoint identity and migration report")
     _json(initialization)
     models = _models(policy, wm, critic)
+    dr_profile = (extra or {}).get("config", {}).get("domain_randomization_profile", LEGACY_DR)
+    mass_enabled = uses_torso_mass(dr_profile)
+    if any(model.torso_mass_context != mass_enabled for model in (wm, critic)):
+        raise ValueError("checkpoint WM/critic torso mass context differs from the DR profile")
     data = _data(data_identity)
     result = {
         "schema_version": CHECKPOINT_SCHEMA,
         "variant": variant,
-        "feature_schema": deepcopy(FEATURE_SCHEMA),
+        "feature_schema": feature_schema(policy.observation_profile, torso_mass_context=mass_enabled,
+                                         actor_architecture=policy.actor_architecture),
         "architecture": {key: _signature(model) for key, model in models.items()},
         "physics": _physics(physics),
         "data_identity": data,
@@ -89,6 +103,17 @@ def make_checkpoint(policy, wm, critic, optimizers, *, iteration, physics, data_
     }
     if extra is not None:
         result["extra"] = deepcopy(extra)
+    configured_profile = (extra or {}).get("config", {}).get("observation_profile", policy.observation_profile)
+    if configured_profile != policy.observation_profile:
+        raise ValueError("checkpoint actor profile differs from saved configuration")
+    configured_architecture = (extra or {}).get("config", {}).get("actor_architecture", MLP_ACTOR)
+    if configured_architecture != policy.actor_architecture:
+        raise ValueError("checkpoint actor architecture differs from saved configuration")
+    if policy.actor_architecture == FUSION_ACTOR:
+        result["actor_architecture_contract"] = actor_architecture_contract(policy.actor_architecture, policy.observation_profile)
+    if policy.observation_profile != LEGACY or dr_profile != LEGACY_DR:
+        result["experiment_contract"] = {"observation_profile": policy.observation_profile,
+                                         "domain_randomization": randomization_contract(dr_profile)}
     return result
 
 
@@ -150,16 +175,71 @@ def checkpoint_training_progress(checkpoint):
             "initialization_identity": "checkpoint.initialization separately records prior motion training or continuation"}
 
 
-def validate_checkpoint_features(checkpoint):
+def _checkpoint_actor_features(checkpoint):
+    """Recover exact architecture from the schema; missing legacy config means MLP."""
+    for profile, architecture in ((LEGACY, MLP_ACTOR), (MATCHING, MLP_ACTOR), (MATCHING, FUSION_ACTOR)):
+        for enabled in (False, True):
+            if checkpoint.get("feature_schema") != feature_schema(
+                    profile, torso_mass_context=enabled, actor_architecture=architecture):
+                continue
+            configured = checkpoint.get("extra", {}).get("config", {}).get("actor_architecture", MLP_ACTOR)
+            if configured != architecture:
+                raise ValueError("checkpoint actor architecture differs from saved configuration")
+            contract = checkpoint.get("actor_architecture_contract")
+            if architecture == FUSION_ACTOR:
+                if contract != actor_architecture_contract(architecture, profile):
+                    raise ValueError("checkpoint actor architecture contract differs or is missing")
+            elif contract is not None:
+                raise ValueError("checkpoint actor architecture contract differs from MLP schema")
+            return profile, enabled, architecture
+    raise ValueError("checkpoint feature schema/version differs; five-channel hand/foot-object contact requires an explicit migration for old three-channel HOI checkpoints")
+
+
+def checkpoint_observation_profile(checkpoint):
+    return _checkpoint_actor_features(checkpoint)[0]
+
+
+def checkpoint_actor_architecture(checkpoint):
+    return _checkpoint_actor_features(checkpoint)[2]
+
+
+def checkpoint_torso_mass_context(checkpoint):
+    return _checkpoint_actor_features(checkpoint)[1]
+
+
+def checkpoint_randomization_profile(checkpoint):
+    profile = checkpoint.get("extra", {}).get("config", {}).get("domain_randomization_profile", LEGACY_DR)
+    contract = checkpoint.get("experiment_contract")
+    observation = checkpoint_observation_profile(checkpoint)
+    if checkpoint_torso_mass_context(checkpoint) != uses_torso_mass(profile):
+        raise ValueError("checkpoint torso mass context is missing or differs from its DR profile")
+    if observation != LEGACY or profile != LEGACY_DR:
+        if contract != {"observation_profile": observation, "domain_randomization": randomization_contract(profile)}:
+            raise ValueError("checkpoint experiment/DR contract differs or is missing")
+    return profile
+
+
+def validate_checkpoint_features(checkpoint, observation_profile=None, actor_architecture=None):
     """Reject incompatible continuation on CPU, before workers/output creation."""
-    if checkpoint.get("schema_version") != CHECKPOINT_SCHEMA or checkpoint.get("feature_schema") != FEATURE_SCHEMA:
+    if checkpoint.get("schema_version") != CHECKPOINT_SCHEMA:
         raise ValueError("checkpoint feature schema/version differs; five-channel hand/foot-object contact requires an explicit migration for old three-channel HOI checkpoints")
+    actual = checkpoint_observation_profile(checkpoint)
+    if observation_profile is not None and actual != observation_profile:
+        raise ValueError("checkpoint actor observation profile differs; initialize a new experiment instead of resuming v1")
+    if actor_architecture is not None and checkpoint_actor_architecture(checkpoint) != actor_architecture:
+        raise ValueError("checkpoint actor architecture differs; initialize a new experiment instead of resuming another architecture")
+    checkpoint_randomization_profile(checkpoint)
 
 
-def load_checkpoint(path, policy, wm, critic, optimizers=None, *, physics, data_identity, map_location="cpu", variant="hoi_v1"):
+def load_checkpoint(path, policy, wm, critic, optimizers=None, *, physics, data_identity, map_location="cpu", variant="hoi_v1",
+                    domain_randomization_profile=None):
     from .variants import validate_variant, geometry_input_enabled
     checkpoint = torch.load(path, map_location=map_location, weights_only=False) if not isinstance(path, dict) else path
-    validate_checkpoint_features(checkpoint)
+    validate_checkpoint_features(checkpoint, policy.observation_profile, policy.actor_architecture)
+    if any(model.torso_mass_context != checkpoint_torso_mass_context(checkpoint) for model in (wm, critic)):
+        raise ValueError("checkpoint WM/critic torso mass context differs from requested models")
+    if domain_randomization_profile is not None and checkpoint_randomization_profile(checkpoint) != domain_randomization_profile:
+        raise ValueError("checkpoint domain randomization profile differs")
     if checkpoint_variant(checkpoint) != validate_variant(variant):
         raise ValueError("checkpoint experiment variant differs from the requested continuation/evaluation")
     if type(checkpoint.get("iteration")) is not int or checkpoint["iteration"] < 0:
@@ -254,6 +334,8 @@ def _last_linear_key(state, prefix="net"):
 
 @torch.no_grad()
 def migrate_legacy(checkpoint, policy, wm, critic, *, physics, legacy_physics=None, allow_physics_change=False):
+    if policy.observation_profile != LEGACY:
+        raise ValueError("v1.1 actor cannot warm-start legacy observation weights; use explicit from-scratch or same-profile resume")
     if checkpoint.get("schema_version") is not None:
         raise ValueError("migrate_legacy only accepts motion-only checkpoints")
     saved = checkpoint.get("physics") or checkpoint.get("args", {})

@@ -1,10 +1,321 @@
 # SuperMimic + HOI v1 最终设计
 
-现行开发基线：`codex/hoi-v1-no-quality-gate`，2026-10-25整理。本文保留v1增量架构与数据契约，并统一为当前已实现、已验收的新版：完整手/脚碰撞、身体自碰撞、五通道learned contact、固定500 iteration WM-only后交替更新。WM质量比较只作诊断；native、数据身份和有限性硬检查保留。
+v1科学基线：`codex/hoi-v1-no-quality-gate`，2026-10-25整理。本文保留v1增量架构与数据契约，并统一为已验收的v1配置：完整手/脚碰撞、身体自碰撞、五通道learned contact、固定500 iteration WM-only后交替更新。WM质量比较只作诊断；native、数据身份和有限性硬检查保留。当前独立开发实验为下述 `hoi/v1.2-perception-fusion`；v1验收不自动构成新架构的验收。
 
 当前实验为全部from-scratch，最后完整8500pt已完成canonical HOI80及同固定20条视频验收；训练因24h作业时限结束，没有完成20k，不宣称收敛。冻结权重、源码、bundle、物理、数值与媒体证据见[8500pt最终验收](hoi_v1_final8500_eval_handoff_20261025.md)。设计与本次记录不自动授权续训或新实验。
 
 数据依据为[ULTRA数据与时间基准交接](ULTRA_DATASET_AND_TIMEBASE_HANDOFF_20261023.zh-CN.md)。发布数据真实生成时钟尚未证实；本版使用canonical 60Hz解释与50Hz控制。网络尺寸、物体分支、奖励权重和阈值属于本项目设计，不冒充论文原配置或已验证最优值。外部仓库与操作入口见[文档索引](README.md)。
+
+## v1.2 perception fusion
+
+2026-10-25用户授权实现5-token attention方案：保留原1148D直连，并追加融合后的512D；
+本轮不实现额外MLP对照。用户随后追加授权：部署独立集群源码，先完成完整GPU验证，
+通过后commit/push v1.2，再从零训练20k，使用独立输出和新的私有W&B run。
+独立分支为 `hoi/v1.2-perception-fusion`，工作区为
+`D:/supermimic_reproduced_hoi/tmp/hoi_v1_2_perception_fusion`。
+原工作区 `D:/supermimic_reproduced_hoi` 的 `hoi/v1.1-observation-matching`、未提交文件和现有实验保持原状。
+新工作区从v1.1当前完整状态复制；Git基点为 `fd626e7`，29个未提交文件的内容与SHA保存在原目录ignored
+`tmp/hoi_v1_2_workspace_setup_20261025_01/baseline.json` 和同目录 `baseline_files/`。
+下文v1.1排队记录保留原有观察时点，本次没有重新查询或更改其作业状态。
+
+### Actor融合合同
+
+显式配置 `configs/hoi_v1_2_perception_fusion.json` 选择
+`actor_architecture=five_token_fusion_v1`、`observation_profile=v1_1_observation_matching`、
+`domain_randomization_profile=v1_1_mass_object`。新架构只接受该观测profile；
+省略架构配置仍为 `mlp`，原v1/v1.1配置和网络保持原行为。
+
+| 顺序 | 新融合分支输入 | token |
+| --- | --- | --- |
+| 0 | 原93D RMS/裁剪后的本体10帧历史，按最旧到当前展平为930D | Linear930→256 |
+| 1 | 原448D RMS/裁剪后的人体7帧未来参考，位于原human encoder之前 | Linear448→256 |
+| 2 | 原9D独立RMS后的物体10帧历史，无裁剪，展平为90D | Linear90→256 |
+| 3 | 原63D独立RMS后的物体7帧未来参考，无裁剪，位于原object encoder之前 | Linear63→256 |
+| 4 | 原actor PointNet的64D形状特征，不额外做RMS | Linear64→256 |
+
+每个token追加对应的可学习模态标识；joint self-attention使用2层、d_model256、4 heads、
+FFN1024、Pre-LN、GELU、dropout0，末尾LayerNorm。
+五个token全部相互可见，无causal mask；未来reference是既有任务输入，不读取未来实际状态。
+本版按模态把固定时间槽位展平，因此不再新增逐帧位置/时间编码，也不新增观测有效性mask。
+这测试跨模态摘要之间的交互，不等同于本地冯桥V5 student的逐帧token实现。
+
+取融合后顺序0的本体历史token256D与顺序2的物体历史token256D，拼成512D。
+原路径保持 `zH32 + robot_history930 + object_history90 + zO32 + shape64 = 1148D`，
+原human448→2048→1024→512→256→32、object63→256→128→32和PointNet全部保留；
+新融合分支能读取压缩到32D之前的参考，不把zH/zO扩维当作完整参考。
+最终decoder输入为 `[原1148D, fused_robot256, fused_object256]`，即
+`1660→2048→1024→512→256→29`，hidden ELU、末层线性、动作/PD接口不变。
+双token读出是明确的工程选择，尚无性能优于单token读出的结论。
+
+初始化先按原MLP actor构建全部原模块，再扩宽decoder首层：原1148列和bias原样保留，
+新增512列为零。新增首层与融合模块的初始化使用局部CPU RNG上下文，结束时恢复外部RNG状态，
+使相同全局随机种子下后续构建的WM/critic仍保持配对初始化。相同随机种子下actor初始动作与v1.1一致；首次更新时融合内部梯度为零，
+新增decoder列更新后梯度才能进入融合分支，不另加零初始化乘法gate。
+这只保证初始化行为，不授权用v1.1 checkpoint跨架构直接resume。
+
+### 保留的训练、几何与检查边界
+
+本版仍为oracle-pose/完整reference条件下的HOI tracking，没有图像感知估计器、flow matching、
+BC/DAgger监督或新增动作目标。Actor继续通过现有imagined-return BPTT更新；
+WM/critic参数在actor更新中冻结，但保留输入Jacobian，融合特征及参考不detach。
+每个imagined tick以当步预测torso/物体重新计算参考、token及attention，不能跨tick缓存K/V。
+固定形状只在一次imagination中复用同一PointNet计算图，不跨optimizer更新缓存。
+geometry禁用变体在原路径和新融合分支入口均使用已置零的shape64，不能从新分支旁路泄漏几何。
+
+2026-10-26完整GPU探针发现L40在actor4096/H32构图时显存耗尽。v1.2的imagination
+将每步actor及WM前向包装为non-reentrant activation checkpoint（`use_reentrant=False`）：
+反传按需重算attention/MLP中间激活，完整32步依赖、state/action Jacobian和共享PointNet梯度均保留，
+不detach、不截断BPTT、不拆分actor batch、不减少网络或模拟器规模。
+RMS仍只在真实采集更新，WM/critic冻结参数的上下文覆盖前向和反传重算；原MLP实验执行路径不变。
+CPU H32逐项对比直接执行：动作、奖励/存活率和目标值完全一致，WM-action Jacobian和全部actor参数梯度在容差内一致；
+保存用于反传的tensor字节计数小于直接执行的一半（包含重复保存的tensor，不是GPU峰值测量）。
+新的原生完整资源探针仍需单独通过，不能用CPU对照推断L40一定装得下。
+
+观测字段、坐标、七个未来时刻、历史/边界重复、RMS统计及其真实采集更新时机全部沿用v1.1；
+imagination/eval不更新统计。WM225D、critic1215D、DR、五通道contact、奖励/终止/PD、
+碰撞资产/物性、4096环境、actor batch4096/H32、训练配比、优化参数和500轮WM-only均保持。
+checkpoint须保存并严格校验架构合同；训练与评估按该合同构造同一actor，旧MLP缺省合同仍按MLP解释。
+v1.2只能from-scratch或同架构/同观测/同DR合同resume，新训练还必须使用独立输出与完整原生证据。
+
+### 本地验证证据
+
+CPU runtime为现有 `D:/ProtoMotions/.venv/Scripts/python.exe`、PyTorch `2.7.0+cpu`，未修改该环境。
+证据位于本v1.2工作区ignored `tmp/hoi_v1_2_cpu_20261025_01/`：
+
+- `cpu_regression_final.log`：`python -m unittest discover -s tests -v`运行305项，304通过、1项因可选pxr不可用跳过；包含12项新增融合测试。
+- `hoi_boundary.log`：`python -m unittest hoi.test_reference hoi.test_hand_collision -v`，6项通过。
+- 新测试覆盖原模块/1148D前缀与同seed/RNG初始化、五路标准化完整参考、双token读出、零扩展后梯度唤醒、完整actor前后向、float64动作Jacobian有限差分、H3想象反传、WM/critic及RMS冻结、checkpoint隔离、无worker preflight和完整时长冻结评估。
+- `full_actor_h32.json`：完整11923229参数actor在batch2/H32的合成CPU想象反传中，原encoder、PointNet、融合模块与五路投影均有有限非零梯度，WM/critic参数及RMS不变，0 optimizer step。该诊断显式将新增decoder列赋予非零测试权重以检查融合梯度；WM/critic为既有缩小合成fixture，不是原生物理或生产资源证明。
+
+CPU检查不能证明batch4096/H32的GPU显存可行性或HOI收益；GPU结果单独记录如下。
+
+### 集群验证与20k启动合同
+
+新验证入口 `cluster/hoi_v1_2_validate.sbatch.sh`、`tools/hoi_v1_2_validate.py`；
+训练入口 `cluster/hoi_v1_2_train.sbatch.sh`、`tools/hoi_v1_2_launch_train.py`；
+自动canonical80评估使用独立 `cluster/hoi_v1_2_evaluate.sbatch.sh`，限时2小时。
+验证单独申请L40×1、24CPU、96GiB、2小时；正式训练L40×1、24CPU、96GiB、96小时。
+所有进程保留两套 `expandable_segments:True` allocator环境变量和OMP/MKL线程3，
+共享既有runtime/IsaacLab/资产只读，新源码/缓存/结果位于独立目录，不能回写v1.1或8500依赖。
+
+GPU验证先检查8个资产在训练DR及名义eval两种模式下的实际属性读回、子集reset隔离及真实积分，
+再用真实原生4096环境/replay1000/64帧prefill，验证完整WM2048×8、actor4096×32和critic minibatch。
+资源诊断使用可丢弃的新模型，执行WM1次、actor2次、critic40次，共43次真实Adam更新。
+第二次actor反传时三个优化器的moment状态均已分配，并要求五路融合投影、原encoder及PointNet均有有限非零梯度；
+同时确认WM输入Jacobian、BF16执行、冻结参数/RMS、allocator峰值及所有模拟器进程的显存。
+这些probe更新与正式训练完全隔离，模型/优化器不保存、不传入新训练；正式启动仍显式 `--from-scratch`。
+
+只有 `results/v12_validation_complete.json` 的源码、配置、架构、stage及证据SHA全部匹配且验证通过，
+才允许commit/push。之后额外写入绑定该验证结果与已推送commit的回执，训练启动器再次校验；
+失败或普通排队不被描述为通过，不降batch/H，不以WM质量阈值重新控制actor更新。
+训练新RUN_DIR必须不存在，独占claim防止重复producer；W&B生成新UUID、`resume=never`，
+显式使用entity `tianzizh-university-of-pennsylvania` / project `SuperMimic_HOI_v1_20261023`，
+只上传既有白名单配置/指标/汇总，不上传权重、源码、原数据、完整rollout或视频。
+当前阶段的真实queue/log/claim/submission、验证报告与Git回执留在ignored目录；验证完成后再补入本节结果。
+
+已冻结集群源码为 `/mnt/projects/ll/tianzizh/supermimic_hoi_v1_2_perception_fusion_20261025_01`，
+189个文件逐项SHA校验通过，executable source SHA为
+`d41e2d6b2c68b308c4b6f74b6f0c198ddf72678e2ca574f61af1944c2efa8995`，stage SHA为
+`dcc796201d65297f2f5eca75c549d5cef60002bc766568ce8fb04075ae40ccdf`。
+完整GPU验证作业 `1467631` 已实际获得L40，于2026-10-26 02:14:32–02:17:14（America/New_York）
+在 `ll-l40-2.grasp.maas` 运行2分42秒后FAILED/1:0。调度器此前估计10月29日开始，实际提前获得资源，估计不是保证。
+失败发生在首次native DR reset：`DR requires a contiguous writable native object-friction view`；
+未进入batch4096/H32资源探针，没有完成报告、GPU通过、commit/push或正式训练。
+指定W&B项目经只读GraphQL核对 `access=PRIVATE`；新run在正式训练开始时才创建。
+用户随后明确取消自动跟进，`v1-2-20k` 已删除；已提交的GPU验证作业保留，等待用户提醒后再检查并继续Git与训练启动。
+真实回执位于本工作区ignored
+`tmp/hoi_v1_2_cluster_20261025_01/`；集群验证快照保持不可变。
+
+2026-10-26用户手动提醒后读取真实sacct及完整失败日志。Newton selection getter允许带stride的视图，
+也可能返回gathered暂存数组；原代码对连续可写view的假设不成立。修复只改 `hoi/v1/randomization.py`
+的属性写入：将每个环境的既有抽样摩擦广播到原attribute形状，用正式 `set_attribute` 写入selection，
+再重新获取模型属性进行硬读回检查。保留原DR分布、subset隔离、质量/COM/惯量、模型和全部训练规模；
+不直接对view做contiguous复制后声称改到了原模型，不改共享runtime。
+该最小接口修复参考了v1.1同类独立诊断，但不迁入其他v1.1改动或操作其后继作业。
+旧1467631快照与日志保留，新快照/新输出重跑native与完整GPU验证；证据留在本工作区ignored
+`tmp/hoi_v1_2_dr_friction_fix_20261026_01/`，仍需真实GPU通过后才能执行已授权的commit/push与20k启动。
+修复后的完整CPU回归318项（317通过、1项可选pxr跳过）和6项HOI边界检查通过；
+新增测试覆盖contiguous/strided/gathered模型真实写入、物体全部shape、机器人/地面sentinel、未选环境隔离、丢失写入及非法环境轴。
+已读取实际runtime的Newton selection getter/setter源码确认参数顺序和模型更新通知要求，未修改共享包。
+新快照为 `/mnt/projects/ll/tianzizh/supermimic_hoi_v1_2_perception_fusion_drfix_20261026_01`，
+source SHA `de4bab548c477d0e673e487835bc7b6644a05f6857b3f892ab5219d4d97c6bcc`，
+stage SHA `8a88281ce622330617bb4522bbc18904470ed03221bb014c0058b92bcc565fcf`。
+190个文件与Linux启动器校验通过，实际确认旧1467631 FAILED/1:0且无其他v1.2 producer后，
+使用独占claim提交验证后继 `1468983`（L40×1/24CPU/96GiB/2小时），提交时PENDING；没有提交训练。
+该作业实际于2026-10-26 16:18:18–16:27:34（America/New_York）在 `ll-l40-2.grasp.maas` 运行9分16秒，
+FAILED/1:0。8类资产训练DR/名义eval原生属性与积分检查通过，真实4096环境/replay1000/64帧prefill通过；
+WM2048×8完成一次真实反传及Adam更新。首次actor4096/H32尚未完成构图时OOM，未执行actor/critic优化器更新。
+失败时L40总44.32GiB，父进程约24.36GiB，8个模拟器进程合计约19.88GiB，设备仅剩42.81MiB；
+已启用expandable_segments，真实nvidia-smi证据未发现其他作业占用同一物理GPU。
+没有完整通过回执，没有commit/push或正式训练。保留该冻结快照和失败报告，
+按上述中间激活重算策略准备独立新快照重跑全部原生/GPU检查，原科学配置不变。
+失败与修复证据在本工作区ignored `tmp/hoi_v1_2_activation_checkpoint_20261026_01/`。
+激活重算修复后完整CPU回归319项（318通过、1项可选pxr跳过）和6项HOI边界通过；
+新增H32对照包含non-reentrant路径的`autograd.grad`和完整反传，原网络参数/归一化统计无变化。
+新快照为 `/mnt/projects/ll/tianzizh/supermimic_hoi_v1_2_perception_fusion_actckpt_20261026_01`，
+source SHA `a5e9af2ea67eeddaa4e5b84b8878670cf2555b5e67a61558a01bda563c1afa64`，
+stage SHA `8c452e165e1d7a4ae836e2795dfc3670822ebf2b34faebc4ce556a84654f03af`。
+190个文件及bash-n校验通过、确认1468983真实FAILED/1:0且无重复v1.2 producer后，
+独占claim提交同规格验证后继1470647；已在 `ll-l40-1.grasp.maas` 的L40完成，真实sacct为COMPLETED/0:0，运行10分51秒。
+完整报告 `results/v12_validation_complete.json` 的SHA为
+`c8e60f14cc5c89f001562536e20f4882ca05166c9202d075ecb4a7b6c00515ac`，190个冻结文件逐项核对一致。
+8资产训练DR/名义eval、真实4096环境/replay1000/64帧prefill、WM2048×8、两次actor4096×32和40个critic minibatch均通过；
+43次真实Adam更新为WM1/actor2/critic40，三组优化器状态均实际驻留，第二次五路融合、原encoder与PointNet梯度有限非零。
+WM-action Jacobian非零、WM/critic参数及RMS冻结、BF16实际执行均通过，allocator记录0 OOM/0 allocation retry。
+父进程allocated峰值16.37GiB、reserved峰值18.82GiB；整卡含8模拟器的1秒采样峰值约39.25GiB，
+实际样本绑定唯一物理GPU UUID，未发现其他作业CUDA进程。父allocator峰值为精确计数，整卡采样峰值是下界。
+这证明本次完整规模资源与反传可行，不代表十个WM batch的正式iteration吞吐或HOI效果/收敛。
+探针模型及优化器丢弃；后续按用户授权commit/push，再从全新进程/参数/优化器启动20k。
+新训练输出为该冻结root下 `results/hoi_v1_2_perception_fusion_scratch_20k`；W&B项目再次只读核对为PRIVATE，
+仍要求新UUID、resume=never。实际Git及训练提交状态以本工作区上述ignored目录state.json和对应回执为准。
+保持手动提醒巡检，不恢复定时任务。
+
+## v1.1 observation matching
+
+2026-10-25新增本地实验分支 `hoi/v1.1-observation-matching`。以下是独立新实验合同，
+不改写8500pt的v1结果。最初授权范围为实现、CPU回归和可导性检查；后续用户明确授权必要GPU验证后启动新20k训练。
+本次通过独立源码/输出及同一GPU allocation内的验证→训练串行流程执行，不commit/push。
+显式配置 `configs/hoi_v1_1_observation_matching.json` 选择 `observation_profile=v1_1_observation_matching`、
+`domain_randomization_profile=v1_1_mass_object`。省略配置仍使用原v1 profile。
+
+### Actor观测与保留的差异
+
+| 输入 | v1.1合同 |
+| --- | --- |
+| 本体历史 | 10×93，最旧到当前；pelvis局部gyro3、q-default-PD零位偏置29、qd29、上次raw action29、投影重力3 |
+| 人体未来 | 7×64：`rotation_XZ(R_torso_actual(t)^T R_torso_ref(t+k))`6、现有派生参考qd×0.1的29维、参考q29 |
+| 物体历史 | 10×9，当前torso原点/heading中的位置3和物体旋转XZ6；删除当前物体reference误差后9D |
+| 物体未来 | 7×9，同一当前实际/imagined torso-heading中的reference位置3、旋转XZ6；无速度/期望接触/接触有效性输入 |
+| 未来偏移 | 人体/物体共用control ticks `[1,2,5,7,12,18,25]`，即0.02/0.04/0.10/0.14/0.24/0.36/0.50秒 |
+| 历史/末尾 | 启动重复首帧；未来越界重复末帧，不读下一clip；不添加mask，固定时间由MLP输入槽位表示 |
+| 旋转编码 | 拼接旋转后X轴3维和Z轴3维；只用于新actor，原WM/critic旋转编码保持 |
+| 几何 | 原128×3物体局部米制FPS不变，原actor PointNet/shape64不变 |
+
+这是V5可见字段/坐标语义匹配加用户指定例外，不是V5数值接口/网络/训练方法的逐位复现。
+V5本体IMU仍读pelvis完整局部坐标系，人体未来读完整torso相对旋转，只有物体位姿使用torso heading。
+现有50Hz参考重采样、姿态派生joint qd、qd输入缩放0.1与FK顺序保持；不改原数据或reward/reference velocity。
+关节零位沿用原PD偏置/传感器校准约定，不把V5独立encoder offset符号直接移植。
+传感噪声保持原幅度，仅重排93维并删除已移除的6D旋转噪声；干净评估不加观测/探索噪声。
+
+本体/人体目标使用新建统计的RMS和[-5,5]裁剪，稳定项为1e-5；不复制或冻结一个未训练的V5 RMS。
+按用户后续明确要求，物体历史和未来参考也做RunningNorm：独立9D与63D RMS，均不裁剪。
+历史10帧共用9维统计，真实采集每次只用当前帧更新一次；未来63维保留各时间槽位/特征的独立统计。
+两套RMS使用`(x-mean)/sqrt(var+0.01^2)`，分母下限0.01，max_count=2e8，均从真实采集新建统计；
+imagination/eval只读取统计并保留输入Jacobian。原始replay/评估输入仍按米制/XZ旋转保存，网络内部标准化。
+MLP融合保留：human448→原hidden→32、object63→原object_hidden→32，
+decoder输入为`32+930+90+32+64=1148`，hidden2048/1024/512/256与29维动作不变。
+没有Transformer、flow matching或额外物体速度/真实接触/质量actor输入。
+
+`hoi/v1/observations.py`是actor专用适配层；collect、imagination、冻结evaluate使用同一合同，
+每个imagined tick用当步预测torso/物体重新计算，保持状态/动作Jacobian。
+原MDP、MotionLib.goal、190D object goal继续供旧critic/reward读取，不被actor配置全局替换。
+按用户后续授权，WM输入224→225、critic输入1214→1215，只在原输入末尾追加1D torso质量上下文；
+WM输出82、全部hidden、五通道contact监督、奖励/终止/PD/手脚物理与训练配比保持。
+新feature/checkpoint记录完整actor和DR合同，旧8500不能直接resume或legacy迁移为新actor；需要from-scratch或相同新合同resume。
+
+### DR配置
+
+| 参数 | 范围和抽样时机 |
+| --- | --- |
+| torso质量 | nominal±3kg，每个环境初始化抽一次；nominal必须>3kg |
+| 物体质量 | 每episode uniform `[max(nominal-1.5kg,0.1×nominal), nominal+1.5kg]`；不先生成负质量再clamp |
+| 物体COM | 相对nominal各轴±1cm，每episode；保持object link-local定义 |
+| 物体摩擦 | uniform[0.4,0.8]，每episode |
+| 机器人摩擦/torso COM/关节零位/reset扰动 | 原范围与抽样时机保持 |
+| 惯量 | 只随对应质量同比缩放原COM惯量，保持几何及回转半径；无独立惯量随机化 |
+| 地面摩擦/PD/重力/延迟/推搡/物体初始位姿 | 原固定profile；不增加这些随机化 |
+
+物体DR从nominal重抽，subset reset不改变其余环境；写入后读回质量/COM/惯量/摩擦，实际12D xiO随transition保存。
+Robot mass只改torso，其他link质量/惯量不变。原33D robot xi保留原语义，torso质量通过独立上下文提供给WM/critic。
+正常HOI80用eval_mode，新增DR与原随机化均关闭，读取nominal物性。
+
+### Torso质量训练上下文
+
+2026-10-25按用户后续要求补齐，schema为`supermimic_torso_mass_context_1`。
+native在DR之前缓存`torso_mass_nominal`，每次snapshot和pre-action transition读取生效的`torso_link`质量为`torso_mass`；
+两个字段均以kg、shape[B,1]保存，终止后的reset不能覆盖上一条transition的质量。
+网络读取`(torso_mass−torso_mass_nominal)/3kg`这一维，固定缩放、不RMS、不裁剪；名义评估为0。
+
+| 链路 | 合同 |
+| --- | --- |
+| Worker/Replay | 原始实际/名义质量随环境合并，保存到ring buffer、WM窗口、imagination start/history；新DR缺失/非正/非有限质量立即报错 |
+| WM | 原224维后追加1维，训练、autoregressive rollout、teacher-forced holdout、执行动作评估诊断都条件化质量；原raw normalizer不扩维 |
+| Imagination | 起点质量全程固定，预测状态/动作及其Jacobian继续递归；不从reference推断质量 |
+| Critic | 原1214维后追加相同1维，bootstrap与全部H+1状态/value minibatch使用对应起点质量；原914/236 normalizer保持 |
+| Actor | 不消费质量，部署输入保持93/448/9/63；现行追加独立物体RMS，Policy.forward、原观测/FK字段和MLP结构不变 |
+| 评估 | nominal质量上下文为0；保存T条实际/名义质量及编码值，校验snapshot/transition/after一致；0optimizer/0normalizer更新 |
+| Checkpoint | 现行feature版本`supermimic_hoi_v1_1_observation_matching_3`，保存质量/RMS合同及两套物体RMS全部统计；恢复前拒绝raw-pose旧v1.1、缺质量合同、错误DR或旧输入维度 |
+
+旧v1默认仍是224D WM/1214D critic，旧8500按原合同读取。先前未加质量的v1.1+质量DR checkpoint不能直接resume为新版；
+checkpoint仍不保存simulator/replay/RNG，续训须fresh真实prefill，新采样的质量随新transition记录。
+定期评估入口已从硬编码旧feature schema改为版本化校验，兼容新checkpoint合同；本次没有提交评估作业。
+
+新DR的native setter路径尚未在Linux GPU验证。旧native evidence和CPU mock均不认证新DR；
+训练入口另检查native evidence的`domain_randomization`合同及实际property-readback、subset-reset隔离、nominal-eval验证。
+这些原生检查未完成时，新配置可CPU预检，但不能启动正式训练。
+
+观测改造阶段CPU证据在ignored `tmp/hoi_v1_1_observation_matching_cpu_20261025_02/`（01保留前轮结果）：
+全量276项检查完成、275通过、1项因可选pxr不可用跳过；原HOI边界6项通过。
+新增测试用明确的合成waist chain核对命名torso FK/完整FK/解析旋转，验证七槽位、XZ编码、历史与末尾重复、
+参考qd缩放、旧critic输入不变、checkpoint合同隔离、actor BPTT与固定噪声有限差分，以及DR采样/写入mock/读回/隔离。
+另验证冻结评估完整T/T+1、新维数落盘且无权重/normalizer更新；新配置preflight不启动workers并明确标记DR原生门未通过。
+额外CPU检查包括batch2/H32的合成小网络rollout反传，以及默认完整规模actor（8883741参数）的batch2前向/反向，梯度有限。
+该阶段的13项AST对照确认当时WM、critic、shape encoder、原kin.forward、原native.step/_advance、奖励终止和旧object_goal未改；
+本次追加质量后WM/critic/native.step已有上述明确变更，不沿用这些旧AST断言作为本次证据。
+
+质量链路最终CPU证据在ignored `tmp/hoi_v1_1_mass_context_cpu_20261025_01/validation.json`：
+全量286项检查、285通过、1项可选pxr跳过；原HOI边界6项通过。
+新增质量缺失/数值/读回、pre-reset记录、replay回绕、WM fit/1步和32步holdout、固定imagination质量、
+critic bootstrap/value minibatch、checkpoint文件读回/拒绝旧合同、定期评估读取和冻结nominal评估诊断检查。
+batch2/H32反传及固定噪声方向有限差分通过（autograd=0.05280915，FD=0.05272627）；
+float64直接动作/位置Jacobian有限差分通过，默认完整8883741参数actor前向/反向有限。
+Policy/ShapeEncoder AST及observations.py字节SHA与本次质量改造前一致；WM/critic在actor反传中无参数梯度。
+这些是CPU软件和梯度合同证据，不是原生物理、GPU资源、训练稳定性或HOI成功证据。
+
+### v1.1验证与训练提交
+
+2026-10-25用户授权必要验证后从零训练20k，并要求超过24小时的作业时限。
+已读取真实queue、QoS/association和partition：`liu-compute` MaxTime=14天，`ll-med`无额外MaxWall，账户允许该QoS。
+新训练申请96小时，20k结束即退出；原固定500轮WM-only、4096环境/H32/完整batch及优化配置保持。
+用户随后明确授权加物体独立RMS并替换排队作业；CPU/可导性检查通过后，仅取消仍PENDING的1467430/1467434，
+已记录CANCELLED回执，旧raw-pose源码和数据完整保留。下表为当前RMS版本作业。
+用户又要求验证和训练使用同一GPU任务以避免二次排队；已在两项作业仍PENDING时取消1467536/1467537，
+替换为单GPU作业1467570。RMS冻结源码及训练参数不变，只新增独立operations启动包装。
+
+| 项目 | 实际提交合同 |
+| --- | --- |
+| 冻结源码 | `/mnt/projects/ll/tianzizh/supermimic_hoi_v1_1_object_rms_20261025_01`，不覆盖任何历史快照 |
+| Source content SHA | `ade8dafe66473b0ac15ae4c68a2ced8656185ce5d90fba9f6e0faf5ca13edac2`；183个文件逐项核对 |
+| GPU验证 | 合并Slurm `1467570`的第一阶段，L40×1/24CPU/96GiB，单阶段7200秒超时保护；当前PENDING，尚无GPU验证通过结论 |
+| 验证内容 | 八资产×训练DR/名义eval；真实reset隔离、Newton与生效MuJoCo-Warp质量/COM/惯量/摩擦读回；4096环境/replay1000/64prefill、2048×8 WM、4096×32 actor和全部critic minibatch反传；0真实optimizer step |
+| 正式训练 | 同一Slurm `1467570`第二阶段，无dependency/二次sbatch；总时限96小时覆盖验证和训练，20k from-scratch；当前PENDING，没有开始训练 |
+| 训练输出 | 新源码的`results/hoi_v1_1_object_rms_scratch_20k`；不读取8500初始化权重 |
+| 运行环境 | 原已验收read-only kitless-cu128和IsaacLab；OMP/MKL=3，两个allocator变量均为`expandable_segments:True` |
+| 数据/碰撞 | 原source15验收的完整train2651/HOI80 bundle；原八资产碰撞证据只证明原配置，新DR须额外通过新作业检查 |
+| W&B | 训练实际启动时创建独立私有run，project=`SuperMimic_HOI_v1_20261023`，不复用8500 run；仅curated配置/指标/汇总 |
+| 定期评估 | 每5000轮完整HOI80，独立GPU作业；已测8500完整80耗时42m18s，因此本轮独立评估启动器预留2小时，线程/allocator同上 |
+
+GPU验证脚本和训练入口均检查冻结stage/hash，训练还要核验新DR证据与production resource报告passed、source/config一致和参数未更新。
+合并启动器使用`set -e`和7200秒validation timeout：验证失败/超时立即退出，不调用训练；不把原native evidence改成声称已验证新DR。
+额外检查native/capacity证据属于当前SLURM_JOB_ID，前后GPU/节点/allocation一致，probe为0真实optimizer step；检查失败也不进入训练。
+验证和训练分属前后两个Python进程，验证进程及其probe模型退出后再创建from-scratch训练进程，保持同一GPU allocation，不复用probe权重或RMS。
+WANDB_SYNC只在训练阶段为1，验证为0；训练仍按原500轮WM-only和固定更新日程运行。
+新原生校验是显式validation worker开关，普通训练collector不执行probe/reset；只为核对惯量比例保存DR前机器人质量/惯量副本，不改变抽样或物理参数。
+
+合并操作启动器单独冻结于`/mnt/projects/ll/tianzizh/supermimic_hoi_v1_1_object_rms_combined_20261025_01`，
+保持183文件源码快照不变；五个辅助文件和operations manifest均逐项校验，SBATCH脚本bash-n通过。
+原独立启动器`/mnt/projects/ll/tianzizh/supermimic_hoi_v1_1_object_rms_operations_20261025_01`及其取消作业回执保留。
+旧raw-pose排队版回执/287项CPU证据保留在ignored `tmp/hoi_v1_1_launch_20261025_01/`。
+当前RMS版回执、stage/operations manifest和证据见ignored `tmp/hoi_v1_1_object_rms_20261025_01/validation.json`：
+293项CPU回归、292通过、1项可选pxr跳过，原HOI边界6项通过；验证独立RMS、历史计数、无裁剪与0.01分母下限、
+真实采集更新、imagination/eval冻结、保存/恢复统计和拒绝旧raw schema。
+batch2/H32使用非空真实RMS统计反传与固定噪声有限差分通过（autograd=0.05541336，FD=0.05531311）；
+float64动作/状态直接Jacobian和完整8883741参数actor前后向有限，网络参数量与输入维数不变，仅增加146个统计标量buffer。
+Scope审计确认WM/critic、ShapeEncoder、Policy.forward、Learner.action/imagine、原观测采样/坐标变换及物理/奖励/参考代码未变。
+真实完整bundle的CPU预检确认新9D/63D无裁剪合同、source/config一致、原native门通过；新DR门保持未通过，等GPU作业验证。
+合并流程另外在真实Linux runtime执行10项CPU检查：验证失败/证据缺失或篡改/不同job或GPU/非零probe更新均阻断训练；
+实际POSIX shell的成功顺序、phase环境与失败早退通过。记录在ignored `tmp/hoi_v1_1_object_rms_combined_20261025_01/`。
+以上明确区分CPU已完成和合并GPU作业排队；PENDING不代表RUNNING、通过、稳定或收敛。
 
 ## 1. 结论与范围
 

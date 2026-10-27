@@ -16,7 +16,7 @@ class TrainConfig:
     buffer_steps: int = 1000
     utd: float = 0.4
     horizon: int = 32
-    goal_frames: int = 10
+    goal_frames: int = 10  # Legacy critic/reference path; actor slots belong to observation_profile.
     hist: int = 10
     wm_window: int = 8
     wm_batches: int = 10
@@ -40,10 +40,19 @@ class TrainConfig:
     no_critic: bool = False
     experiment_kind: str = "formal"
     variant: str = "hoi_v1"
+    observation_profile: str = "v1"
+    actor_architecture: str = "mlp"
+    domain_randomization_profile: str = "v1"
 
     def validate(self):
         from .variants import validate_variant
         validate_variant(self.variant)
+        from .observations import observation_spec
+        from .randomization import randomization_contract
+        observation_spec(self.observation_profile)
+        from .actor_fusion import validate_actor_architecture
+        validate_actor_architecture(self.actor_architecture, self.observation_profile)
+        randomization_contract(self.domain_randomization_profile)
         if type(self.seed) is not int or self.seed < 0 or type(self.no_critic) is not bool:
             raise ValueError("seed must be a nonnegative integer and no_critic must be boolean")
         for key in ("num_envs", "iterations", "buffer_steps", "horizon", "goal_frames", "hist",
