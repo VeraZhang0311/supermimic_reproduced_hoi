@@ -74,8 +74,9 @@ def make_checkpoint(policy, wm, critic, optimizers, *, iteration, physics, data_
     data = _data(data_identity)
     result = {
         "schema_version": CHECKPOINT_SCHEMA,
+        "actor_observation_profile": getattr(policy, "actor_observation_profile", "v1"),
         "variant": variant,
-        "feature_schema": deepcopy(FEATURE_SCHEMA),
+        "feature_schema": deepcopy(getattr(policy, "feature_schema", FEATURE_SCHEMA)),
         "architecture": {key: _signature(model) for key, model in models.items()},
         "physics": _physics(physics),
         "data_identity": data,
@@ -152,7 +153,13 @@ def checkpoint_training_progress(checkpoint):
 
 def validate_checkpoint_features(checkpoint):
     """Reject incompatible continuation on CPU, before workers/output creation."""
-    if checkpoint.get("schema_version") != CHECKPOINT_SCHEMA or checkpoint.get("feature_schema") != FEATURE_SCHEMA:
+    from .privileged import BASE_PROFILE, feature_schema
+    profile = checkpoint.get("actor_observation_profile", BASE_PROFILE)
+    configured = checkpoint.get("extra", {}).get("config", {}).get("actor_observation_profile", profile)
+    if configured != profile:
+        raise ValueError("checkpoint actor profile and training configuration disagree")
+    expected = feature_schema(profile, FEATURE_SCHEMA)
+    if checkpoint.get("schema_version") != CHECKPOINT_SCHEMA or checkpoint.get("feature_schema") != expected:
         raise ValueError("checkpoint feature schema/version differs; five-channel hand/foot-object contact requires an explicit migration for old three-channel HOI checkpoints")
 
 
@@ -160,6 +167,8 @@ def load_checkpoint(path, policy, wm, critic, optimizers=None, *, physics, data_
     from .variants import validate_variant, geometry_input_enabled
     checkpoint = torch.load(path, map_location=map_location, weights_only=False) if not isinstance(path, dict) else path
     validate_checkpoint_features(checkpoint)
+    if checkpoint["feature_schema"] != getattr(policy, "feature_schema", FEATURE_SCHEMA):
+        raise ValueError("checkpoint actor observation profile differs from the requested model")
     if checkpoint_variant(checkpoint) != validate_variant(variant):
         raise ValueError("checkpoint experiment variant differs from the requested continuation/evaluation")
     if type(checkpoint.get("iteration")) is not int or checkpoint["iteration"] < 0:

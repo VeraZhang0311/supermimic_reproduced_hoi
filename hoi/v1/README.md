@@ -1,6 +1,11 @@
 # SuperMimic HOI v1
 
-当前开发基线为 `codex/hoi-v1-no-quality-gate`：无持续WM质量门、完整手脚碰撞、五通道contact head。使用同SHA的完整ULTRA脚STL/零安装变换，在不可变手overlay上关闭旧脚球并追加CoACD5hull/16vertex凸包，保留原质量/COM/惯量。原VHACD60000只作作者配置溯源，不冒称相同cooker。Train/eval必须显式绑定foot manifest、USD和新bundle身份，不能只依赖默认机器人路径。
+`hoi/privileged_teacher` 从下述 v1 基线分出。使用
+`configs/hoi_v1_privileged_teacher.json` 显式启用新的全身特权 actor，详见
+[PRIVILEGED_TEACHER.md](PRIVILEGED_TEACHER.md)。不传配置仍使用原始 v1 输入；
+旧 HOI checkpoint 不可直接 resume 为 teacher。
+
+共享科学基线为 `codex/hoi-v1-no-quality-gate`：无持续WM质量门、完整手脚碰撞、五通道contact head。使用同SHA的完整ULTRA脚STL/零安装变换，在不可变手overlay上关闭旧脚球并追加CoACD5hull/16vertex凸包，保留原质量/COM/惯量。原VHACD60000只作作者配置溯源，不冒称相同cooker。Train/eval必须显式绑定foot manifest、USD和新bundle身份，不能只依赖默认机器人路径。
 
 设计依据为[v1最终设计](../../notes/supermimic_hoi_v1_final_design.md)。新版source15的原生/资源与正式训练身份，以及最后8500pt完整HOI80和固定20条视频证据，见[最终验收报告](../../notes/hoi_v1_final8500_eval_handoff_20261025.md)。训练已因24h作业时限结束，没有完成20k；操作示例不自动授权续训。原 `hoi.run` 仍为冻结、无物体policy observation的zero-shot入口。
 

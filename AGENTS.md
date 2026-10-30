@@ -3,7 +3,8 @@
 ## 开发入口
 
 - 先读 `DEVELOPMENT.md`，再按需读 `notes/README.md`；默认目录 `D:/supermimic_reproduced_hoi`。
-- 后续默认开发分支 **`codex/hoi-v1-no-quality-gate`**。不要再切到已删除的 `hoi/zero_shot` 或 `hoi/v1.0`。
+- 本工作区开发分支 **`hoi/privileged_teacher`**，由用户确认的整理后 v1 基线 `fd626e7` 创建。共享科学基线仍是 `codex/hoi-v1-no-quality-gate`；不自动切换其他 worktree，不重建已删除的 `hoi/zero_shot` 或 `hoi/v1.0`。
+- 特权 actor 使用显式配置 `configs/hoi_v1_privileged_teacher.json`；实现与验证边界见 `hoi/v1/PRIVILEGED_TEACHER.md`。独立离线标注代码位于 `D:/hoi_data_pipeline`，其几何意图标签不等于本仓真实 pair 冲量标签。
 - `main`仅保留初始fork复现代码供对照。旧分支历史已包含在当前分支中；不重建中间分支，除非用户要求。
 - 修改、Git和检查命令显式指定本仓库workdir，先确认分支及已有改动。
 - `D:/SuperMimic`是早期自写实现。selfcollision/handcollision历史工作区及其集群环境保留，不自动同步、切分支、清理或覆盖。

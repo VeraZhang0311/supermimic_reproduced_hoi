@@ -40,6 +40,12 @@ class Learner:
     def __init__(self, policy, wm, critic, motion, mdp, shapes, replay, config=None):
         self.config = (config if config is not None else TrainConfig()).validate()
         self.pi, self.wm, self.critic = policy, wm, critic
+        self.privileged_teacher = getattr(policy, "is_privileged_teacher", False)
+        if getattr(policy, "actor_observation_profile", "v1") != self.config.actor_observation_profile:
+            raise ValueError("learner config and actor observation profile differ")
+        if self.privileged_teacher and not hasattr(mdp, "privileged_features"):
+            raise ValueError("privileged teacher requires the bound 39-body feature adapter")
+        self.teacher_previous_state = None
         self.motion, self.mdp, self.shapes, self.buffer = motion, mdp, shapes, replay
         self.device = next(policy.parameters()).device
         self.optimizers = {
@@ -72,7 +78,9 @@ class Learner:
         S, O = unflatten_state(snapshot["s"]), unflatten_object(snapshot["o"])
         f, xi, assets = snapshot["f"], snapshot["xi"], snapshot["asset_id"]
         self._check_assets(f, assets)
-        robot = self.mdp.add_noise(self.mdp.obs(S, snapshot["a_prev"], xi, f))
+        robot = self.mdp.obs(S, snapshot["a_prev"], xi, f)
+        if not self.privileged_teacher:
+            robot = self.mdp.add_noise(robot)
         obj = self.mdp.object_obs(S, O, f)
         fresh = snapshot["ep_step"] == 0
         self.robot_history = torch.where(fresh[:, None, None], robot[:, None].expand_as(self.robot_history),
@@ -81,6 +89,14 @@ class Learner:
                                          torch.cat((self.object_history[:, 1:], obj[:, None]), 1))
         human_goal = self.motion.goal(f, 10)
         object_goal = self.motion.object_goal(S, O, f, 10)
+        actor_extra = {}
+        if self.privileged_teacher:
+            previous = S if self.teacher_previous_state is None else tuple(
+                torch.where(fresh.reshape(fresh.shape + (1,) * (cur.ndim - fresh.ndim)), cur, prev)
+                for cur, prev in zip(S, self.teacher_previous_state))
+            actor_extra["privileged"] = self.mdp.privileged_features(
+                S, O, f, snapshot["a_prev"], xi, snapshot["xi_o"], previous)
+            self.teacher_previous_state = tuple(value.clone() for value in S)
         if update_statistics:
             # Match the upstream current-observation count, not ten repeated
             # histories per tick; each new normalizer has its own count.
@@ -88,7 +104,9 @@ class Learner:
             self.pi.goal_norm.update(human_goal)
             self.pi.object_obs_norm.update(obj)
             self.pi.object_goal_norm.update(object_goal)
-        a = self.pi(self.robot_history, human_goal, self.object_history, object_goal, self._points(assets))
+            if self.privileged_teacher:
+                self.pi.privileged_norm.update(actor_extra["privileged"])
+        a = self.pi(self.robot_history, human_goal, self.object_history, object_goal, self._points(assets), **actor_extra)
         if exploration:
             a = (a + self.config.action_noise * torch.randn_like(a)).clamp(-20, 20)
         if not bool(torch.isfinite(a).all()):
@@ -163,7 +181,9 @@ class Learner:
         with torch.no_grad():
             robot_hist = self.mdp.obs(unflatten_state(history["s"]), history["a_prev"], history["xi"], history["f"])
             obj_hist = self.mdp.object_obs(unflatten_state(history["s"]), unflatten_object(history["o"]), history["f"])
-        robot_hist = self.mdp.add_noise(robot_hist) if fixed_robot_noise is None else robot_hist + fixed_robot_noise[0]
+        if not self.privileged_teacher:
+            robot_hist = self.mdp.add_noise(robot_hist) if fixed_robot_noise is None else robot_hist + fixed_robot_noise[0]
+        previous_S = unflatten_state(history["s"][:, -2]) if self.privileged_teacher else None
         states, objects, frames = [S], [O], [f]
         actions, rewards, failures, contact_probabilities = [], [], [], []
         points = self._points(assets)
@@ -173,14 +193,19 @@ class Learner:
         for step in range(c.horizon):
             human_goal = self.motion.goal(f, 10)
             object_goal = self.motion.object_goal(S, O, f, 10)
-            action = self.pi(robot_hist, human_goal, obj_hist, object_goal, points, shape_embedding=policy_shape)
+            actor_extra = {}
+            if self.privileged_teacher:
+                actor_extra["privileged"] = self.mdp.privileged_features(S, O, f, previous, xi, xi_o, previous_S)
+            action = self.pi(robot_hist, human_goal, obj_hist, object_goal, points, shape_embedding=policy_shape, **actor_extra)
+            previous_S = S
             S, O, logits = self.wm.step(S, O, action, xi_n, xi_o, points)
             f = f + 1
             probabilities = torch.sigmoid(logits)
             rewards.append(self.mdp.reward(S, O, f, action, previous, probabilities))
             failures.append(self.mdp.soft_termination(S, O, f))
             observation = self.mdp.obs(S, action, xi, f)
-            observation = self.mdp.add_noise(observation) if fixed_robot_noise is None else observation + fixed_robot_noise[step + 1]
+            if not self.privileged_teacher:
+                observation = self.mdp.add_noise(observation) if fixed_robot_noise is None else observation + fixed_robot_noise[step + 1]
             robot_hist = torch.cat((robot_hist[:, 1:], observation[:, None]), 1)
             obj_hist = torch.cat((obj_hist[:, 1:], self.mdp.object_obs(S, O, f)[:, None]), 1)
             states.append(S)

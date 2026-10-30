@@ -40,10 +40,13 @@ class TrainConfig:
     no_critic: bool = False
     experiment_kind: str = "formal"
     variant: str = "hoi_v1"
+    actor_observation_profile: str = "v1"
 
     def validate(self):
         from .variants import validate_variant
         validate_variant(self.variant)
+        from .privileged import validate_profile
+        validate_profile(self.actor_observation_profile)
         if type(self.seed) is not int or self.seed < 0 or type(self.no_critic) is not bool:
             raise ValueError("seed must be a nonnegative integer and no_critic must be boolean")
         for key in ("num_envs", "iterations", "buffer_steps", "horizon", "goal_frames", "hist",

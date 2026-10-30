@@ -35,7 +35,7 @@ def read_config(path=None):
     # Changes to the reproduction's numerical training profile are explicit
     # smoke experiments, never silently labelled the default formal run.
     defaults = TrainConfig().to_dict()
-    protected = set(defaults) - {"iterations", "seed", "ckpt_every", "eval_every", "log_every", "gate_every", "experiment_kind", "variant"}
+    protected = set(defaults) - {"iterations", "seed", "ckpt_every", "eval_every", "log_every", "gate_every", "experiment_kind", "variant", "actor_observation_profile"}
     changed = {key: {"default": defaults[key], "actual": getattr(config, key)}
                for key in protected if getattr(config, key) != defaults[key]}
     if changed and config.experiment_kind != "smoke":
@@ -303,7 +303,11 @@ def main(argv=None):
     motion, shapes, bundle = load_bundle(args.bundle, kin, device=args.device)
     mdp = HOIMDP(kin, motion, torch.tensor(default_joint_pos_list(), device=args.device), shapes,
                  cfg=reward_config(config.variant))
-    models = [model(geometry_input_enabled=geometry_input_enabled(config.variant)).to(args.device)
+    from .privileged import TEACHER_PROFILE, configure_teacher
+    if config.actor_observation_profile == TEACHER_PROFILE:
+        configure_teacher(mdp, bundle, args.device)
+    models = [model(geometry_input_enabled=geometry_input_enabled(config.variant),
+                    **({"actor_observation_profile": config.actor_observation_profile} if model is Policy else {})).to(args.device)
               for model in (Policy, WorldModel, Critic)]
     replay = ReplayBuffer(config.buffer_steps, config.num_envs, args.device)
     learner = Learner(*models, motion, mdp, shapes, replay, config)
@@ -323,7 +327,8 @@ def main(argv=None):
         if checkpoint["extra"]["config"] != config.to_dict():
             previous = checkpoint["extra"]["config"]
             allowed = {"iterations", "log_every", "gate_every", "ckpt_every", "eval_every"}
-            if any(previous[k] != v for k, v in config.to_dict().items() if k not in allowed):
+            if any(previous.get(k, "v1" if k == "actor_observation_profile" else None) != v
+                   for k, v in config.to_dict().items() if k not in allowed):
                 raise ValueError("continuation training profile differs")
         learner.iteration = checkpoint["iteration"]
         if config.iterations <= learner.iteration:

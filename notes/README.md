@@ -1,6 +1,9 @@
 # 当前开发文档
 
-开发仓库：`D:/supermimic_reproduced_hoi`，分支 `codex/hoi-v1-no-quality-gate`。后续开发以无持续质量门、完整手脚碰撞、五通道contact head的新版为基线；固定500 iteration WM-only之后正常更新actor/critic，质量比较保留为诊断。原始fork分支只作溯源。
+当前分支为 `hoi/privileged_teacher`，从整理后 v1 基线 `fd626e7` 创建。
+特权 actor 的显式配置和实现边界见 [teacher 说明](../hoi/v1/PRIVILEGED_TEACHER.md)。
+无持续质量门、完整手脚碰撞、五通道contact head仍为共享基线；固定500 iteration
+WM-only之后正常更新actor/critic，质量比较保留为诊断。原始fork分支只作溯源。
 
 | 文档 | 用途 |
 | --- | --- |
@@ -16,5 +19,6 @@
 | --- | --- |
 | `D:/Ultra` | 原作者G1 HOI路径：`ultra/data/cfg/g1_teacher.yaml` → `ultra/env/tasks/humanoid_g1.py` → `ultra/data/assets/g1/g1_29dof.urdf`；整脚STL、原VHACD recipe。`ultra/env/tasks/ultra_g1_retarget.py` 为630D consumer，`ultra/env/tasks/ultra_g1.py` 为当前exporter；当前exporter不能反证发布数据真实时钟。 |
 | `D:/Protomotions` 的 `hoi/dagger_distillation` | 固定selection/source-group划分、canonical80/test40、连续时间采样与39体PHC参考；`protomotions/envs/hoi/ultra_reference.py`、`ultra_motion_bank.py`，`scripts/hoi/dagger_evaluation.py`，`notes/ULTRA_HOI_FROZEN_RUNBOOK.zh-CN.md`。不自动恢复该仓实验或迁入teacher/DAgger训练。 |
+| `D:/hoi_data_pipeline` | 独立离线管线：ULTRA、HOI-Retarget、GRAIL sitting、OmniContact 的来源校验、50Hz重采样和全身几何 expected-contact。入口 `README.md`、`hoi_pipeline/cli.py`；原始数据与派生结果保存在集群 `hoi_corpus`，回执在该仓 ignored `receipts/`。 |
 
 外仓具体历史commit、清单SHA与数据路径见最终设计及数据交接。当前足部采用同源STL+CoACD5hull/16vertex，不能称为与作者PhysX VHACD逐位相同。Learned contact预测五项，reference接触目标与奖励仍为双手；原zero-shot入口保留。

@@ -56,8 +56,13 @@ class ShapeEncoder(nn.Module):
 
 class Policy(nn.Module):
     def __init__(self, obs_dim=99, goal_dim=730, hist=10, z_dim=32,
-                 hidden=(2048, 1024, 512, 256), object_hidden=(256, 128), *, geometry_input_enabled=True):
+                 hidden=(2048, 1024, 512, 256), object_hidden=(256, 128), *, geometry_input_enabled=True,
+                 actor_observation_profile="v1"):
         super().__init__()
+        from .privileged import validate_profile, TEACHER_PROFILE, PRIVILEGED_DIM, feature_schema
+        self.actor_observation_profile = validate_profile(actor_observation_profile)
+        self.is_privileged_teacher = actor_observation_profile == TEACHER_PROFILE
+        self.feature_schema = feature_schema(actor_observation_profile, FEATURE_SCHEMA)
         if type(geometry_input_enabled) is not bool:
             raise ValueError("geometry_input_enabled must be boolean")
         self.geometry_input_enabled = geometry_input_enabled
@@ -67,18 +72,20 @@ class Policy(nn.Module):
         self.enc = mlp(goal_dim, list(hidden), z_dim)
         self.object_enc = mlp(190, list(object_hidden), 32)
         self.shape_encoder = ShapeEncoder()
-        self.dec = mlp(1298, list(hidden), NUM_J)
+        self.dec = mlp(1298 + (PRIVILEGED_DIM if self.is_privileged_teacher else 0), list(hidden), NUM_J)
         with torch.no_grad():
             self.dec[-1].weight.mul_(0.01)
             self.dec[-1].bias.zero_()
         self.obs_norm, self.goal_norm = RunningNorm(99), RunningNorm(730)
         self.object_obs_norm, self.object_goal_norm = RunningNorm(18), RunningNorm(190)
+        if self.is_privileged_teacher:
+            self.privileged_norm = RunningNorm(PRIVILEGED_DIM)
 
     def human_latent(self, human_goal):
         _dim(human_goal, 730, "human goal")
         return torch.tanh(run_mlp(self.enc, self.goal_norm(human_goal)))
 
-    def forward(self, robot_hist, human_goal, object_hist, object_goal, points, *, shape_embedding=None):
+    def forward(self, robot_hist, human_goal, object_hist, object_goal, points, *, shape_embedding=None, privileged=None):
         if robot_hist.shape[-2:] != (10, 99) or object_hist.shape[-2:] != (10, 18):
             raise ValueError("actor requires robot (...,10,99) and object (...,10,18) histories")
         _dim(object_goal, 190, "object goal")
@@ -92,6 +99,13 @@ class Policy(nn.Module):
         zO = torch.tanh(run_mlp(self.object_enc, self.object_goal_norm(object_goal)))
         x = torch.cat((zH, self.obs_norm(robot_hist).flatten(-2),
                        self.object_obs_norm(object_hist).flatten(-2), zO, shape_embedding), -1)
+        if self.is_privileged_teacher:
+            from .privileged import PRIVILEGED_DIM
+            if privileged is None or privileged.shape != robot_hist.shape[:-2] + (PRIVILEGED_DIM,):
+                raise ValueError("privileged teacher requires its full current feature block")
+            x = torch.cat((x, self.privileged_norm(privileged)), -1)
+        elif privileged is not None:
+            raise ValueError("baseline actor cannot consume privileged teacher features")
         return run_mlp(self.dec, x)
 
     @torch.no_grad()

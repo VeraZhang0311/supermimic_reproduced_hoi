@@ -235,6 +235,7 @@ def evaluate_group(policy, motion, mdp, shapes, workers, clip_ids, *, fk39, join
     policy.eval()
     output = fresh_directory(output)
     records, controls, robot_hist, object_hist = [], [], None, None
+    previous_teacher_state = None
     first = _state_record(snapshot, motion, fk39, order)
     if verify_tracked_fk:
         from supermimic.robot_metadata import TRACKED_BODIES
@@ -254,7 +255,13 @@ def evaluate_group(policy, motion, mdp, shapes, workers, clip_ids, *, fk39, join
             hg, og = motion.goal(f, 10), motion.object_goal(S, O, f, 10)
             robot_hist = robot[:, None].expand(-1, 10, -1).clone() if robot_hist is None else torch.cat((robot_hist[:, 1:], robot[:, None]), 1)
             object_hist = obj[:, None].expand(-1, 10, -1).clone() if object_hist is None else torch.cat((object_hist[:, 1:], obj[:, None]), 1)
-            action = policy(robot_hist, hg, object_hist, og, shapes.points(assets))
+            actor_extra = {}
+            if getattr(policy, "is_privileged_teacher", False):
+                previous = S if previous_teacher_state is None else previous_teacher_state
+                actor_extra["privileged"] = mdp.privileged_features(
+                    S, O, f, snapshot["a_prev"], snapshot["xi"], snapshot["xi_o"], previous)
+                previous_teacher_state = tuple(value.clone() for value in S)
+            action = policy(robot_hist, hg, object_hist, og, shapes.points(assets), **actor_extra)
             if not bool(torch.isfinite(action).all()):
                 raise FloatingPointError("frozen evaluation policy produced nonfinite actions")
             transition = workers.step(action)
@@ -429,7 +436,12 @@ def main(argv=None):
     joint_names = manifest["bindings"]["target_joint_names"]
     fk39 = _load_fk39(bundle, joint_names, args.device)
     mdp = HOIMDP(kin, motion, torch.tensor(default_joint_pos_list(), device=args.device), shapes, cfg=reward_config(variant))
-    policy, wm, critic = [model(geometry_input_enabled=geometry_input_enabled(variant)).to(args.device)
+    from .privileged import TEACHER_PROFILE, configure_teacher
+    actor_profile = checkpoint.get("actor_observation_profile", "v1")
+    if actor_profile == TEACHER_PROFILE:
+        configure_teacher(mdp, bundle, args.device)
+    policy, wm, critic = [model(geometry_input_enabled=geometry_input_enabled(variant),
+                                **({"actor_observation_profile": actor_profile} if model is Policy else {})).to(args.device)
                           for model in (Policy, WorldModel, Critic)]
     load_checkpoint(checkpoint, policy, wm, critic, physics=asdict(settings), data_identity=identity, variant=variant)
     legacy_networks.AMP_DTYPE = None

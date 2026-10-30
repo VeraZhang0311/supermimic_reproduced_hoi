@@ -2,7 +2,11 @@
 
 ## 当前开发入口
 
-统一在 `codex/hoi-v1-no-quality-gate` 分支开发：无持续WM质量门、完整手脚碰撞、五通道learned contact head。`main`保留初始fork复现代码供对照。
+本分支为 `hoi/privileged_teacher`，从整理后的 v1 基线 `fd626e7` 创建。
+通过 `configs/hoi_v1_privileged_teacher.json` 启用全身特权 actor，详见
+[teacher 输入与验证合同](hoi/v1/PRIVILEGED_TEACHER.md)。
+无持续WM质量门、完整手脚碰撞、五通道learned contact head仍沿用基线。
+`main`保留初始fork复现代码供对照。
 新版hand/self均ON，脚采用同源ULTRA完整STL及已验证CoACD overlay；旧zero-shot入口保留。
 设计与8500pt验收见 [notes索引](notes/README.md)，完整开发入口和实验边界见 [DEVELOPMENT.md](DEVELOPMENT.md)。
 以下上游复现说明中的历史成绩对应其原始配置，不代表新的默认碰撞组合。

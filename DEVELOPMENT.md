@@ -1,6 +1,16 @@
 # SuperMimic HOI v1 开发入口
 
-以后在 `D:/supermimic_reproduced_hoi` 的 **`codex/hoi-v1-no-quality-gate`** 分支开发。
+本工作区为用户指定的 **`hoi/privileged_teacher`**，从整理后的 v1 基线
+`fd626e752686ef61b3e7e1b604f12412a9d5cd2b` 创建，不包含 v1.1/v1.2 感知改动。
+显式配置 `configs/hoi_v1_privileged_teacher.json` 开启无观测噪声的全身特权 actor；
+字段、ULTRA 对照及 contact/reward 扩展提案见 [teacher 说明](hoi/v1/PRIVILEGED_TEACHER.md)。
+本次实现 actor 链路，五通道接触与现有奖励保持基线；未启动训练。
+离线数据管线独立维护在 `D:/hoi_data_pipeline`；来源转换、50Hz expected-contact
+标注和标注 Slurm 作业使用该仓入口。本仓接入新数据仍需准备匹配的 bundle、真实接触
+记录及 native evidence。数据标注成功不等于机器人已可执行。
+
+本工作区沿用 **`codex/hoi-v1-no-quality-gate`** 的科学基线，以下说明仍适用；
+开发、检查与 Git 命令显式指定当前 teacher worktree，不切换其他分支的工作区。
 `main` 保留初始fork的复现代码（`a1508d42c9d1699a52e8233ab16d08c488441ab9`），用于对照。
 原 `hoi/zero_shot`、`hoi/v1.0` 已全部合入当前分支；整理后删除两个本地及GitHub分支，提交历史仍在当前分支中。
 
