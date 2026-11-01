@@ -466,7 +466,7 @@ https://app.forge.coreweave.com/tianzizh-university-of-pennsylvania/superteacher
 以Slurm和该独立目录的日志为准，本文提交状态不代表后续运行结果。
 
 
-## 多资产共进程资源实验（hoi/younameit）
+## 多资产共进程资源实验（hoi/multi-asset-collectors）
 
 原superteacher作业1488620保持排队及冻结source_02不变。新分支显式
 --assets-per-process K，把相邻完整资产WorkerSpec打包到同一spawn进程；默认K=1

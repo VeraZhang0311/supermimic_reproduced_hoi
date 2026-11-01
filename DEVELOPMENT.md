@@ -1,6 +1,6 @@
 # SuperMimic HOI v1 开发入口
 
-本工作区为用户指定的资源优化分支 **`hoi/younameit`**，从teacher提交`0d1a11e`派生。
+本工作区为用户指定的资源优化分支 **`hoi/multi-asset-collectors`**，从teacher提交`0d1a11e`派生。
 原teacher排队作业1488620及冻结源码保持不动；新分支只做多资产共进程和4096/2048环境
 资源对照，不启动另一个训练。teacher此前从整理后的 v1 基线
 `fd626e752686ef61b3e7e1b604f12412a9d5cd2b` 创建，不包含 v1.1/v1.2 感知改动。

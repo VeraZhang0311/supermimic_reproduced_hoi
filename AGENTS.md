@@ -3,7 +3,7 @@
 ## 开发入口
 
 - 先读 `DEVELOPMENT.md`，再按需读 `notes/README.md`；默认目录 `D:/supermimic_reproduced_hoi`。
-- 本工作区开发分支 **`hoi/younameit`**，由用户授权从 `hoi/privileged_teacher` 的 `0d1a11e` 创建。
+- 本工作区开发分支 **`hoi/multi-asset-collectors`**，由用户授权从 `hoi/privileged_teacher` 的 `0d1a11e` 创建。
 - 本分支仅优化采集部署并做零optimizer资源验收；保留正在排队的原teacher作业1488620及冻结source_02，不修改、取消或替换。完整数据/训练参数不变；用户另允许2048环境资源对照和必要时按物体类别拆teacher，后者当前未实现。共享科学基线仍是 `codex/hoi-v1-no-quality-gate`；不自动切换其他 worktree，不重建已删除的 `hoi/zero_shot` 或 `hoi/v1.0`。
 - 特权 actor 使用显式配置 `configs/hoi_v1_privileged_teacher.json`；实现与验证边界见 `hoi/v1/PRIVILEGED_TEACHER.md`。独立离线标注代码位于 `D:/hoi_data_pipeline`，其几何意图标签不等于本仓真实 pair 冲量标签。
 - `main`仅保留初始fork复现代码供对照。旧分支历史已包含在当前分支中；不重建中间分支，除非用户要求。
