@@ -4,7 +4,11 @@
 `fd626e752686ef61b3e7e1b604f12412a9d5cd2b` 创建，不包含 v1.1/v1.2 感知改动。
 显式配置 `configs/hoi_v1_privileged_teacher.json` 开启无观测噪声的全身特权 actor；
 字段、ULTRA 对照及 contact/reward 扩展提案见 [teacher 说明](hoi/v1/PRIVILEGED_TEACHER.md)。
-本次实现 actor 链路，五通道接触与现有奖励保持基线；未启动训练。
+2026-10-31 已扩展16区域真实接触、普通masked BCE、reference三态组内替代与
+正负分别归一化奖励，并接通actor/critic输入及curated数据接口。用户确认按task/source
+group分层约10% protected_eval；缺失task保留unspecified。旧5通道checkpoint/bundle
+拒绝直接加载。新物体采用显式质量/摩擦约定及来源绑定，Omni桌面接入真实kinematic场景；
+未启动训练；完整资产原生验收仍是独立训练前步骤，进度与边界见teacher说明。
 离线数据管线独立维护在 `D:/hoi_data_pipeline`；来源转换、50Hz expected-contact
 标注和标注 Slurm 作业使用该仓入口。本仓接入新数据仍需准备匹配的 bundle、真实接触
 记录及 native evidence。数据标注成功不等于机器人已可执行。
@@ -14,7 +18,7 @@
 `main` 保留初始fork的复现代码（`a1508d42c9d1699a52e8233ab16d08c488441ab9`），用于对照。
 原 `hoi/zero_shot`、`hoi/v1.0` 已全部合入当前分支；整理后删除两个本地及GitHub分支，提交历史仍在当前分支中。
 
-## 当前新版
+## 共享历史 v1 基线（当前 teacher 差异以上文及 teacher 说明为准）
 
 - 无持续WM质量门。前500轮WM-only，之后按固定日程更新actor/critic；WM holdout质量只作诊断。数据/资产身份、原生物理和非有限值硬错误检查保留。
 - 原机器人网络结构保留，追加物体观测/目标/几何及联合动力学。learned contact head输出依次为左手—物体、右手—物体、物体—地面、左脚—物体、右脚—物体。

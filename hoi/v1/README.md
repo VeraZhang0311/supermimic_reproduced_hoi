@@ -1,8 +1,15 @@
 # SuperMimic HOI v1
 
+> 当前 `hoi/privileged_teacher` 已按2026-10-31方案使用16区域contact、统一三态奖励、
+> 普通masked BCE与curated reference接入；详见 [teacher说明](PRIVILEGED_TEACHER.md)。
+> 下文五通道/双手bundle描述属于历史v1；该格式不能直接作为当前teacher输入。
+> Curated准备使用 `python -m hoi.v1.prepare --curated --manifest <split.json> --assets
+> <audited-recipes.json> --partition train|protected_eval --output <new-directory>`。
+> 尚未启动训练，完整新资产的GPU原生验收仍需单独执行。
+
 `hoi/privileged_teacher` 从下述 v1 基线分出。使用
 `configs/hoi_v1_privileged_teacher.json` 显式启用新的全身特权 actor，详见
-[PRIVILEGED_TEACHER.md](PRIVILEGED_TEACHER.md)。不传配置仍使用原始 v1 输入；
+[PRIVILEGED_TEACHER.md](PRIVILEGED_TEACHER.md)。不传配置使用非特权 actor 接口，contact/goal 同样采用本分支16区域schema；
 旧 HOI checkpoint 不可直接 resume 为 teacher。
 
 共享科学基线为 `codex/hoi-v1-no-quality-gate`：无持续WM质量门、完整手脚碰撞、五通道contact head。使用同SHA的完整ULTRA脚STL/零安装变换，在不可变手overlay上关闭旧脚球并追加CoACD5hull/16vertex凸包，保留原质量/COM/惯量。原VHACD60000只作作者配置溯源，不冒称相同cooker。Train/eval必须显式绑定foot manifest、USD和新bundle身份，不能只依赖默认机器人路径。

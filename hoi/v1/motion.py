@@ -9,11 +9,12 @@ import torch
 
 from supermimic.motion import BIN_FRAMES, MotionLib
 from supermimic.rotations import mat_to_6d, yaw_mat
+from .contacts import CHANNELS
 
 
 class TrainingMotionBank(MotionLib):
     def __init__(self, clips, kin, device="cpu", partition="train", retain_source_reference=None):
-        if partition not in ("train", "eval80", "test40", "validation", "regression", "test"):
+        if partition not in ("train", "protected_eval", "eval80", "test40", "validation", "regression", "test"):
             raise ValueError("unknown reference partition")
         if not clips:
             raise ValueError("a reference bank requires at least one clip")
@@ -31,7 +32,9 @@ class TrainingMotionBank(MotionLib):
         self.num_frames = sum(lengths)
         cat = lambda values: torch.cat(values).to(device=device, dtype=torch.float32)
         keep_source = partition != "train" if retain_source_reference is None else retain_source_reference
-        self.source_reference = cat([d["source_sampled"] for d in data]) if keep_source else None
+        # Curated non-ULTRA references have native arrays, not a fabricated 630D
+        # ULTRA cache. Source-only diagnostics must test this optional field.
+        self.source_reference = cat([d["source_sampled"] for d in data]) if keep_source and all("source_sampled" in d for d in data) else None
         for attr, field in (("root_p", "root_pos"), ("root_R", "root_rot"),
                             ("root_v", "derived_ref_v"), ("root_w", "derived_ref_omega"),
                             ("q", "joint_pos"), ("qd", "derived_ref_joint_qd")):
@@ -45,8 +48,8 @@ class TrainingMotionBank(MotionLib):
         expected, valid = [], []
         for c, n in zip(clips, lengths):
             e, m = torch.as_tensor(c["expected_contact"]), torch.as_tensor(c["expected_valid"])
-            if e.shape != (n, 2) or m.shape != (n, 2):
-                raise ValueError("expected schedule must be T+1 by two hand-object pairs")
+            if e.shape != (n, len(CHANNELS)) or m.shape != (n, len(CHANNELS)):
+                raise ValueError("expected schedule must be T+1 by 16 region-object/ground pairs")
             if not bool((((e == 0) | (e == 1)) & ((m == 0) | (m == 1))).all()):
                 raise ValueError("expected contact and masks must be binary")
             expected.append(e * m)
@@ -93,7 +96,7 @@ class TrainingMotionBank(MotionLib):
         return tuple(x[f] for x in self.ref_object_arrays())
 
     def object_goal(self, S, O, f, K=10):
-        """19D/future tick in the *current* actual/imagined robot heading.
+        """47D/future tick in the *current* actual/imagined robot heading.
 
         Beyond-end poses clamp exactly like the human goal.  Contact validity
         becomes zero outside the clip rather than inventing a held command.
@@ -111,6 +114,7 @@ class TrainingMotionBank(MotionLib):
         return torch.cat((dp, rot, v, w, expected, valid), -1).flatten(-2)
 
     def expected(self, f):
+        """Arrival-index requirements: row i describes control interval (i-1,i]."""
         return self.expected_contact[f], self.expected_valid[f]
 
     def compatible_bins(self, asset_id):

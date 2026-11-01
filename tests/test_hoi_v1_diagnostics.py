@@ -9,6 +9,7 @@ from torch import nn
 
 from hoi.v1.diagnostics import contact_transition_events, executed_action_reward_gap, source_flag_comparison
 from hoi.v1.contacts import CHANNELS, LABEL_SCHEMA
+from hoi.v1.scene_context import empty_scene_state
 from hoi.v1.state import flatten_object, flatten_state
 from tests.test_hoi_v1_evaluate import fixture
 
@@ -20,7 +21,7 @@ class ScriptedWM(nn.Module):
         self.register_buffer("count", torch.tensor(0.))
         self.actions = []
 
-    def step(self, S, O, a, xi, xi_o, points):
+    def step(self, S, O, a, xi, xi_o, points, scene_context):
         self.actions.append(a.detach().clone())
         S1 = (S[0] + a[:, :3] * self.scale * .001, *S[1:])
         O1 = (O[0] + a[:, :3] * self.scale * .002, *O[1:])
@@ -75,11 +76,12 @@ class EvaluationDiagnosticsTests(unittest.TestCase):
         control = {"action": actions, "a_prev": torch.cat((torch.zeros_like(actions[:1]), actions[:-1])),
                    "xi": torch.ones(T, 33), "xi_o": torch.ones(T, 12),
                    "contact_valid": torch.ones(T, len(CHANNELS)).bool(), "reward": []}
+        control.update(empty_scene_state((T,)))
         cloud = shapes.points(torch.tensor(0))
         with torch.no_grad():
             for step in range(T):
                 S, O, logits = wm.step(S, O, actions[step:step + 1], control["xi"][step:step + 1],
-                                       control["xi_o"][step:step + 1], cloud[None])
+                                       control["xi_o"][step:step + 1], cloud[None], torch.zeros(1,26))
                 states["s"].append(flatten_state(S)[0])
                 states["o"].append(flatten_object(O)[0])
                 reward = mdp.reward(S, O, torch.tensor([start + step + 1]), actions[step:step + 1],
@@ -130,13 +132,13 @@ class EvaluationDiagnosticsTests(unittest.TestCase):
     def test_paired_reward_rejects_old_validity_and_WM_logits_contracts(self):
         wm, mdp, states, control, frames, cloud = self.trajectory()
         old = {**control, "contact_valid": control["contact_valid"][:, :3]}
-        with self.assertRaisesRegex(ValueError, "5 channels"):
+        with self.assertRaisesRegex(ValueError, "16 channels"):
             executed_action_reward_gap(wm, mdp, states, old, frames, cloud)
         class OldWM(ScriptedWM):
             def step(self, *args):
                 S, O, logits = super().step(*args)
                 return S, O, logits[:, :3]
-        with self.assertRaisesRegex(ValueError, "five-channel"):
+        with self.assertRaisesRegex(ValueError, "16-channel"):
             executed_action_reward_gap(OldWM(), mdp, states, control, frames, cloud)
 
     def test_foot_logits_do_not_become_reference_reward_and_nonfinite_feet_are_rejected(self):

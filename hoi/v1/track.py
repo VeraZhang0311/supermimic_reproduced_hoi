@@ -94,7 +94,7 @@ def _contact_identity(value):
     channels = value.get("contact_channels")
     if (not isinstance(channels, (list, tuple)) or tuple(channels) != CHANNELS or
             value.get("contact_label_schema") != LABEL_SCHEMA):
-        raise ValueError("tracking requires the current five-channel contact label contract")
+        raise ValueError("tracking requires the current 16-channel contact label contract")
     return True
 
 
@@ -143,7 +143,7 @@ def _configuration(plan, evaluation):
     for key, value in hashes.items():
         _hash(out, key, value)
     partition = evaluation.get("partition")
-    if partition in ("train", "eval80", "test40", "validation", "regression", "test"):
+    if partition in ("train", "protected_eval", "eval80", "test40", "validation", "regression", "test"):
         out["evaluation/partition"] = partition
     if evaluation.get("variant") in VARIANTS:
         out["evaluation/variant"] = evaluation["variant"]
@@ -175,7 +175,7 @@ def _training_event(record):
     for source, prefix in (("fit_contact_positive", "contact/fit_positive"), ("fit_contact_negative", "contact/fit_negative")):
         values = record.get(source)
         if values is not None and (not isinstance(values, list) or len(values) != len(CHANNELS)):
-            raise ValueError("tracking fit contact counts must use all five actual channels")
+            raise ValueError("tracking fit contact counts must use all 16 actual channels")
         if isinstance(values, list):
             for index, channel in enumerate(CHANNELS):
                 _put(metrics, prefix + "/" + channel, values[index])
@@ -209,7 +209,7 @@ def _evaluation_summary(report):
                     "actual_contact_fraction", "maximum_interval_normal_impulse_Ns"):
             values = contact.get(key)
             if values is not None and (not isinstance(values, list) or len(values) != len(CHANNELS)):
-                raise ValueError("tracking actual contact metrics require all five channels")
+                raise ValueError("tracking actual contact metrics require all 16 channels")
             if isinstance(values, list):
                 for channel, value in zip(CHANNELS, values):
                     _put(metrics, prefix + "contact/" + key + "/" + channel, value)
@@ -217,16 +217,18 @@ def _evaluation_summary(report):
             _put(metrics, prefix + "contact/" + key, contact.get(key))
         for key in ("missing_contact_intervals", "extra_contact_intervals", "max_missing_streak_steps", "max_missing_streak_seconds", "missing_streak_ge16"):
             values = contact.get(key)
-            if isinstance(values, list) and len(values) == 2:
-                for hand, value in zip(("left", "right"), values):
-                    _put(metrics, prefix + "contact/" + key + "/" + hand, value)
+            if values is not None and (not isinstance(values, list) or len(values) != len(CHANNELS)):
+                raise ValueError("tracking expected contact metrics require all 16 regions")
+            if isinstance(values, list):
+                for channel, value in zip(CHANNELS, values):
+                    _put(metrics, prefix + "contact/" + key + "/" + channel, value)
         source_flags = _mapping(case.get("source_flag_comparison"))
         for key in ("valid_intervals", "mismatch_intervals", "mismatch_fraction_valid"):
             values = source_flags.get(key)
             if isinstance(values, list) and len(values) == 2:
                 for hand, value in zip(("left", "right"), values):
                     _put(metrics, prefix + "source_flag_comparison/" + key + "/" + hand, value)
-        for kind, channels in (("actual", CHANNELS), ("expected", CHANNELS[:2])):
+        for kind, channels in (("actual", CHANNELS), ("expected", CHANNELS)):
             for channel in channels:
                 source_channel = "object_ground_support" if channel == "object_ground" else channel
                 for key in ("onset_count", "release_count", "valid_adjacent_intervals"):
@@ -251,7 +253,7 @@ def _validate_payload(payload):
                    "training/amp": ("none", "bf16"), "training/experiment_kind": ("formal", "smoke"),
                    "training/variant": VARIANTS, "evaluation/variant": VARIANTS,
                    "contact/label_schema": (LABEL_SCHEMA,), "contact/channel_count": (len(CHANNELS),),
-                   "evaluation/partition": ("train", "eval80", "test40", "validation", "regression", "test")}
+                   "evaluation/partition": ("train", "protected_eval", "eval80", "test40", "validation", "regression", "test")}
     numeric_fields = {"training/" + key for key, value in TrainConfig().to_dict().items() if type(value) in (int, float, bool)}
     numeric_fields.add("training/wm_quality_gate_enabled")
     numeric_fields.update({"physics/hand_collision", "physics/self_collision", "dataset/selected_motions", "dataset/available_motions", "dataset/is_subset"})
@@ -289,10 +291,10 @@ def _validate_payload(payload):
         "maximum_interval_normal_impulse_Ns") for channel in CHANNELS)
     case_keys.update(group + "/" + statistic for group in ERROR_GROUPS for statistic in ("mean", "p95", "max", "final"))
     case_keys.update("contact/" + key for key in ("expected_positive_intervals", "expected_contact_coverage", "expected_valid_fraction", "all_known_expected_contact_matched"))
-    case_keys.update("contact/" + key + "/" + side for key in ("missing_contact_intervals", "extra_contact_intervals", "max_missing_streak_steps", "max_missing_streak_seconds", "missing_streak_ge16") for side in ("left", "right"))
+    case_keys.update("contact/" + key + "/" + side for key in ("missing_contact_intervals", "extra_contact_intervals", "max_missing_streak_steps", "max_missing_streak_seconds", "missing_streak_ge16") for side in CHANNELS)
     case_keys.update("source_flag_comparison/" + key + "/" + side for key in ("valid_intervals", "mismatch_intervals", "mismatch_fraction_valid") for side in ("left", "right"))
     case_keys.update("contact/" + kind + "_events/" + channel + "/" + key
-                     for kind, channels in (("actual", CHANNELS), ("expected", CHANNELS[:2])) for channel in channels
+                     for kind, channels in (("actual", CHANNELS), ("expected", CHANNELS)) for channel in channels
                      for key in ("onset_count", "release_count", "valid_adjacent_intervals"))
     case_keys.update("paired_reward_gap/" + horizon + "/" + key for horizon in ("1", "8", "32")
                      for key in ("sequence_count", "valid_intervals", "signed_reward_gap_mean", "absolute_reward_gap_mean", "reward_gap_rmse"))

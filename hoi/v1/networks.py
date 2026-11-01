@@ -11,29 +11,36 @@ from supermimic.mdp import NUM_J, invariant_features
 from supermimic.networks import RunningNorm, WorldModel as RobotWorldModel, mlp, run_mlp
 from supermimic.rotations import so3_exp, yaw_mat
 from .contacts import CHANNELS, LABEL_SCHEMA
+from .scene_context import SCENE_CONTEXT_DIM, SCENE_CONTEXT_SCHEMA, normalize_scene_context
 from .state import integrate_object, object_features, object_state_error, object_targets
 
-FEATURE_VERSION = "supermimic_hoi_v1_full_reference_2"
+OBJECT_GOAL_DIM = 10 * (15 + 2 * len(CHANNELS))
+CRITIC_OBJECT_DIM = OBJECT_GOAL_DIM + 15 + 15 + 12 + 2 * len(CHANNELS)
+FEATURE_VERSION = "supermimic_hoi_v1_full_reference_4"
 FEATURE_SCHEMA = {
     "version": FEATURE_VERSION,
     "robot_state": "p3,quat_wxyz4,v_world3,omega_world3,q29,qd29",
     "object_state": "p_origin3,quat_wxyz4,v_origin_world3,omega_world3",
-    "actor": ["human_latent32", "robot_history10x99", "object_history10x18", "object_latent32", "shape64"],
-    "wm": ["legacy_robot133", "object_invariant15", "shape64", "object_context12"],
+    "actor": ["human_latent32", "robot_history10x99", "object_history10x18", "object_latent32", "shape64", "scene_context26"],
+    "wm": ["legacy_robot133", "object_invariant15", "shape64", "object_context12", "scene_context26"],
     "wm_output": ["robot_increment70", "object_increment12"],
-    "critic": ["legacy914", "object_goal190", "object_invariant15", "object_error15", "object_context12", "expected_and_valid4", "shape64"],
+    "critic": ["legacy914", f"object_goal{OBJECT_GOAL_DIM}", "object_invariant15", "object_error15", "object_context12", f"expected_and_valid{2 * len(CHANNELS)}", "shape64", "scene_context26"],
+    "scene_context": SCENE_CONTEXT_SCHEMA,
     "object_context": "mass1,COM_local3,inertia_COM_local_xx_yy_zz_xy_xz_yz6,object_friction1,ground_friction1",
     "object_invariant": "HrobotT*(pO-pR)3,rot6d(HrobotT*RO)6,HrobotT*(vO-vR)3,HrobotT*omegaO3",
     "object_observation": "HrobotT*(pO-pR)3,rot6d(HrobotT*RO)6,HrobotT*(pOref-pO)3,rot6d(ROT*ROref)6",
-    "object_goal_tick": "HrobotT*(pOref-pR)3,rot6d(HrobotT*ROref)6,HrobotT*vOref3,HrobotT*omegaOref3,expectedLR2,validLR2",
+    "object_goal_tick": "HrobotT*(pOref-pR)3,rot6d(HrobotT*ROref)6,HrobotT*vOref3,HrobotT*omegaOref3,expected_regions16,valid_regions16",
     "object_increment": "HrobotT*dp3,log(ROT*ROnext)3,HrobotT*dv3,HrobotT*domega3",
     "contact": list(CHANNELS),
     "contact_time": "actual_interval_t_tplus1",
+    "reference_contact_time": "arrival_index_i_describes_interval_i_minus_1_to_i; row0_invalid",
+    "contact_loss": "plain_masked_BCEWithLogitsLoss_no_class_reweighting",
+    "contact_objective": "mean_probability_known_positive_minus_mean_probability_known_negative; empty_set_zero; unknown_ignored",
     "actual_contact_label": {"schema": LABEL_SCHEMA, "threshold_N": 1., "comparison": "strict_greater",
                              "control_dt_s": .02, "num_substeps": 4,
                              "aggregation": "sum_normal_impulses_all_contact_points_all_substeps_divided_by_control_dt"},
     "shape": "pointnet_3_64_128_128_max_128_64_ELU_FPS128_object_local_meters",
-    "normalizers": "independent_legacy_new_raw_blocks_shape_unnormalized",
+    "normalizers": "independent_legacy_new_raw_blocks_shape_unnormalized; scene26_RMS_includes_absent_zero_rows_presence_restored_and_absent_slots_zeroed_after_norm",
 }
 
 
@@ -70,14 +77,15 @@ class Policy(nn.Module):
             raise ValueError("v1 schema requires obs99, human_goal730, history10, latent32")
         self.hist = hist
         self.enc = mlp(goal_dim, list(hidden), z_dim)
-        self.object_enc = mlp(190, list(object_hidden), 32)
+        self.object_enc = mlp(OBJECT_GOAL_DIM, list(object_hidden), 32)
         self.shape_encoder = ShapeEncoder()
-        self.dec = mlp(1298 + (PRIVILEGED_DIM if self.is_privileged_teacher else 0), list(hidden), NUM_J)
+        self.dec = mlp(1298 + SCENE_CONTEXT_DIM + (PRIVILEGED_DIM if self.is_privileged_teacher else 0), list(hidden), NUM_J)
         with torch.no_grad():
             self.dec[-1].weight.mul_(0.01)
             self.dec[-1].bias.zero_()
+        self.scene_norm = RunningNorm(SCENE_CONTEXT_DIM)
         self.obs_norm, self.goal_norm = RunningNorm(99), RunningNorm(730)
-        self.object_obs_norm, self.object_goal_norm = RunningNorm(18), RunningNorm(190)
+        self.object_obs_norm, self.object_goal_norm = RunningNorm(18), RunningNorm(OBJECT_GOAL_DIM)
         if self.is_privileged_teacher:
             self.privileged_norm = RunningNorm(PRIVILEGED_DIM)
 
@@ -85,10 +93,10 @@ class Policy(nn.Module):
         _dim(human_goal, 730, "human goal")
         return torch.tanh(run_mlp(self.enc, self.goal_norm(human_goal)))
 
-    def forward(self, robot_hist, human_goal, object_hist, object_goal, points, *, shape_embedding=None, privileged=None):
+    def forward(self, robot_hist, human_goal, object_hist, object_goal, points, *, scene_context, shape_embedding=None, privileged=None):
         if robot_hist.shape[-2:] != (10, 99) or object_hist.shape[-2:] != (10, 18):
             raise ValueError("actor requires robot (...,10,99) and object (...,10,18) histories")
-        _dim(object_goal, 190, "object goal")
+        _dim(object_goal, OBJECT_GOAL_DIM, "object goal")
         if shape_embedding is None:
             shape_embedding = self.shape_encoder(points)
         elif not isinstance(shape_embedding, torch.Tensor) or shape_embedding.shape != robot_hist.shape[:-2] + (64,):
@@ -106,10 +114,12 @@ class Policy(nn.Module):
             x = torch.cat((x, self.privileged_norm(privileged)), -1)
         elif privileged is not None:
             raise ValueError("baseline actor cannot consume privileged teacher features")
+        x = torch.cat((x, normalize_scene_context(self.scene_norm, scene_context)), -1)
         return run_mlp(self.dec, x)
 
     @torch.no_grad()
-    def update_normalizers(self, robot_hist, human_goal, object_hist, object_goal):
+    def update_normalizers(self, robot_hist, human_goal, object_hist, object_goal, scene_context):
+        self.scene_norm.update(scene_context)
         self.obs_norm.update(robot_hist)
         self.goal_norm.update(human_goal)
         self.object_obs_norm.update(object_hist)
@@ -124,8 +134,8 @@ class WorldModel(nn.Module):
         self.geometry_input_enabled = geometry_input_enabled
         if not hidden:
             raise ValueError("joint WM requires hidden layers")
-        self.in_dim, self.out_dim = 224, 82
-        self.net = mlp(224, list(hidden), 82, act=nn.SiLU, layer_norm=True)
+        self.in_dim, self.out_dim = 224 + SCENE_CONTEXT_DIM, 82
+        self.net = mlp(self.in_dim, list(hidden), 82, act=nn.SiLU, layer_norm=True)
         # Preserve the legacy zero-increment start for the robot block. New
         # object rows are independently initialized and immediately trainable.
         with torch.no_grad():
@@ -134,6 +144,7 @@ class WorldModel(nn.Module):
         self.contact_head = mlp(hidden[-1], [contact_hidden], len(CHANNELS), act=nn.SiLU)
         self.shape_encoder = ShapeEncoder()
         self.in_norm, self.out_norm = RunningNorm(133), RunningNorm(70, eps=1e-4)
+        self.scene_norm = RunningNorm(SCENE_CONTEXT_DIM)
         self.object_in_norm = RunningNorm(27)
         self.object_out_norm = RunningNorm(12, eps=1e-4)
         self.register_buffer("robot_error_floor", torch.cat((torch.full((3,), .003), torch.full((3,), .005),
@@ -146,13 +157,13 @@ class WorldModel(nn.Module):
         _dim(xi_o, 12, "object physical context")
         return torch.cat((invariant_features(S), a, xi_n), -1), torch.cat((object_features(S, O), xi_o), -1)
 
-    def inputs(self, S, O, a, xi_n, xi_o, points):
+    def inputs(self, S, O, a, xi_n, xi_o, points, scene_context):
         old, new = self.raw_inputs(S, O, a, xi_n, xi_o)
         new = self.object_in_norm(new)
         shape = self.shape_encoder(points)
         if not self.geometry_input_enabled:
             shape = shape * 0
-        return torch.cat((self.in_norm(old), new[..., :15], shape, new[..., 15:]), -1)
+        return torch.cat((self.in_norm(old), new[..., :15], shape, new[..., 15:], normalize_scene_context(self.scene_norm, scene_context)), -1)
 
     @staticmethod
     def targets(S, O, S1, O1):
@@ -162,8 +173,8 @@ class WorldModel(nn.Module):
     def state_error(S_hat, O_hat, S, O):
         return torch.cat((RobotWorldModel.state_error(S_hat, S), object_state_error(S, O_hat, O)), -1)
 
-    def step(self, S, O, a, xi_n, xi_o, points):
-        hidden = run_mlp(self.net[:-1], self.inputs(S, O, a, xi_n, xi_o, points))
+    def step(self, S, O, a, xi_n, xi_o, points, scene_context):
+        hidden = run_mlp(self.net[:-1], self.inputs(S, O, a, xi_n, xi_o, points, scene_context))
         y = run_mlp(self.net[-1], hidden)
         dr = y[..., :70] * self.out_norm.std() + self.out_norm.mean
         do = y[..., 70:] * self.object_out_norm.std() + self.object_out_norm.mean
@@ -174,17 +185,18 @@ class WorldModel(nn.Module):
         return S1, integrate_object(S, O, do), run_mlp(self.contact_head, hidden)
 
     @torch.no_grad()
-    def update_normalizers(self, S, O, a, xi_n, xi_o, points, S1, O1):
+    def update_normalizers(self, S, O, a, xi_n, xi_o, points, S1, O1, scene_context):
         # Deliberately normalize only raw data, never a changing shape embedding.
         old, new = self.raw_inputs(S, O, a, xi_n, xi_o)
         target = self.targets(S, O, S1, O1)
         self.in_norm.update(old)
         self.object_in_norm.update(new)
+        self.scene_norm.update(scene_context)
         self.out_norm.update(target[..., :70])
         self.object_out_norm.update(target[..., 70:])
 
-    def loss(self, S_hat, O_hat, S, O, contact_logits, contact_actual, contact_valid, mask,
-             pos_weight=None, lambda_object=1., lambda_contact=.1):
+    def loss(self, S_hat, O_hat, S, O, contact_logits, contact_actual, contact_valid, mask, *,
+             lambda_object=1., lambda_contact=.1):
         """Original masked robot loss plus equally weighted object groups and pair BCE.
 
         ``mask`` contains the terminal transition and excludes only later reset
@@ -196,7 +208,15 @@ class WorldModel(nn.Module):
         obj = scaled.reshape(scaled.shape[:-1] + (4, 3)).mean(-1).mean(-1)
         for x, name in ((contact_logits, "contact logits"), (contact_actual, "actual pair labels"), (contact_valid, "pair validity")):
             _dim(x, len(CHANNELS), name)
-        bce = F.binary_cross_entropy_with_logits(contact_logits, contact_actual.float(), reduction="none", pos_weight=pos_weight)
+        if not (contact_logits.shape == contact_actual.shape == contact_valid.shape):
+            raise ValueError("contact logits, labels and validity must have identical shapes")
+        known = contact_valid.bool()
+        if bool((known & ((contact_actual != 0) & (contact_actual != 1))).any()):
+            raise ValueError("known actual contact labels must be binary")
+        # Unknown labels never reach BCE; no class reweighting distorts its
+        # probability target. Counts remain diagnostics only.
+        target = torch.where(known, contact_actual, 0.).to(contact_logits)
+        bce = F.binary_cross_entropy_with_logits(contact_logits, target, reduction="none")
         valid = contact_valid.to(bce.dtype)
         contact = (bce * valid).sum(-1) / valid.sum(-1).clamp_min(1)
         reduce = lambda x: (x * mask).sum() / max(1, mask.shape[0])
@@ -210,29 +230,31 @@ class Critic(nn.Module):
         if type(geometry_input_enabled) is not bool:
             raise ValueError("geometry_input_enabled must be boolean")
         self.geometry_input_enabled = geometry_input_enabled
-        self.net = mlp(1214, list(hidden), 1)
-        self.norm, self.object_norm = RunningNorm(914), RunningNorm(236)
+        self.net = mlp(914 + CRITIC_OBJECT_DIM + 64 + SCENE_CONTEXT_DIM, list(hidden), 1)
+        self.scene_norm = RunningNorm(SCENE_CONTEXT_DIM)
+        self.norm, self.object_norm = RunningNorm(914), RunningNorm(CRITIC_OBJECT_DIM)
         self.shape_encoder = ShapeEncoder()
 
     @staticmethod
     def raw_object_features(object_goal, object_feat, errors, xi_o, expected):
-        values = ((object_goal, 190), (object_feat, 15), (errors, 15), (xi_o, 12), (expected, 4))
+        values = ((object_goal, OBJECT_GOAL_DIM), (object_feat, 15), (errors, 15), (xi_o, 12), (expected, 2 * len(CHANNELS)))
         for x, d in values:
             _dim(x, d, "critic object feature")
         return torch.cat(tuple(x for x, _ in values), -1)
 
-    def forward(self, legacy, object_goal, object_feat, errors, xi_o, expected, points):
+    def forward(self, legacy, object_goal, object_feat, errors, xi_o, expected, scene_context, points):
         _dim(legacy, 914, "legacy critic features")
         raw = self.raw_object_features(object_goal, object_feat, errors, xi_o, expected)
         # Must remain in forward, including value-fitting minibatches.
         shape = self.shape_encoder(points)
         if not self.geometry_input_enabled:
             shape = shape * 0
-        x = torch.cat((self.norm(legacy), self.object_norm(raw), shape), -1)
+        x = torch.cat((self.norm(legacy), self.object_norm(raw), shape, normalize_scene_context(self.scene_norm, scene_context)), -1)
         return run_mlp(self.net, x).squeeze(-1)
 
     @torch.no_grad()
-    def update_normalizers(self, legacy, object_goal, object_feat, errors, xi_o, expected):
+    def update_normalizers(self, legacy, object_goal, object_feat, errors, xi_o, expected, scene_context):
+        self.scene_norm.update(scene_context)
         self.norm.update(legacy)
         self.object_norm.update(self.raw_object_features(object_goal, object_feat, errors, xi_o, expected))
 

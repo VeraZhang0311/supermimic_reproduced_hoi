@@ -86,19 +86,19 @@ class NetworksTest(unittest.TestCase):
         wm = WorldModel(hidden=(32,32), contact_hidden=12, geometry_input_enabled=False)
         critic = Critic(hidden=(32,16), geometry_input_enabled=False)
         points, changed = torch.randn(3,128,3), torch.randn(3,128,3)*10
-        args = (torch.randn(3,10,99), torch.randn(3,730), torch.randn(3,10,18), torch.randn(3,190))
-        action = pi(*args, points)
-        torch.testing.assert_close(action, pi(*args, changed), atol=0, rtol=0)
-        torch.testing.assert_close(action, pi(*args, points, shape_embedding=torch.randn(3,64)), atol=0, rtol=0)
+        args = (torch.randn(3,10,99), torch.randn(3,730), torch.randn(3,10,18), torch.randn(3,470))
+        action = pi(*args, points, scene_context=points.new_zeros(3,26))
+        torch.testing.assert_close(action, pi(*args, changed, scene_context=points.new_zeros(3,26)), atol=0, rtol=0)
+        torch.testing.assert_close(action, pi(*args, points, scene_context=points.new_zeros(3,26), shape_embedding=torch.randn(3,64)), atol=0, rtol=0)
         S,O = states()
         wm_args = (S,O,action.detach(),torch.randn(3,33),torch.randn(3,12))
-        inputs = wm.inputs(*wm_args, points)
+        inputs = wm.inputs(*wm_args, points, points.new_zeros(3,26))
         torch.testing.assert_close(inputs[:,148:212], torch.zeros(3,64), atol=0, rtol=0)
-        torch.testing.assert_close(inputs, wm.inputs(*wm_args, changed), atol=0, rtol=0)
-        critic_args = (torch.randn(3,914),torch.randn(3,190),torch.randn(3,15),torch.randn(3,15),torch.randn(3,12),torch.randn(3,4))
-        value = critic(*critic_args, points)
-        torch.testing.assert_close(value, critic(*critic_args, changed), atol=0, rtol=0)
-        _,_,logits = wm.step(*wm_args, points)
+        torch.testing.assert_close(inputs, wm.inputs(*wm_args, changed, points.new_zeros(3,26)), atol=0, rtol=0)
+        critic_args = (torch.randn(3,914),torch.randn(3,470),torch.randn(3,15),torch.randn(3,15),torch.randn(3,12),torch.randn(3,32))
+        value = critic(*critic_args, points.new_zeros(3,26), points)
+        torch.testing.assert_close(value, critic(*critic_args, points.new_zeros(3,26), changed), atol=0, rtol=0)
+        _,_,logits = wm.step(*wm_args, points, points.new_zeros(3,26))
         (action.sum()+value.sum()+logits.sum()).backward()
         for model in (pi,wm,critic):
             self.assertIsInstance(model.shape_encoder, ShapeEncoder)
@@ -138,15 +138,15 @@ class NetworksTest(unittest.TestCase):
         pi, wm, critic = Policy(), WorldModel(), Critic()
         self.assertEqual(pi.enc[0].in_features, 730)
         self.assertEqual(pi.enc[-1].out_features, 32)
-        self.assertEqual(pi.object_enc[0].in_features, 190)
+        self.assertEqual(pi.object_enc[0].in_features, 470)
         self.assertEqual(pi.object_enc[-1].out_features, 32)
         self.assertEqual([x.out_features for x in pi.dec if isinstance(x, nn.Linear)], [2048, 1024, 512, 256, 29])
-        self.assertEqual(pi.dec[0].in_features, 1298)
+        self.assertEqual(pi.dec[0].in_features, 1324)
         self.assertEqual([x.out_features for x in wm.net if isinstance(x, nn.Linear)], [2048, 2048, 2048, 82])
-        self.assertEqual(wm.net[0].in_features, 224)
+        self.assertEqual(wm.net[0].in_features, 250)
         self.assertEqual(wm.contact_head[0].in_features, 2048)
-        self.assertEqual(wm.contact_head[-1].out_features, 5)
-        self.assertEqual(critic.net[0].in_features, 1214)
+        self.assertEqual(wm.contact_head[-1].out_features, 16)
+        self.assertEqual(critic.net[0].in_features, 1548)
         self.assertEqual([x.out_features for x in critic.net if isinstance(x, nn.Linear)], [256, 128, 1])
         self.assertEqual(len({id(m.shape_encoder) for m in (pi, wm, critic)}), 3)
 
@@ -170,21 +170,21 @@ class NetworksTest(unittest.TestCase):
         self.assertEqual(report["iteration"], 0)
         self.assertEqual(report["source_iteration"], 100)
         S, O = states()
-        obs, hg, oh, og, points = torch.randn(3, 10, 99), torch.randn(3, 730), torch.randn(3, 10, 18), torch.randn(3, 190), torch.randn(3, 128, 3)
+        obs, hg, oh, og, points = torch.randn(3, 10, 99), torch.randn(3, 730), torch.randn(3, 10, 18), torch.randn(3, 470), torch.randn(3, 128, 3)
         xi = torch.randn(3, 33)
         action = legacy_pi(obs, hg)
         torch.testing.assert_close(pi.human_latent(hg), torch.tanh(legacy_pi.enc(legacy_pi.goal_norm(hg))))
-        torch.testing.assert_close(pi(obs, hg, oh, og, points), action, atol=2e-6, rtol=2e-5)
+        torch.testing.assert_close(pi(obs, hg, oh, og, points, scene_context=points.new_zeros(3,26)), action, atol=2e-6, rtol=2e-5)
         S1 = legacy_wm.step(S, action, xi)
-        newS, _, _ = wm.step(S, O, action, xi, torch.randn(3, 12), points)
+        newS, _, _ = wm.step(S, O, action, xi, torch.randn(3, 12), points, points.new_zeros(3,26))
         for new, old in zip(newS, S1):
             torch.testing.assert_close(new, old, atol=2e-6, rtol=2e-5)
         v = torch.randn(3, 914)
-        torch.testing.assert_close(critic(v, og, torch.randn(3, 15), torch.randn(3, 15), torch.randn(3, 12), torch.randn(3, 4), points), legacy_v(v))
+        torch.testing.assert_close(critic(v, og, torch.randn(3, 15), torch.randn(3, 15), torch.randn(3, 12), torch.randn(3, 32), points.new_zeros(3,26), points), legacy_v(v))
         self.assertEqual(float(pi.object_obs_norm.count), 0)
         self.assertEqual(float(wm.object_in_norm.count), 0)
         self.assertEqual(float(wm.in_norm.count), 2e8)
-        wm.update_normalizers(S, O, action, xi, torch.randn(3, 12), points, S1, O)
+        wm.update_normalizers(S, O, action, xi, torch.randn(3, 12), points, S1, O, points.new_zeros(3,26))
         self.assertEqual(float(wm.object_in_norm.count), 3)
         self.assertEqual(float(wm.in_norm.count), 2e8)
         self.assertEqual(torch.count_nonzero(pi.dec[0].weight[:, 1022:]), 0)
@@ -198,7 +198,7 @@ class NetworksTest(unittest.TestCase):
         S = tuple(x.detach().requires_grad_() for x in S)
         O = tuple(x.detach().requires_grad_() for x in O)
         action = torch.randn(3, 29, requires_grad=True)
-        S1, O1, contact = wm.step(S, O, action, torch.randn(3, 33), torch.randn(3, 12), torch.randn(3, 128, 3))
+        S1, O1, contact = wm.step(S, O, action, torch.randn(3, 33), torch.randn(3, 12), torch.randn(3, 128, 3), torch.zeros(3,26))
         robot_depends_on_object = torch.autograd.grad(S1[0].square().sum(), O[0], retain_graph=True)[0]
         object_depends_on_action = torch.autograd.grad(O1[0].square().sum(), action, retain_graph=True)[0]
         self.assertGreater(robot_depends_on_object.abs().sum().item(), 0)
@@ -218,7 +218,7 @@ class NetworksTest(unittest.TestCase):
         xi, xio, points = torch.randn(1, 33, dtype=torch.float64), torch.randn(1, 12, dtype=torch.float64), torch.randn(1, 128, 3, dtype=torch.float64)
         before = copy.deepcopy(wm.state_dict())
         def objective(a):
-            _, O1, logits = wm.step(S, O, a, xi, xio, points)
+            _, O1, logits = wm.step(S, O, a, xi, xio, points, points.new_zeros(1,26))
             return O1[0].square().sum() + torch.sigmoid(logits).sum() * .1
         with frozen_parameters(wm):
             value = objective(action)
@@ -236,8 +236,8 @@ class NetworksTest(unittest.TestCase):
 
     def test_critic_pointnet_receives_value_loss_gradients(self):
         _, _, v = modules()
-        features = [torch.randn(3, d).detach() for d in (914, 190, 15, 15, 12, 4)]
-        value = v(*features, torch.randn(3, 128, 3).detach())
+        features = [torch.randn(3, d).detach() for d in (914, 470, 15, 15, 12, 32)]
+        value = v(*features, torch.zeros(3,26), torch.randn(3, 128, 3).detach())
         value.square().mean().backward()
         self.assertGreater(sum(p.grad.abs().sum().item() for p in v.shape_encoder.parameters() if p.grad is not None), 0)
 
@@ -245,16 +245,16 @@ class NetworksTest(unittest.TestCase):
         policy = Policy(hidden=(32, 16), object_hidden=(16,)).double()
         reused = copy.deepcopy(policy)
         robot, obj = torch.randn(2, 10, 99, dtype=torch.float64), torch.randn(2, 10, 18, dtype=torch.float64)
-        hg, og, points = torch.randn(2, 730, dtype=torch.float64), torch.randn(2, 190, dtype=torch.float64), torch.randn(2, 128, 3, dtype=torch.float64)
+        hg, og, points = torch.randn(2, 730, dtype=torch.float64), torch.randn(2, 470, dtype=torch.float64), torch.randn(2, 128, 3, dtype=torch.float64)
         robot_map = torch.randn(29, 99, dtype=torch.float64) * .01
         object_map = torch.randn(29, 18, dtype=torch.float64) * .01
-        goal_map = torch.randn(29, 190, dtype=torch.float64) * .01
+        goal_map = torch.randn(29, 470, dtype=torch.float64) * .01
         def objective(actor, use_reuse):
             r, o, goal = robot.clone(), obj.clone(), og.clone()
             encoded = actor.shape_encoder(points) if use_reuse else None
             result = torch.zeros((), dtype=torch.float64)
             for tick in range(4):
-                action = actor(r, hg, o, goal, points, shape_embedding=encoded)
+                action = actor(r, hg, o, goal, points, scene_context=points.new_zeros(2,26), shape_embedding=encoded)
                 # A differentiable feedback rollout makes later observations
                 # depend on earlier actions; the cache stays on this one graph.
                 r = torch.cat((r[:, 1:], (.99 * r[:, -1] + action @ robot_map)[:, None]), 1)
@@ -273,9 +273,9 @@ class NetworksTest(unittest.TestCase):
             torch.testing.assert_close(first.grad, second.grad, atol=1e-10, rtol=1e-7, msg=name)
         self.assertGreater(sum(float(p.grad.abs().sum()) for p in reused.shape_encoder.parameters()), 0)
         with self.assertRaisesRegex(ValueError, "64 features"):
-            reused(robot, hg, obj, og, points, shape_embedding=torch.zeros(2, 63))
+            reused(robot, hg, obj, og, points, scene_context=points.new_zeros(2,26), shape_embedding=torch.zeros(2, 63))
         with self.assertRaisesRegex(ValueError, "batch"):
-            reused(robot, hg, obj, og, points, shape_embedding=torch.zeros(3, 64))
+            reused(robot, hg, obj, og, points, scene_context=points.new_zeros(2,26), shape_embedding=torch.zeros(3, 64))
 
     def test_terminal_mask_contact_validity_and_loss(self):
         _, wm, _ = modules()
@@ -284,7 +284,9 @@ class NetworksTest(unittest.TestCase):
         O = tuple(x[:, None].expand((2, 2) + x.shape[1:]) for x in O)
         O_bad = tuple(x + .01 if i != 1 else x for i, x in enumerate(O))
         logits = torch.zeros(2, 2, len(CHANNELS), requires_grad=True)
-        valid = torch.tensor([[[1., 0., 0., 0., 0.], [0., 0., 0., 0., 0.]], [[1., 1., 1., 1., 1.], [1., 1., 1., 1., 1.]]])
+        valid = torch.ones_like(logits)
+        valid[0] = 0
+        valid[0, 0, 0] = 1
         mask = torch.tensor([[1., 0.], [1., 0.]])
         losses = wm.loss(S, O_bad, S, O, logits, torch.zeros_like(logits), valid, mask)
         torch.testing.assert_close(losses["contact"], torch.tensor(.6931472))
@@ -325,38 +327,49 @@ class NetworksTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             load_checkpoint(checkpoint, pi, altered_eps, critic, physics=PHYSICS, data_identity=DATA)
 
-    def test_feet_supervision_reaches_each_head_row_and_shared_dynamics_features(self):
+    def test_region_supervision_reaches_each_head_row_and_shared_dynamics_features(self):
         _, wm, _ = modules()
         S, O = states(2)
         S1, O1, logits = wm.step(S, O, torch.randn(2, 29), torch.randn(2, 33),
-                                  torch.randn(2, 12), torch.randn(2, 128, 3))
-        self.assertEqual(CHANNELS, ("left_hand_object", "right_hand_object", "object_ground",
-                                    "left_foot_object", "right_foot_object"))
-        self.assertEqual(logits.shape, (2, 5))
-        # Two distinct executed labels: left kick then right kick. Only the
-        # feet are supervised here, so old channels cannot create this gradient.
-        targets = torch.tensor([[0., 0., 0., 1., 0.], [0., 0., 0., 0., 1.]])
-        valid = torch.tensor([[0, 0, 0, 1, 1]], dtype=torch.bool).expand(2, -1)
-        loss = wm.loss(S1, O1, S1, O1, logits, targets, valid, torch.ones(2),
-                       pos_weight=torch.tensor([1., 1., 1., 3., 7.]))["contact"]
+                                  torch.randn(2, 12), torch.randn(2, 128, 3), torch.zeros(2,26))
+        self.assertEqual(len(CHANNELS), 16)
+        self.assertEqual(logits.shape, (2, 16))
+        feet = [CHANNELS.index(name) for name in ("left_foot_object", "right_foot_object")]
+        targets = torch.zeros_like(logits)
+        targets[0, feet[0]], targets[1, feet[1]] = 1, 1
+        valid = torch.zeros_like(logits, dtype=torch.bool)
+        valid[:, feet] = True
+        loss = wm.loss(S1, O1, S1, O1, logits, targets, valid, torch.ones(2))["contact"]
         logits.retain_grad()
         loss.backward()
-        self.assertTrue(bool((logits.grad[:, 3:] * (1 - 2 * targets[:, 3:]) > 0).all()))
-        self.assertEqual(float(logits.grad[:, :3].abs().sum()), 0.)
-        self.assertTrue(bool((wm.contact_head[-1].weight.grad[3:].abs().sum(-1) > 0).all()))
-        self.assertEqual(float(wm.contact_head[-1].weight.grad[:3].abs().sum()), 0.)
+        self.assertTrue(bool((logits.grad[:, feet] * (1 - 2 * targets[:, feet]) > 0).all()))
+        self.assertEqual(float(logits.grad[~valid].abs().sum()), 0.)
+        self.assertTrue(bool((wm.contact_head[-1].weight.grad[feet].abs().sum(-1) > 0).all()))
         self.assertGreater(float(wm.net[0].weight.grad.abs().sum()), 0.)
         self.assertGreater(sum(float(p.grad.abs().sum()) for p in wm.shape_encoder.parameters() if p.grad is not None), 0.)
-        # Invalid labels do not contribute, even for a foot-positive target.
         wm.zero_grad(set_to_none=True)
-        independent = torch.zeros(2, 5, requires_grad=True)
-        valid = valid.clone()
-        valid[:, 3] = False
+        independent = torch.zeros(2, 16, requires_grad=True)
+        valid[:, feet[0]] = False
+        targets[~valid] = float("nan")
         wm.loss(S1, O1, S1, O1, independent, targets, valid, torch.ones(2))["contact"].backward()
-        self.assertEqual(float(independent.grad[:, 3].abs().sum()), 0.)
-        self.assertGreater(float(independent.grad[:, 4].abs().sum()), 0.)
-        with self.assertRaisesRegex(ValueError, "dimension 5"):
-            wm.loss(S1, O1, S1, O1, independent[:, :3], targets[:, :3], valid[:, :3], torch.ones(2))
+        self.assertEqual(float(independent.grad[~valid].abs().sum()), 0.)
+        self.assertGreater(float(independent.grad[:, feet[1]].abs().sum()), 0.)
+        with self.assertRaisesRegex(ValueError, "dimension 16"):
+            wm.loss(S1, O1, S1, O1, independent[:, :5], targets[:, :5], valid[:, :5], torch.ones(2))
+
+    def test_plain_masked_bce_has_symmetric_positive_negative_gradients(self):
+        _, wm, _ = modules()
+        S, O = states(2)
+        logits = torch.zeros(2, len(CHANNELS), requires_grad=True)
+        targets = torch.zeros_like(logits)
+        targets[0, 0] = 1
+        valid = torch.ones_like(logits, dtype=torch.bool)
+        loss = wm.loss(S, O, S, O, logits, targets, valid, torch.ones(2))["contact"]
+        loss.backward()
+        self.assertAlmostEqual(float(logits.grad[0, 0]), -float(logits.grad[0, 1]))
+        self.assertAlmostEqual(float(loss), float(torch.log(torch.tensor(2.))))
+        with self.assertRaises(TypeError):
+            wm.loss(S, O, S, O, logits, targets, valid, torch.ones(2), pos_weight=torch.ones(16))
 
     def test_three_channel_hoi_checkpoint_is_rejected_before_any_mutation(self):
         models = modules()
@@ -374,11 +387,22 @@ class NetworksTest(unittest.TestCase):
             key = "contact_head." + last + "." + field
             old["wm"][key] = old["wm"][key][:3].clone()
         before = [copy.deepcopy(model.state_dict()) for model in models]
-        with self.assertRaisesRegex(ValueError, "old three-channel HOI checkpoints"):
+        with self.assertRaisesRegex(ValueError, "old scene-less or three/five-channel HOI checkpoints"):
             load_checkpoint(old, *models, optimizers, physics=PHYSICS, data_identity=DATA)
         for model, state in zip(models, before):
             for name, value in model.state_dict().items():
                 torch.testing.assert_close(value, state[name], rtol=0, atol=0)
+
+    def test_old_five_channel_checkpoint_is_rejected(self):
+        models = modules()
+        optimizers = {key: torch.optim.Adam(model.parameters()) for key, model in zip(("pi", "wm", "critic"), models)}
+        checkpoint = make_checkpoint(*models, optimizers, iteration=0, physics=PHYSICS,
+                                     data_identity=DATA, initialization={"kind": "fresh"})
+        checkpoint["schema_version"] = "supermimic_hoi_v1_checkpoint_1"
+        checkpoint["feature_schema"]["version"] = "supermimic_hoi_v1_full_reference_2"
+        checkpoint["feature_schema"]["contact"] = ["left_hand_object", "right_hand_object", "object_ground", "left_foot_object", "right_foot_object"]
+        with self.assertRaisesRegex(ValueError, "16-channel"):
+            load_checkpoint(checkpoint, *models, optimizers, physics=PHYSICS, data_identity=DATA)
 
     def test_legacy_unknown_physics_and_no_critic(self):
         lpi, lwm, _ = legacy_models()

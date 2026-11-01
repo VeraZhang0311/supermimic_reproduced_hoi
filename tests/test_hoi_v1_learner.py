@@ -74,7 +74,7 @@ def reference_fixture():
         obj = {"pos": p + torch.tensor([.3, 0., .1]), "rot": R.clone(), "derived_ref_v": velocity.clone(),
                "derived_ref_omega": zero.clone()}
         clips.append({"asset_id": asset, "name": f"synthetic_{asset}", "reference": {"robot": robot, "object": obj},
-                      "expected_contact": torch.ones(n, 2), "expected_valid": torch.ones(n, 2)})
+                      "expected_contact": torch.ones(n, len(CHANNELS)), "expected_valid": torch.ones(n, len(CHANNELS))})
     motion = TrainingMotionBank(clips, kin)
     mdp = HOIMDP(kin, motion, torch.zeros(29), shapes)
     return motion, mdp, shapes
@@ -138,9 +138,12 @@ class ReplayTest(unittest.TestCase):
     def test_replay_preserves_distinct_feet_and_rejects_legacy_contact_shapes(self):
         learner = make_learner()
         item = transition(learner, [70, 80], 0)
-        item["contact"] = torch.tensor([[0., 0., 0., 1., 0.], [0., 0., 1., 0., 1.]])
-        item["impulse"] = torch.tensor([[0., 0., 0., .03, 0.], [0., 0., .04, 0., .05]])
-        item["contact_valid"][1, 3] = False
+        item["contact"].zero_()
+        item["contact"][0, CHANNELS.index("left_foot_object")] = 1
+        item["contact"][1, CHANNELS.index("right_foot_object")] = 1
+        item["contact"][1, CHANNELS.index("object_ground")] = 1
+        item["impulse"] = item["contact"] * .03
+        item["contact_valid"][1, CHANNELS.index("left_foot_object")] = False
         learner.buffer.add(item)
         window = learner.buffer._windows_at(torch.tensor([0, 0]), torch.tensor([0, 1]), 1)
         for name in ("contact", "contact_valid", "impulse"):
@@ -217,24 +220,30 @@ class LearnerTest(unittest.TestCase):
         self.assertEqual(learner.sim_steps, 2)
         self.assertEqual(action.shape, (2, 29))
 
-    def test_feet_class_counts_use_only_valid_fit_labels_and_hand_reward_stays_fixed(self):
+    def test_region_class_counts_are_valid_fit_diagnostics_and_do_not_weight_bce(self):
         learner = make_learner()
         item = transition(learner, [0, 70], 0)
-        item["contact"] = torch.tensor([[1., 1., 1., 1., 1.], [0., 0., 0., 1., 0.]])
-        item["contact_valid"][1, 4] = False
+        foot = CHANNELS.index("left_foot_object")
+        ignored = CHANNELS.index("right_foot_object")
+        item["contact"][1].zero_()
+        item["contact"][1, foot] = 1
+        item["contact_valid"][1, ignored] = False
         learner.observe(item)
-        torch.testing.assert_close(learner.contact_positive, torch.tensor([0., 0., 0., 1., 0.], dtype=torch.float64))
-        torch.testing.assert_close(learner.contact_negative, torch.tensor([1., 1., 1., 0., 0.], dtype=torch.float64))
-        item = transition(learner, [71, 81], 1)
-        item["contact"] = torch.tensor([[0., 0., 0., 0., 1.], [0., 0., 0., 1., 0.]])
-        learner.observe(item)
-        torch.testing.assert_close(learner.contact_positive, torch.tensor([0., 0., 0., 2., 1.], dtype=torch.float64))
-        torch.testing.assert_close(learner.contact_negative, torch.tensor([3., 3., 3., 1., 1.], dtype=torch.float64))
+        positive = torch.zeros(len(CHANNELS), dtype=torch.float64)
+        positive[foot] = 1
+        negative = torch.ones_like(positive)
+        negative[[foot, ignored]] = 0
+        torch.testing.assert_close(learner.contact_positive, positive)
+        torch.testing.assert_close(learner.contact_negative, negative)
+        fill(learner)
+        learner.contact_positive.fill_(1)
+        learner.contact_negative.fill_(1000000)
+        with patch.object(learner.wm, "loss", wraps=learner.wm.loss) as loss:
+            learner.wm_update()
+        self.assertNotIn("pos_weight", loss.call_args.kwargs)
         S, O = unflatten_state(item["s1"]), unflatten_object(item["o1"])
-        frames = item["f"] + 1
-        hands_only = learner.mdp.reward(S, O, frames, item["a"], item["a_prev"], item["contact"][:, :3])
-        with_feet = learner.mdp.reward(S, O, frames, item["a"], item["a_prev"], item["contact"])
-        torch.testing.assert_close(hands_only, with_feet, rtol=0, atol=0)
+        with self.assertRaisesRegex(ValueError, "16 region"):
+            learner.mdp.reward(S, O, item["f"] + 1, item["a"], item["a_prev"], item["contact"][:, :5])
 
     def test_eight_step_wm_fit_uses_executed_actions_and_changes_parameters(self):
         learner = make_learner()

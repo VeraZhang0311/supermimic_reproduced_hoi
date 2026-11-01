@@ -14,6 +14,7 @@ import torch
 from torch import nn
 
 from hoi.v1.config import TrainConfig
+from hoi.v1.scene_context import empty_scene_state
 from hoi.v1.learner import Learner, _detach, _flatten, _stack
 from hoi.v1.networks import frozen_parameters
 from supermimic.mdp import normalize_xi
@@ -30,7 +31,8 @@ def full_batch_reference(learner, trajectory, start):
         f = torch.stack(trajectory["frames"]).flatten()
         expand = lambda value: value[None].expand((H + 1,) + value.shape).flatten(0, 1)
         arguments = learner._critic_args(S, O, f, expand(normalize_xi(start["xi"])),
-                                         expand(start["xi_o"]), expand(start["asset_id"]))
+                                         expand(start["xi_o"]), expand(start["asset_id"]),
+                                         expand(start["support_pose_xyzw"]), expand(start["support_present"]))
     learner.critic.update_normalizers(*arguments[:-1])
     with torch.no_grad():
         values = learner.critic(*arguments).reshape(H + 1, B)
@@ -148,7 +150,7 @@ class CriticTargetChunkingTests(unittest.TestCase):
             target_calls = [call for call in chunk_calls if not call["gradient_enabled"]]
             self.assertEqual([call["rows"] for call in target_calls], [4, 4, 4, 4, 2])
             self.assertEqual(sum(call["rows"] for call in target_calls), (H + 1) * B)
-            for feature_index in range(7):
+            for feature_index in range(8):
                 reconstructed = torch.cat([call["arguments"][feature_index] for call in target_calls])
                 torch.testing.assert_close(reconstructed, full_calls[0]["arguments"][feature_index], rtol=0, atol=0)
             chunk_values = torch.cat([call["value"] for call in target_calls]).reshape(H + 1, B)
@@ -196,13 +198,14 @@ class CriticTargetChunkingTests(unittest.TestCase):
         learner.optimizers = {"critic": torch.optim.Adam(learner.critic.parameters(), lr=learner.config.lr)}
         H, B = learner.config.horizon, learner.config.pi_batch
         rows = torch.arange((H + 1) * B).float()[:, None] / ((H + 1) * B)
-        learner._critic_args = MethodType(lambda self, *args: (rows,) * 7, learner)
+        learner._critic_args = MethodType(lambda self, *args: (rows,) * 8, learner)
         trajectory = {"states": [(torch.full((B, 1), float(tick)),) for tick in range(H + 1)],
                       "objects": [(torch.zeros(B, 1),) for _ in range(H + 1)],
                       "frames": [torch.full((B,), tick) for tick in range(H + 1)],
                       "reward": torch.full((H, B), .1), "failure": torch.zeros(H, B)}
         start = {"f": torch.zeros(B, dtype=torch.long), "xi": torch.ones(B, 33),
                  "xi_o": torch.ones(B, 12), "asset_id": torch.zeros(B, dtype=torch.long)}
+        start.update(empty_scene_state((B,)))
         loss = learner.critic_update(trajectory, start)
         self.assertTrue(torch.isfinite(torch.tensor(loss)))
         self.assertEqual(learner.critic.normalizer_rows, [135168])

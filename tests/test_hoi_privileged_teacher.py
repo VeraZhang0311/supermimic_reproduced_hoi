@@ -93,10 +93,29 @@ class PrivilegedTeacherTests(unittest.TestCase):
         S, O = unflatten_state(sample["s"]), unflatten_object(sample["o"])
         build = lambda: learner.mdp.privileged_features(S, O, sample["f"], sample["a_prev"], sample["xi"], sample["xi_o"], S)
         features = build()
-        self.assertTrue(bool((features[:, -8:] == 0).all()))
+        self.assertTrue(bool((features[:, -64:] == 0).all()))
         learner.motion.q[180:195] += 10
         learner.motion.object_p[180:195] += 10
         torch.testing.assert_close(build(), features)
+
+    def test_all_region_targets_and_validity_reach_teacher_and_dense_goals(self):
+        learner = teacher_learner()
+        sample = transition(learner, [10, 70], 0)
+        S, O = unflatten_state(sample["s"]), unflatten_object(sample["o"])
+        build = lambda: learner.mdp.privileged_features(S, O, sample["f"], sample["a_prev"], sample["xi"], sample["xi_o"], S)
+        before = build()
+        target = sample["f"] + 1
+        # Pelvis and head were unavailable in the old two-hand goal.
+        learner.motion.expected_contact[target, 7] = 0
+        learner.motion.expected_valid[target, 14] = 0
+        after = build()
+        intents = after[:, -64:].reshape(2, 2, 2, 16)
+        self.assertTrue(bool((intents[:, 0, 0, 7] == 0).all()))
+        self.assertTrue(bool((intents[:, 0, :, 14] == 0).all()))
+        self.assertGreater(float((before - after).abs().sum()), 0.)
+        goal = learner.motion.object_goal(S, O, sample["f"]).reshape(2, 10, 47)
+        torch.testing.assert_close(goal[:, 0, 15:31], intents[:, 0, 0])
+        torch.testing.assert_close(goal[:, 0, 31:47], intents[:, 0, 1])
 
     def test_teacher_bypasses_sensor_noise_and_only_real_collection_updates_stats(self):
         learner = teacher_learner()

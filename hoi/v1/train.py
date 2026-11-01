@@ -196,7 +196,7 @@ def main(argv=None):
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--robot-mjcf")
     parser.add_argument("--max-processes", type=int)
-    parser.add_argument("--eval-bundle", type=Path, help="complete canonical HOI80 bundle for every 5000-iteration frozen evaluation")
+    parser.add_argument("--eval-bundle", type=Path, help="complete protected_eval (curated) or canonical HOI80 bundle for every 5000-iteration frozen evaluation")
     parser.add_argument("--evaluation-runtime", help="read-only runtime for independent evaluation Slurm jobs")
     parser.add_argument("--evaluation-isaaclab", help="read-only IsaacLab path for evaluation")
     parser.add_argument("--evaluation-launcher", type=Path, default=Path(__file__).resolve().parents[2] / "cluster/hoi_v1_evaluate.sbatch.sh")
@@ -234,11 +234,13 @@ def main(argv=None):
         evaluation_header = _read_bundle_header(args.eval_bundle)
         validate_canonical80(bundle, evaluation_header)
     elif config.iterations >= config.eval_every:
-        raise ValueError("--eval-bundle is required for automatic full HOI80 evaluation")
+        raise ValueError("--eval-bundle is required for automatic full protected evaluation")
     required_assets = sorted({entry["asset_id"] for entry in bundle["clips"]})
+    expected_asset_profiles = {int(asset["asset_id"]): asset["physical_profile"] for asset in bundle["assets"]}
     native = validate_native_evidence(args.native_evidence, expected_physics=physics,
                                       required_asset_ids=required_assets,
-                                      expected_bundle_sha256=bundle["bundle_content_sha256"]) if args.native_evidence else {
+                                      expected_bundle_sha256=bundle["bundle_content_sha256"],
+                                      expected_asset_profiles=expected_asset_profiles) if args.native_evidence else {
                                           "passed": False, "blockers": ["--native-evidence is required"]}
     output = fresh_directory(args.output)
     identity = bundle_identity(bundle)
@@ -258,7 +260,7 @@ def main(argv=None):
     plan["periodic_evaluation"] = {"every_iterations": config.eval_every, "checkpoint_every": config.ckpt_every,
                                    "bundle": str(args.eval_bundle.resolve()) if args.eval_bundle else None,
                                    "bundle_content_sha256": evaluation_header["bundle_content_sha256"] if evaluation_header else None,
-                                   "case_count": 80, "frozen": True, "independent_gpu_job": True}
+                                   "case_count": len(evaluation_header["clips"]) if evaluation_header else None, "frozen": True, "independent_gpu_job": True}
     import os
     from .track import destination, _base_url
     tracking_enabled = os.environ.get("WANDB_SYNC", "0")
@@ -282,7 +284,8 @@ def main(argv=None):
         return plan
     require_native_evidence(args.native_evidence, expected_physics=physics,
                    required_asset_ids=required_assets,
-                   expected_bundle_sha256=bundle["bundle_content_sha256"])
+                   expected_bundle_sha256=bundle["bundle_content_sha256"],
+                                      expected_asset_profiles=expected_asset_profiles)
     if not str(args.device).startswith("cuda") or not torch.cuda.is_available():
         raise ValueError("native HOI training requires the prepared Linux GPU runtime")
     torch.manual_seed(config.seed)

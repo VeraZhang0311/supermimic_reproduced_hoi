@@ -19,7 +19,7 @@ import uuid
 import torch
 
 from hoi.data.manifest import read_manifest, sha256_file
-from .checkpoint import CHECKPOINT_SCHEMA, checkpoint_variant
+from .checkpoint import CHECKPOINT_SCHEMA, checkpoint_variant, validate_checkpoint_features
 from .config import bundle_identity, json_identity, source_identity, write_json
 from .evaluate import _read_bundle_header, validate_evaluation_identity
 from .networks import FEATURE_SCHEMA
@@ -34,6 +34,18 @@ SCHEDULER_CLIENT_ENVIRONMENT = ("PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_A
 def validate_canonical80(training_header, evaluation_header):
     """Check exact held-out identities and duration, not just an 80-row count."""
     validate_evaluation_identity(training_header, evaluation_header)
+    if evaluation_header.get("partition") == "protected_eval":
+        from hoi.data.curated import read_split
+        _, partitions = read_split(evaluation_header["manifest"]["path"])
+        rows = partitions["protected_eval"]
+        actual = evaluation_header.get("clips", ())
+        expected_ids = {(r["dataset"], r["clip_id"]) for r in rows}
+        actual_ids = {(r["dataset"], r["clip_id"]) for r in actual}
+        scope = evaluation_header.get("scope", {})
+        if (actual_ids != expected_ids or len(actual) != len(rows) or scope.get("is_subset") is not False
+                or scope.get("selected_motions") != len(rows) or scope.get("available_motions") != len(rows)):
+            raise ValueError("periodic evaluation requires the complete frozen protected_eval partition")
+        return True
     scope = evaluation_header.get("scope", {})
     if (evaluation_header.get("partition") != "eval80" or scope.get("is_subset") is not False or
             scope.get("available_motions") != 80 or scope.get("selected_motions") != 80 or
@@ -99,8 +111,9 @@ def _checkpoint(path, iteration, training_header):
     digest = hashlib.sha256(raw).hexdigest()
     checkpoint = torch.load(io.BytesIO(raw), map_location="cpu", weights_only=False)
     if (not isinstance(checkpoint, dict) or checkpoint.get("schema_version") != CHECKPOINT_SCHEMA or
-            checkpoint.get("feature_schema") != FEATURE_SCHEMA or checkpoint.get("iteration") != iteration):
+            checkpoint.get("iteration") != iteration):
         raise ValueError("evaluation checkpoint schema, features or iteration differ")
+    validate_checkpoint_features(checkpoint)
     physics = checkpoint.get("physics", {})
     if physics.get("hand_collision") is not True or physics.get("self_collision") is not True:
         raise ValueError("v1 periodic evaluation requires checkpoint hand ON and self ON")
@@ -143,7 +156,7 @@ def verify_dispatch(path):
             training_header["bundle_content_sha256"] != request["training_bundle"]["content_sha256"] or
             evaluation_header["bundle_content_sha256"] != request["evaluation_bundle"]["content_sha256"]):
         raise ValueError("frozen checkpoint/source/bundle contracts changed after dispatch")
-    if request["protocol"] != {"partition": "eval80", "cases": 80, "full_duration": True,
+    if request["protocol"] != {"partition": evaluation_header["partition"], "cases": len(evaluation_header["clips"]), "full_duration": True,
                                "optimizer_updates": 0, "normalization_updates": 0,
                                "no_failure_reset": True, "independent_gpu_job": True}:
         raise ValueError("evaluation dispatch full-duration frozen protocol differs")
@@ -194,7 +207,7 @@ def schedule_evaluation(checkpoint_path, iteration, training_bundle, eval_bundle
             "source_content_sha256": source_sha, "physics": physics, "variant": variant,
             "launcher": {"path": str(launcher_path), "sha256": sha256_file(launcher_path)},
             "environment": runtime, "output": str(directory / "results"),
-            "protocol": {"partition": "eval80", "cases": 80, "full_duration": True,
+            "protocol": {"partition": evaluation_header["partition"], "cases": len(evaluation_header["clips"]), "full_duration": True,
                          "optimizer_updates": 0, "normalization_updates": 0,
                          "no_failure_reset": True, "independent_gpu_job": True},
             "tracking": {"entity": tracking["WANDB_ENTITY"], "project": tracking["WANDB_PROJECT"],

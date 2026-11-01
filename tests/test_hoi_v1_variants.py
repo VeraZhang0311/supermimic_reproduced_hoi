@@ -6,6 +6,7 @@ import unittest
 import torch
 
 from hoi.v1.config import TrainConfig
+from hoi.v1.contacts import CHANNELS
 from hoi.v1.train import read_config
 from hoi.v1.variants import geometry_input_enabled, max_step_reward, reward_config
 from tests.test_hoi_v1_learner import make_learner, transition
@@ -40,11 +41,20 @@ class VariantTests(unittest.TestCase):
             learner = make_learner()
             tr = transition(learner, [0, 70], 0)
             S, O, f = unflatten_state(tr['s1']), unflatten_object(tr['o1']), tr['f'] + 1
-            actual = torch.zeros(2, 3)
+            # Exercise both a net positive match and a net contact penalty,
+            # with one unknown region that must not affect either objective.
+            learner.motion.expected_contact[f] = 0
+            learner.motion.expected_contact[f, CHANNELS.index("pelvis_object")] = 1
+            learner.motion.expected_valid[f] = 1
+            learner.motion.expected_valid[f, CHANNELS.index("head_object")] = 0
+            actual = torch.stack((torch.full((len(CHANNELS),), .2), torch.full((len(CHANNELS),), .7)))
+            actual[:, CHANNELS.index("pelvis_object")] = torch.tensor([.8, .1])
+            actual[:, CHANNELS.index("head_object")] = .99
             full, terms = learner.mdp.reward(S, O, f, tr['a'], tr['a_prev'], actual, terms=True)
             learner.mdp.cfg = reward_config('no_contact_objective')
             ablated, ablated_terms = learner.mdp.reward(S, O, f, tr['a'], tr['a_prev'], actual, terms=True)
             torch.testing.assert_close(full - ablated, terms['contact_match'] * .25)
+            torch.testing.assert_close(terms['contact_match'], torch.tensor([.6, -.6]) * .02)
             for name in ('human_reward', 'object_position', 'object_orientation', 'hand_approach'):
                 torch.testing.assert_close(terms[name], ablated_terms[name])
         finally:

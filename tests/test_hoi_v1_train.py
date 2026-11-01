@@ -31,7 +31,7 @@ DATA_ID = {"scope": "synthetic_CPU_orchestration_only", "frozen_identity": "test
 def scripted_wm_report(passed):
     metric = {"valid_samples": 20, "object_normalized_error": .1 if passed else .8,
               "zero_increment_normalized_error": .5, "constant_velocity_normalized_error": .4}
-    return {"finite": True, "scope": "training_reference_bins_reserved_from_wm_fit_not_eval80_or_test40", "real_executed_actions": True,
+    return {"finite": True, "scope": "training_reference_bins_reserved_from_wm_fit_not_protected_eval", "real_executed_actions": True,
             "horizon_reports": {str(k): {**metric, "phases": {p: dict(metric) for p in ("no_contact", "contact", "onset", "release")}}
                                 for k in (1,8,32)},
             "contact_diagnostics": {"channels": list(CHANNELS), "positive_counts": [20]*len(CHANNELS), "negative_counts": [20]*len(CHANNELS), "precision": [.8]*len(CHANNELS),
@@ -236,13 +236,18 @@ class TrainingFlowTests(unittest.TestCase):
         value["xi_o"][0] = 100
         value["contact"][0] = 1
         value["contact"][1] = 0
+        from hoi.v1.scene_context import scene_context
+        value["support_present"][:,0]=True
+        value["support_pose_xyzw"][:,0,6]=1
+        value["support_pose_xyzw"][:,0,0]=torch.tensor([100.,3.])
         expected = deepcopy(learner.wm)
         ids = torch.tensor([1])
         expected.update_normalizers(unflatten_state(value["s"][ids]), unflatten_object(value["o"][ids]), value["a"][ids],
                                     normalize_xi(value["xi"][ids]), value["xi_o"][ids], learner.shapes.points(value["asset_id"][ids]),
-                                    unflatten_state(value["s1"][ids]), unflatten_object(value["o1"][ids]))
+                                    unflatten_state(value["s1"][ids]), unflatten_object(value["o1"][ids]),
+                                    scene_context(unflatten_state(value["s"][ids]),value["support_pose_xyzw"][ids],value["support_present"][ids]))
         learner.observe(value)
-        for name in ("in_norm", "out_norm", "object_in_norm", "object_out_norm"):
+        for name in ("in_norm", "out_norm", "object_in_norm", "object_out_norm", "scene_norm"):
             for key, tensor in getattr(expected, name).state_dict().items():
                 torch.testing.assert_close(getattr(learner.wm, name).state_dict()[key], tensor, rtol=0, atol=0)
         torch.testing.assert_close(learner.contact_positive, torch.zeros(len(CHANNELS), dtype=torch.float64))
@@ -268,7 +273,7 @@ class TrainingFlowTests(unittest.TestCase):
         path = self.root / "old_three_channel.pt"
         torch.save(old, path)
         output = self.root / "preflight_old_resume"
-        with self.assertRaisesRegex(ValueError, "old three-channel HOI checkpoints"):
+        with self.assertRaisesRegex(ValueError, "old scene-less or three/five-channel HOI checkpoints"):
             main(["--bundle", str(self.root / "unused.json"), "--output", str(output),
                   "--resume", str(path), "--preflight"])
         self.assertFalse(output.exists())

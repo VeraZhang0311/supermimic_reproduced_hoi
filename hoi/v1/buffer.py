@@ -7,6 +7,7 @@ from .contacts import CHANNELS
 
 
 FIELDS = {
+    "support_pose_xyzw": ((2,7), torch.float32), "support_present": ((2,), torch.bool),
     "s": (71, torch.float32), "s1": (71, torch.float32),
     "o": (13, torch.float32), "o1": (13, torch.float32),
     "a": (29, torch.float32), "a_prev": (29, torch.float32),
@@ -16,7 +17,7 @@ FIELDS = {
     "done": ((), torch.bool), "term": ((), torch.bool), "asset_id": ((), torch.long),
     "failure_reason": ((), torch.int32),
     "contact": (len(CHANNELS), torch.float32), "contact_valid": (len(CHANNELS), torch.bool),
-    "impulse": (len(CHANNELS), torch.float32), "contact_missing_counter": (2, torch.int32),
+    "impulse": (len(CHANNELS), torch.float32), "contact_missing_counter": (len(CHANNELS), torch.int32),
 }
 
 
@@ -40,6 +41,8 @@ class ReplayBuffer:
                 raise ValueError(f"wrong {key} shape: {tuple(transition[key].shape)} != {expected}")
             if transition[key].is_floating_point() and not bool(torch.isfinite(transition[key]).all()):
                 raise ValueError(f"nonfinite real transition: {key}")
+        from .scene_context import validate_scene_state
+        validate_scene_state(transition["support_pose_xyzw"],transition["support_present"],(self.N,))
         if not bool(((transition["contact"] == 0) | (transition["contact"] == 1)).all()):
             raise ValueError("real pair-contact labels must be binary")
         if bool((transition["impulse"] < 0).any()):
@@ -167,7 +170,7 @@ class ReplayBuffer:
             back = torch.minimum(back[None], usable[:, None])
             hrows = self._row(ages[:, None] - back)
             henv = env[:, None].expand_as(hrows)
-            keys = ("s", "o", "a_prev", "xi", "xi_o", "f", "asset_id", "contact_missing_counter")
+            keys = ("s", "o", "a_prev", "xi", "xi_o", "f", "asset_id", "contact_missing_counter", "support_pose_xyzw", "support_present")
             starts.append({key: self.data[key][rows, env] for key in keys})
             histories.append({key: self.data[key][hrows, henv] for key in keys})
             remaining -= len(ids)

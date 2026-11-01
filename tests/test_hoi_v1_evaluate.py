@@ -12,6 +12,7 @@ import torch
 from hoi.data.manifest import sha256_file
 from hoi.v1.evaluate import evaluate_group, validate_evaluation_identity, _load_fk39, _validate_contact_contract
 from hoi.v1.contacts import CHANNELS, LABEL_SCHEMA
+from hoi.v1.scene_context import empty_scene_state
 from hoi.v1.motion import TrainingMotionBank
 from hoi.v1.mdp import HOIMDP
 from hoi.v1.networks import Policy
@@ -23,6 +24,12 @@ class Synthetic39Kinematics:
     """Explicit 39 bodies, distinct from the reward fixture's 14 bodies."""
     body_names = [f"link_{i}" for i in range(39)]
     dof_names = [f"joint_{i}" for i in range(29)]
+
+    def __init__(self):
+        # Each synthetic fixture owns its names; diagnostic edits cannot leak
+        # into a later evaluation fixture through mutable class attributes.
+        self.body_names = list(type(self).body_names)
+        self.dof_names = list(type(self).dof_names)
 
     def forward(self, root, q, qd, root_velocity_is_com=False):
         assert root_velocity_is_com is False
@@ -56,7 +63,7 @@ def fixture():
         source[:, 84:201] = body["body_pos"].flatten(-2)
         source[:, 201:357] = body["body_rot"].flatten(-2)
         clips.append({"name": f"synthetic_{clip_id}", "asset_id": 0, "reference": {"robot": robot, "object": obj, "source_sampled": source},
-                      "expected_contact": torch.ones(n, 2), "expected_valid": torch.ones(n, 2),
+                      "expected_contact": torch.cat((torch.ones(n, 2), torch.zeros(n, len(CHANNELS)-2)), -1), "expected_valid": torch.cat((torch.ones(n, 2), torch.zeros(n, len(CHANNELS)-2)), -1),
                       "provenance": {"scope": "synthetic_CPU_test"}})
     motion = TrainingMotionBank(clips, kin, partition="eval80")
     mdp = HOIMDP(kin, motion, torch.zeros(29), shapes)
@@ -82,7 +89,9 @@ class SyntheticWorkers:
         self.value = {"s": flatten_state(self.motion.ref_state(starts)), "o": flatten_object(self.motion.ref_object(starts)),
                       "f": starts.clone(), "a_prev": torch.zeros(2, 29), "xi": xi, "xi_o": xio,
                       "ep_step": torch.zeros(2, dtype=torch.long), "asset_id": torch.zeros(2, dtype=torch.long),
-                      "contact_missing_counter": torch.zeros(2, 2, dtype=torch.long)}
+                      "contact_missing_counter": torch.zeros(2, len(CHANNELS), dtype=torch.long)}
+        self.value.update(empty_scene_state((2,)))
+        self.value["reference_support_pose_xyzw"] = self.value["support_pose_xyzw"].clone()
         return self.snapshot()
 
     def snapshot(self):
@@ -191,9 +200,9 @@ class EvaluationTest(unittest.TestCase):
                 self.assertEqual(raw["states"]["reference_source630"].shape, (T + 1, 630))
                 self.assertEqual(raw["control"]["action"].shape, (T, 29))
                 self.assertEqual(raw["control"]["robot_observation"].shape, (T, 99))
-                self.assertEqual(raw["control"]["object_goal"].shape, (T, 190))
+                self.assertEqual(raw["control"]["object_goal"].shape, (T, 470))
                 for key in ("actual_contact", "contact", "contact_valid", "contact_impulse_Ns", "contact_force_N"):
-                    self.assertEqual(raw["control"][key].shape, (T, 5))
+                    self.assertEqual(raw["control"][key].shape, (T, len(CHANNELS)))
                 self.assertEqual(raw["metadata"]["contact_channels"], list(CHANNELS))
                 self.assertEqual(raw["metadata"]["contact_label_schema"], LABEL_SCHEMA)
                 self.assertEqual(raw["time"].dtype, torch.float64)
@@ -204,8 +213,8 @@ class EvaluationTest(unittest.TestCase):
                 self.assertIsNone(raw["metadata"]["checkpoint_training_source_content_sha256"])
                 self.assertEqual(raw["metadata"]["checkpoint_training_source_identity_status"],"unknown")
                 self.assertEqual(raw["metadata"]["checkpoint_training_progress"]["stage"],"unknown")
-                self.assertEqual(cases[index]["contact"]["missing_contact_intervals"], [T, T])
-                self.assertEqual(cases[index]["contact"]["max_missing_streak_steps"], [T, T])
+                self.assertEqual(cases[index]["contact"]["missing_contact_intervals"], [T, T] + [0] * (len(CHANNELS)-2))
+                self.assertEqual(cases[index]["contact"]["max_missing_streak_steps"], [T, T] + [0] * (len(CHANNELS)-2))
                 human = raw["control"]["human_reward"]
                 self.assertAlmostEqual(cases[index]["supermimic_norm_return"], float(human[:1].sum() / (.1 * T)), places=6)
             self.assertTrue((output / "evaluation.json").is_file())
@@ -251,6 +260,58 @@ class EvaluationTest(unittest.TestCase):
                 self.assertEqual(case["human_normalized_return"], case["supermimic_norm_return"])
                 self.assertAlmostEqual(case["hoi_extra_full_duration_reward"], case["hoi_full_duration_reward"] - case["human_full_duration_reward"], places=6)
                 self.assertIsNone(case["contact"]["expected_contact_coverage"])
+
+    def test_curated_reference_without_ULTRA630_scores_direct_saved_FK(self):
+        policy, motion, mdp, shapes, fk, metadata = fixture()
+        motion.source_reference = None
+        motion.partition = "protected_eval"
+        fk.body_names = list(fk.body_names)
+        fk.body_names[28], fk.body_names[38] = "left_rubber_hand", "right_rubber_hand"
+        with tempfile.TemporaryDirectory() as temp:
+            cases = evaluate_group(policy, motion, mdp, shapes, SyntheticWorkers(motion, mdp, robot_drop=0., object_shift=0.),
+                [0, 1], fk39=fk, joint_names=fk.dof_names, output=Path(temp)/"curated", metadata=metadata, verify_tracked_fk=False)
+            for case in cases:
+                self.assertTrue(case["body_and_object_pose_pass"])
+                self.assertLess(case["body_position_m"]["max"], 1e-7)
+                self.assertLess(case["object_position_m"]["max"], 1e-7)
+                self.assertFalse(case["source_flag_comparison"]["available"])
+                saved = torch.load(case["rollout"], weights_only=True)
+                self.assertNotIn("reference_source630", saved["states"])
+                self.assertEqual(saved["states"]["reference_body_rot"].shape[1:], (39,4))
+                self.assertEqual(saved["metadata"]["timebase"]["control_hz"], 50)
+
+    def test_signed_contact_ceiling_is_zero_for_known_negative_only(self):
+        policy, motion, mdp, shapes, fk, metadata = fixture()
+        motion.expected_contact.zero_()
+        motion.expected_valid.fill_(1)
+        with tempfile.TemporaryDirectory() as temp:
+            cases=evaluate_group(policy,motion,mdp,shapes,SyntheticWorkers(motion,mdp),[0,1],
+                fk39=fk,joint_names=fk.dof_names,output=Path(temp)/"negative",metadata=metadata,verify_tracked_fk=False)
+            for case in cases:
+                self.assertAlmostEqual(case["hoi_reference_mask_reward_upper_bound"], .14*case["control_steps"], places=6)
+
+    def test_full_body_contact_metrics_include_known_feet_and_ignore_unknown(self):
+        from hoi.v1.evaluate import _contact_metrics
+        actual = torch.zeros(3,len(CHANNELS)); valid=torch.ones_like(actual,dtype=torch.bool)
+        expected=torch.zeros_like(actual); mask=torch.zeros_like(actual)
+        foot, pelvis = CHANNELS.index("right_foot_object"), CHANNELS.index("pelvis_object")
+        expected[:,foot]=1; mask[:,foot]=1
+        actual[1:,foot]=1
+        actual[:,pelvis]=1
+        metrics=_contact_metrics({"contact":actual,"contact_valid":valid,"contact_impulse_Ns":actual*.04},expected,mask)
+        self.assertEqual(metrics["missing_contact_intervals"][foot],1)
+        self.assertEqual(metrics["extra_contact_intervals"][pelvis],0)
+        self.assertAlmostEqual(metrics["expected_contact_coverage"],2/3)
+        mask[:,pelvis]=1
+        metrics=_contact_metrics({"contact":actual,"contact_valid":valid,"contact_impulse_Ns":actual*.04},expected,mask)
+        self.assertEqual(metrics["extra_contact_intervals"][pelvis],3)
+        self.assertFalse(metrics["all_known_expected_contact_matched"])
+        expected.zero_(); actual.zero_()
+        metrics=_contact_metrics({"contact":actual,"contact_valid":valid,"contact_impulse_Ns":actual*.04},expected,mask)
+        self.assertTrue(metrics["all_known_expected_contact_matched"])
+        actual[:,pelvis]=1
+        metrics=_contact_metrics({"contact":actual,"contact_valid":valid,"contact_impulse_Ns":actual*.04},expected,mask)
+        self.assertFalse(metrics["all_known_expected_contact_matched"])
 
     def test_existing_results_are_not_overwritten(self):
         policy, motion, mdp, shapes, fk, metadata = fixture()
@@ -334,15 +395,15 @@ class EvaluationTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 _validate_contact_contract({**report, **changed})
 
-    def test_feet_actual_events_and_counts_do_not_change_hand_truth_or_reward(self):
+    def test_unknown_feet_events_are_recorded_but_do_not_change_reward(self):
         class FootWorkers(SyntheticWorkers):
             def step(self, action):
                 result = super().step(action)
                 tick = self.steps - 1
-                result["contact"][:, 3] = (0, 1, 1, 0, 1, 0)[tick]
-                result["contact"][:, 4] = (1, 1, 0, 0, 1, 1)[tick]
-                result["contact_valid"][:, 3] = tick != 2
-                result["impulse"] = result["contact"] * torch.tensor([0., 0., 0., .04, .06])
+                result["contact"][:, CHANNELS.index("left_foot_object")] = (0, 1, 1, 0, 1, 0)[tick]
+                result["contact"][:, CHANNELS.index("right_foot_object")] = (1, 1, 0, 0, 1, 1)[tick]
+                result["contact_valid"][:, CHANNELS.index("left_foot_object")] = tick != 2
+                result["impulse"] = result["contact"] * torch.tensor([.04 if c == "left_foot_object" else .06 if c == "right_foot_object" else 0. for c in CHANNELS])
                 result["contact_force"] = result["impulse"] / .02
                 return result
         policy, motion, mdp, shapes, fk, metadata = fixture()
@@ -356,27 +417,27 @@ class EvaluationTest(unittest.TestCase):
                 for key in ("hoi_full_duration_reward", "hoi_reference_mask_reward_upper_bound", "hoi_normalized_return"):
                     self.assertEqual(old[key], new[key])
                 self.assertEqual(new["contact"]["missing_contact_intervals"], old["contact"]["missing_contact_intervals"])
-                self.assertEqual(len(new["contact"]["missing_contact_intervals"]), 2)
-                self.assertEqual(set(new["contact"]["expected_transition_events"]["channels"]), set(CHANNELS[:2]))
+                self.assertEqual(len(new["contact"]["missing_contact_intervals"]), len(CHANNELS))
+                self.assertEqual(set(new["contact"]["expected_transition_events"]["channels"]), set("object_ground_support" if c == "object_ground" else c for c in CHANNELS))
             contact = feet[1]["contact"]
-            self.assertEqual(contact["actual_positive_intervals"], [0, 0, 0, 2, 4])
-            self.assertEqual(contact["actual_valid_intervals"], [6, 6, 6, 5, 6])
+            self.assertEqual(contact["actual_positive_intervals"], [2 if c == "left_foot_object" else 4 if c == "right_foot_object" else 0 for c in CHANNELS])
+            self.assertEqual(contact["actual_valid_intervals"], [5 if c == "left_foot_object" else 6 for c in CHANNELS])
             events = contact["actual_transition_events"]["channels"]
             self.assertEqual(events["left_foot_object"]["onset_endpoint_steps"], [2, 5])
             self.assertEqual(events["left_foot_object"]["release_endpoint_steps"], [6])
             self.assertEqual(events["right_foot_object"]["onset_endpoint_steps"], [5])
             self.assertEqual(events["right_foot_object"]["release_endpoint_steps"], [3])
             raw = torch.load(feet[1]["rollout"], weights_only=True)
-            self.assertEqual(raw["control"]["contact"].shape, (6, 5))
-            self.assertEqual(raw["control"]["expected_contact"].shape, (6, 2))
-            for column, maximum in ((3, .04), (4, .06)):
+            self.assertEqual(raw["control"]["contact"].shape, (6, len(CHANNELS)))
+            self.assertEqual(raw["control"]["expected_contact"].shape, (6, len(CHANNELS)))
+            for column, maximum in ((CHANNELS.index("left_foot_object"), .04), (CHANNELS.index("right_foot_object"), .06)):
                 self.assertAlmostEqual(contact["maximum_interval_normal_impulse_Ns"][column], maximum)
 
     def test_old_three_channel_saved_contact_arrays_are_rejected(self):
         from hoi.v1.evaluate import _contact_metrics
         control = {"contact": torch.zeros(4, 3), "contact_valid": torch.ones(4, 3, dtype=torch.bool),
                    "contact_impulse_Ns": torch.zeros(4, 3)}
-        with self.assertRaisesRegex(ValueError, "5 channels"):
+        with self.assertRaisesRegex(ValueError, "16 channels"):
             _contact_metrics(control, torch.ones(4, 2), torch.ones(4, 2))
 
 

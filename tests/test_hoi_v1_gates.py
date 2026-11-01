@@ -13,7 +13,7 @@ import torch
 
 from hoi.v1.gates import (GateError, WMThresholdProposal, require_native_evidence,
                          require_wm_evidence, validate_native_evidence, validate_wm_evidence, main)
-from hoi.v1.contacts import CHANNELS, LABEL_SCHEMA
+from hoi.v1.contacts import CHANNELS, LABEL_SCHEMA, GROUP_SCHEMA, REGION_LINKS, CHANNEL_INDEX
 
 
 def native_report(asset_id=0):
@@ -49,14 +49,18 @@ def native_report(asset_id=0):
             "object_support_selection": "lowest_world_z_vertex_on_opposing_support_plane",
             "ground_placement_audit": {"passed": True, "maximum_allowed_penetration_m": .002,
                                        "minimum_required_clearance_m": .002, "minimum_final_world_z_m": .002,
-                                       "root_and_object_translated_identically": True,
+                                       "placement_method": "all_robot_colliders_above_ground_exposed_target_up",
                                        "maximum_ground_penetration_m": 0.}}
         probes[side + "_foot_ground_negative"] = {"maximum_interval_normal_force_N": [0.] * len(CHANNELS),
             "maximum_foot_ground_interval_force_N": [2. if j == index else 0. for j in range(2)]}
+    for index, channel in enumerate(CHANNELS[:-1]):
+        name = "hand_ground_negative" if index == 0 else channel.removesuffix("_object") + "_ground_negative"
+        probe = probes.setdefault(name, {"maximum_interval_normal_force_N": [0.] * len(CHANNELS)})
+        probe["maximum_body_ground_interval_force_N"] = [2. if i == index else 0. for i in range(len(CHANNELS) - 1)]
     probes.update(passed=True, checks={key: True for key in (*CHANNELS, "hand_ground_not_mislabelled",
-                  "left_foot_ground_not_mislabelled", "right_foot_ground_not_mislabelled")})
+                  "left_foot_ground_not_mislabelled", "right_foot_ground_not_mislabelled", *(channel + "_ground_not_mislabelled" for channel in CHANNELS[:-1]))})
     hand = {side: {"collision_geom_count": 5, "allowed_object_pairs": 5, "cpu_probe_contacts": [{"distance": -.001}]} for side in ("left", "right")}
-    return {"asset_id": asset_id, "bundle_content_sha256": "a" * 64, "num_envs": 2, "compiled_foot_audit": foot,
+    report = {"asset_id": asset_id, "bundle_content_sha256": "a" * 64, "num_envs": 2, "compiled_foot_audit": foot,
         "physics": {"physics": {"hand_collision": True, "self_collision": True},
             "control_dt": .02, "substeps": 4, "integration_dt": .005, "mass": [1.], "com": [[0,0,0]],
             "inertia": [[[1.,0,0],[0,1.,0],[0,0,1.]]], "object_friction": [.5], "ground_friction": .3,
@@ -73,7 +77,8 @@ def native_report(asset_id=0):
             "robot_fk_comparison": {"passed": True, "max_link_position_error_m": 1e-6,
                 "max_rotation_matrix_error": 1e-6, "position_tolerance_m": 5e-5, "rotation_tolerance": 5e-5},
             "compiled_collision_geometry_verified_against_bundle": True, "use_cuda_graph": False},
-        "contact": {"schema": LABEL_SCHEMA, "channels": list(CHANNELS),
+        "contact": {"group_schema": GROUP_SCHEMA, "region_links": {k: list(v) for k, v in REGION_LINKS.items()},
+            "region_collision_geom_counts": {name: 1 for name in CHANNELS[:-1]}, "schema": LABEL_SCHEMA, "channels": list(CHANNELS),
             "foot_body_links": {side: side + "_ankle_roll_link" for side in ("left", "right")},
             "foot_collision_geom_counts": {"left": 4, "right": 4},
             "interval": "(t,t+1]", "num_substeps": 4, "substep_dt": .005, "threshold_N": 1., "use_cuda_graph": False,
@@ -81,12 +86,63 @@ def native_report(asset_id=0):
         "palm_selection_verified": True, "compiled_hand_audit": {"enabled": True, "hands": hand},
         "compiled_self_collision_audit": {"enabled": True, "allowed_nonadjacent_robot_geom_pairs": 8},
         "pair_probes": probes, "native_pair_calibration_complete": True, "zero_action_smoke_completed": True}
+    # Explicitly synthetic fixtures exercise validation logic, never native
+    # physics evidence. The traces must still satisfy the full data contract.
+    from hoi.v1.native_acceptance import physical_profile_identity, RUNTIME_SCHEMA
+    report["formal_training_started"] = False
+    report["native_runtime"] = {"schema": RUNTIME_SCHEMA, "backend": "Newton/MuJoCo-Warp",
+        "buffer_devices": {key: "cuda:0" for key in ("contact_geom", "normal_force", "qpos", "interval_impulse")},
+        "verified_from_live_buffers": True, "gpu_name": "synthetic_fixture_not_physics_evidence",
+        "versions": {key: "synthetic_fixture" for key in ("torch", "warp", "mujoco", "mujoco_warp", "newton")}}
+    physics = report["physics"]
+    for key in ("mass", "com", "inertia", "object_friction"):
+        physics[key] = physics[key] * 2
+    profile = {"mass": 1., "com": [0., 0., 0.], "inertia": [[1., 0., 0.], [0., 1., 0.], [0., 0., 1.]],
+               "friction": .5, "ground_friction": .3}
+    physics["bound_physical_profile"] = profile
+    physics["bound_physical_profile_sha256"] = physical_profile_identity(profile)
+    for name, probe in probes.items():
+        if name in ("passed", "checks"):
+            continue
+        force = torch.tensor(probe["maximum_interval_normal_force_N"], dtype=torch.float64).expand(2, 2, -1)
+        ground = torch.tensor(probe.setdefault("maximum_body_ground_interval_force_N", [0.] * 15), dtype=torch.float64).expand(2, 2, -1)
+        probe.update(ticks=2, control_dt_s=.02, substeps_per_interval=4,
+                     interval_normal_impulse_Ns=(force * .02).tolist(), interval_mean_normal_force_N=force.tolist(),
+                     interval_body_ground_impulse_Ns=(ground * .02).tolist())
+    from hoi.v1.probe_pose import SCHEMA
+    from hoi.v1.contacts import BODY_ROLES
+    from hoi.v1.scene_supports import omni_support_recipe, digest, POSE_MODE
+    report["contact"]["topology"] = "one_mujoco_world_per_environment"
+    fixture_roles = list(BODY_ROLES) + [BODY_ROLES[12]]*3 + [BODY_ROLES[13]]*3
+    fixture_links = [REGION_LINKS[channel][-1] for channel in CHANNELS[:-1]] + ["left_ankle_roll_link"]*3 + ["right_ankle_roll_link"]*3
+    report["contact"].update(geom_names=["synthetic_geom_"+str(i) for i in range(len(fixture_roles))],
+        geom_roles=fixture_roles, geom_canonical_links=fixture_links,
+        region_collision_geom_counts={channel:fixture_roles.count(role) for channel,role in zip(CHANNELS[:-1],BODY_ROLES)})
+    report["native_scene_supports"] = {"schema": "hoi_native_scene_supports_v1", "declared_support_ids": [],
+        "supports": [], "isolation_probes": {}, "clips": [{"name": "synthetic_no_support", "bindings": []}],
+        "geometry_recipe": omni_support_recipe(), "geometry_recipe_sha256": digest(omni_support_recipe()),
+        "pose_mode": POSE_MODE, "passed": True}
+    for index, channel in enumerate(CHANNELS[:-1]):
+        for name, negative in ((channel, False), (("hand_ground_negative" if index == 0 else channel.removesuffix("_object") + "_ground_negative"), True)):
+            low = [.01] * len(fixture_roles)
+            low[index] = -.002 if negative else .002
+            probes[name].setdefault("definition", {})["region_pose_audit"] = {
+                "schema": SCHEMA, "region": channel, "ground_negative": negative,
+                "robot_geom_ids": list(range(len(fixture_roles))), "robot_geom_roles": list(fixture_roles),
+                "per_geom_minimum_world_z_m": low, "prescribed_penetration_m": .002,
+                "maximum_allowed_non_target_ground_penetration_m": .002,
+                "maximum_non_target_ground_penetration_m": 0., "target_minimum_world_z_m": low[index],
+                "robot_minimum_world_z_m": min(low), "maximum_self_penetration_m": 0.,
+                "compiled_surface": {"geom_id": index, "source": "actual_compiled_collision_surface"},
+                "search": {"physics_steps": 0, "collisions_disabled": False, "joint_limits_preserved": True}}
+    return report
+
 
 
 def wm_report():
     metric = {"valid_samples": 20, "object_normalized_error": .1, "zero_increment_normalized_error": 1., "constant_velocity_normalized_error": .5}
     horizons = {str(n): {**metric, "phases": {p: dict(metric) for p in ("no_contact", "contact", "onset", "release")}} for n in (1,8,32)}
-    return {"finite": True, "scope": "training_reference_bins_reserved_from_wm_fit_not_eval80_or_test40",
+    return {"finite": True, "scope": "training_reference_bins_reserved_from_wm_fit_not_protected_eval",
         "real_executed_actions": True, "horizon_reports": horizons,
         "contact_diagnostics": {"positive_counts": [20] * len(CHANNELS), "negative_counts": [20] * len(CHANNELS),
             "precision": [.8] * len(CHANNELS), "recall": [.8] * len(CHANNELS),
@@ -173,10 +229,27 @@ class EvidenceGateTests(unittest.TestCase):
             report["contact"].update(schema=schema, channels=channels)
             gate = validate_native_evidence(report, required_asset_ids=[0], expected_bundle_sha256="a" * 64)
             self.assertFalse(gate["passed"])
-            self.assertTrue(any("v2 five-channel" in reason for reason in gate["blockers"]))
+            self.assertTrue(any("v3 sixteen-channel" in reason for reason in gate["blockers"]))
+
+    def test_full_body_region_mapping_positive_and_ground_evidence_required(self):
+        for index, channel in enumerate(CHANNELS[:-1]):
+            for mutation in ('mapping', 'count', 'positive', 'ground', 'mislabelled'):
+                report = native_report()
+                name = 'hand_ground_negative' if index == 0 else channel.removesuffix('_object') + '_ground_negative'
+                if mutation == 'mapping':
+                    report['contact']['region_links'][channel] = ['wrong_link']
+                elif mutation == 'count':
+                    report['contact']['region_collision_geom_counts'][channel] = 0
+                elif mutation == 'positive':
+                    report['pair_probes'][channel]['maximum_interval_normal_force_N'][index] = 1.
+                elif mutation == 'ground':
+                    report['pair_probes'][name]['maximum_body_ground_interval_force_N'][index] = 0.
+                else:
+                    report['pair_probes'][name]['maximum_interval_normal_force_N'][index] = 2.
+                self.assertFalse(validate_native_evidence(report)['passed'], (channel, mutation))
 
     def test_each_real_foot_positive_and_foot_ground_negative_is_required(self):
-        for side, channel in (("left", 3), ("right", 4)):
+        for side, channel in (("left", CHANNEL_INDEX["left_foot_object"]), ("right", CHANNEL_INDEX["right_foot_object"])):
             for mutation in ("positive_missing", "positive_1N", "ground_missing", "ground_1N", "ground_mislabelled", "wrong_link", "no_collision"):
                 report = native_report()
                 positive = report["pair_probes"][side + "_foot_object"]
@@ -188,7 +261,7 @@ class EvidenceGateTests(unittest.TestCase):
                 elif mutation == "ground_missing":
                     del report["pair_probes"][side + "_foot_ground_negative"]
                 elif mutation == "ground_1N":
-                    negative["maximum_foot_ground_interval_force_N"][channel - 3] = 1.
+                    negative["maximum_foot_ground_interval_force_N"][0 if side == "left" else 1] = 1.
                 elif mutation == "ground_mislabelled":
                     negative["maximum_interval_normal_force_N"][channel] = 2.
                 elif mutation == "wrong_link":
@@ -198,15 +271,15 @@ class EvidenceGateTests(unittest.TestCase):
                 self.assertFalse(validate_native_evidence(report)["passed"], (side, mutation))
 
     def test_foot_positive_cannot_be_a_deeply_ground_embedded_box(self):
-        for mutation in ("missing", "deep", "sphere", "old_corner"):
+        for mutation in ("missing", "deep", "visual", "old_corner"):
             report = native_report()
             definition = report["pair_probes"]["left_foot_object"]["definition"]
             if mutation == "missing":
                 del definition["ground_placement_audit"]
             elif mutation == "deep":
                 definition["ground_placement_audit"]["maximum_ground_penetration_m"] = .3
-            elif mutation == "sphere":
-                definition["foot_surface"]["primitive"] = "actual_compiled_sphere"
+            elif mutation == "visual":
+                definition["region_pose_audit"]["compiled_surface"]["source"] = "visual_mesh"
             else:
                 definition["object_support_selection"] = "arbitrary_support_argmin"
             self.assertFalse(validate_native_evidence(report)["passed"], mutation)
@@ -280,11 +353,33 @@ class EvidenceGateTests(unittest.TestCase):
         with self.assertRaises(GateError):
             require_wm_evidence(report)
 
+    def test_curated_bundle_cli_accepts_new_schema_and_binds_installed_asset_physics(self):
+        from hoi.v1.prepare import _digest_json
+        from hoi.data.curated_bundle import CURATED_BUNDLE_SCHEMA
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            report=native_report()
+            profile=report["physics"]["bound_physical_profile"]
+            bundle={"schema_version":CURATED_BUNDLE_SCHEMA,"clips":[{"asset_id":0}],
+                    "assets":[{"asset_id":0,"physical_profile":profile}]}
+            bundle["bundle_content_sha256"]=_digest_json(bundle)
+            report["bundle_content_sha256"]=bundle["bundle_content_sha256"]
+            bp,rp=root/"bundle.json",root/"native.json"
+            bp.write_text(json.dumps(bundle),encoding="utf-8")
+            rp.write_text(json.dumps(report),encoding="utf-8")
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(main(["--bundle",str(bp),"--native-report",str(rp),"--output",str(root/"valid")]),0)
+            mismatched=copy.deepcopy(profile);mismatched["mass"]=2.
+            result=validate_native_evidence(report,expected_asset_profiles={0:mismatched})
+            self.assertFalse(result["passed"])
+            self.assertTrue(any("differs from bundle" in x for x in result["blockers"]))
+
     def test_cli_binds_report_bytes_and_preserves_blocked_evidence(self):
         from hoi.v1.prepare import BUNDLE_SCHEMA, _digest_json
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            bundle = {"schema_version": BUNDLE_SCHEMA, "clips": [{"asset_id": 0}, {"asset_id": 1}], "partition": "train"}
+            bundle = {"schema_version": BUNDLE_SCHEMA, "clips": [{"asset_id": 0}, {"asset_id": 1}], "partition": "train",
+                "assets": [{"asset_id": i, "physical_profile": native_report(i)["physics"]["bound_physical_profile"]} for i in range(2)]}
             bundle["bundle_content_sha256"] = _digest_json(bundle)
             bundle_path = root / "bundle.json"
             bundle_path.write_text(json.dumps(bundle), encoding="utf-8")
@@ -332,10 +427,12 @@ class RealWindowDiagnosticsTests(unittest.TestCase):
             "a": torch.zeros(B,K,29), "xi": torch.zeros(B,K,33), "xi_o": torch.zeros(B,K,12),
             "asset_id": torch.zeros(B,K,dtype=torch.long), "mask": mask, "contact": contact,
             "contact_valid": torch.ones(B,K,len(CHANNELS),dtype=torch.bool)}
+        from hoi.v1.scene_context import empty_scene_state
+        window.update(empty_scene_state((B,K)))
         class WM:
             object_out_norm = SimpleNamespace(std=lambda: torch.ones(12))
             object_error_floor = torch.full((12,), .001)
-            def step(self, S, O, a, xi, xi_o, points):
+            def step(self, S, O, a, xi, xi_o, points, scene_context):
                 return (S[0] + S[2] * .02, *S[1:]), (O[0] + O[2] * .02, *O[1:]), a.new_zeros((len(a),len(CHANNELS)))
             def loss(self, *args):
                 return {name: torch.tensor(0.) for name in ("total", "robot", "object", "contact")}

@@ -1,5 +1,29 @@
 # HOI v1 references and collision recipes
 
+> 当前 `hoi/privileged_teacher` 已按2026-10-31方案使用16区域contact、统一三态奖励、
+> 普通masked BCE与curated reference接入；详见 [teacher说明](PRIVILEGED_TEACHER.md)。
+> 下文五通道/双手bundle描述属于历史v1；该格式不能直接作为当前teacher输入。
+> Curated准备使用 `python -m hoi.v1.prepare --curated --manifest <split.json> --assets
+> <audited-recipes.json> --partition train|protected_eval --output <new-directory>`。
+> 尚未启动训练，完整新资产的GPU原生验收仍需单独执行。
+
+Curated完整recipe可先并行准备独立物体的几何缓存，再供两个分区使用：
+
+```bash
+python -m hoi.data.curated_geometry --recipes /new/final_native/recipes.json \
+  --output /new/prepared_geometry --workers 8 --threads 3
+python -m hoi.v1.prepare --curated --manifest /immutable/split.json \
+  --assets /new/final_native/recipes.json --partition train --output /new/train_bundle \
+  --curated-geometry-cache /new/prepared_geometry/geometry_manifest.json
+```
+
+`protected_eval`采用相同几何manifest和独立bundle输出。几何不含reference帧或接触标签；
+两组motion仍完全隔离。每个spawn进程执行原始SDF/表面采样/FPS和原seed，worker数与
+线程数必须在CPU分配内。Manifest绑定recipe、算法代码、逐资产成功回执和cache SHA；
+消费时再次校验实际collider tensors、距离recipe与点云hash。`--resume`只复用原计划中
+校验通过的成功产物，失败重试使用新attempt；活动claim阻止重复producer。该CPU缓存
+不会声明GPU原生物理通过，也不改变几何采样数、距离阈值或native gate。
+
 Run reference/geometry preparation with CPU Torch and MuJoCo. The optional foot-overlay USD authoring additionally requires the prepared USD/CoACD runtime. Preparation does not launch IsaacLab or train a model. Source tensors, native assets and the legacy zero-shot inputs stay read-only; every output directory must be new.
 
 First build and validate the canonical manifest using [the stage-one data instructions](../data/README.md). An `objects` entry that contains only `asset_id` and an identity-only status is accepted as an identity declaration: the canonical motion entry supplies the object name. It does not establish scale, a mesh transform, COM or native geometry. Those properties must be supplied by the collision recipe and verified by the native gate.
@@ -72,7 +96,7 @@ Full 2651-motion geometry preparation should first be timed on fixed train-only 
 
 Every bundle binds source manifest, recipes, motion/cache/contact/geometry bytes, scale/transforms, FK and optional virtual URDF. Loaders recheck the bindings. Training workers may load one asset's clips and map local frame IDs through `global_frame_index`; central training retains the stable full-bundle asset IDs. Evaluation retains the original resampled source630 reference for independent 39-body scoring. The HOI bank omits terminal-only reset bins, unlike the original motion-only library: every reset bin contains an outgoing control interval, and the final state belongs to the last valid bin.
 
-Native readiness remains a separate gate. It requires matching compiled colliders, actual palm evidence, native mass/COM/inertia/friction/gravity readback, hand/self collisions, the explicitly bound ULTRA full-foot profile and compiled foot audit, and four-substep calibration of all five object pairs including hand-ground and both foot-ground negative controls. Exported colliders must come from the collision engine's `mjModel.mesh_graph` convex hulls. Independent `mj_geomDistance` GJK queries at two separated poses per hand must agree with cached surface gaps within 50µm, while the bundle-to-compiled mesh comparison retains its stricter 10µm tolerance. Native and reference robot FK must also agree within the versioned 50µm position and 5e-5 rotation-matrix tolerance. Comparing raw triangles with another copy of those triangles does not satisfy this gate. WM quality is a separate diagnostic: train-only heldout real 1/8/32-step comparisons, baseline scores, actual-pair coverage/calibration and phase reports do not control actor updates on this branch. The fixed schedule is 64 real prefill vector steps followed by 500 WM-only iterations, then actor/critic updates every iteration. Historical `wm_gate_*.json` names remain, with `controls_policy_updates=false`. Nonfinite diagnostics, data/native identity errors and invalid gradients still fail immediately. A quality-baseline pass is not a calibrated HOI-success criterion.
+Native readiness remains a separate gate. It requires matching compiled colliders, actual palm evidence, native mass/COM/inertia/friction/gravity readback, hand/self collisions, the explicitly bound ULTRA full-foot profile and compiled foot audit, and four-substep calibration of all 16 object pairs, 15 body-ground negative controls, and separately instrumented kinematic table isolation/reset controls when declared. Exported colliders must come from the collision engine's `mjModel.mesh_graph` convex hulls. Independent `mj_geomDistance` GJK queries at two separated poses per hand must agree with cached surface gaps within 50µm, while the bundle-to-compiled mesh comparison retains its stricter 10µm tolerance. Native and reference robot FK must also agree within the versioned 50µm position and 5e-5 rotation-matrix tolerance. Comparing raw triangles with another copy of those triangles does not satisfy this gate. WM quality is a separate diagnostic: train-only heldout real 1/8/32-step comparisons, baseline scores, actual-pair coverage/calibration and phase reports do not control actor updates on this branch. The fixed schedule is 64 real prefill vector steps followed by 500 WM-only iterations, then actor/critic updates every iteration. Historical `wm_gate_*.json` names remain, with `controls_policy_updates=false`. Nonfinite diagnostics, data/native identity errors and invalid gradients still fail immediately. A quality-baseline pass is not a calibrated HOI-success criterion.
 
 ```bash
 python -m hoi.v1.gates --bundle /new/train_bundle/bundle.json \

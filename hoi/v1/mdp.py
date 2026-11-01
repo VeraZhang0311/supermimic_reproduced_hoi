@@ -8,11 +8,12 @@ import torch
 from supermimic.mdp import MDP, RewardCfg
 from supermimic.motion import CONTROL_DT
 from supermimic.rotations import mat_to_6d, rot_angle_sq, yaw_mat
+from .contacts import CHANNELS
 
 MAX_STEP_REWARD = .15
 HUMAN_MAX_STEP_REWARD = .1
 OBJECT_OBS_DIM = 18
-OBJECT_GOAL_DIM = 190
+OBJECT_GOAL_DIM = 10 * (15 + 2 * len(CHANNELS))
 
 
 @dataclass
@@ -85,8 +86,9 @@ class HOIMDP:
     def critic_features(self, S, O, f, xi):
         """Non-shape raw blocks; xiO is supplied separately by the learner.
 
-        Prefix184 + human goal730 + object goal190 + invariant15 + error15 +
-        expected/mask4 = 1138. Append physical context12 then shape64 = 1214.
+        Prefix184 + human goal730 + object goal470 + invariant15 + error15 +
+        expected/mask32 = 1446. Append physical context12 and shape64 = 1522;
+        the learner adds observed scene26 independently, for critic input1548.
         """
         expected, valid = self.motion.expected(f)
         return torch.cat((self.legacy_critic_features(S, f, xi), self.motion.goal(f, 10),
@@ -108,14 +110,23 @@ class HOIMDP:
         expected, valid = self.motion.expected(f)
         # Pair probabilities are supplied by the contact head in imagination,
         # and interval labels by the recorder for real transitions.
-        actual = actual_contact[..., :2]
-        actual_mask = torch.ones_like(actual) if contact_valid is None else contact_valid[..., :2].to(actual)
-        contact = _masked_mean(expected * actual + (1 - expected) * (1 - actual), valid * actual_mask)
+        actual = actual_contact
+        if actual.shape != expected.shape or actual.shape[-1] != len(CHANNELS):
+            raise ValueError("contact reward requires all 16 region probabilities/labels")
+        if contact_valid is not None and contact_valid.shape != actual.shape:
+            raise ValueError("actual contact validity must match all 16 regions")
+        actual_mask = torch.ones_like(actual) if contact_valid is None else contact_valid.to(actual)
+        known = valid * actual_mask
+        # Each set has one total vote, independent of how many regions it has.
+        # An empty positive/negative set contributes zero; unknown has no gradient.
+        contact_positive = _masked_mean(actual, expected * known)
+        contact_negative = _masked_mean(actual, (1 - expected) * known)
+        contact = contact_positive - contact_negative
         distance = self.shapes.hand_distances(self.kin, S, O, self.motion.asset_ids[f])
         weight = torch.softmax(-distance.square() / c.approach_temperature ** 2, -1)
         distance2 = (weight * distance.square()).sum(-1)
         hand_approach = torch.exp(-distance2 / c.approach_std ** 2)
-        approach = _masked_mean(hand_approach, expected * valid)
+        approach = _masked_mean(hand_approach, expected[..., :2] * valid[..., :2])
         extra = (c.w_position * position + c.w_orientation * orientation + c.w_linear_velocity * linear_velocity +
                  c.w_angular_velocity * angular_velocity + c.w_approach * approach + c.w_contact * contact) * CONTROL_DT
         result = human_reward + extra
@@ -126,6 +137,8 @@ class HOIMDP:
                         "object_linear_velocity": linear_velocity * CONTROL_DT,
                         "object_angular_velocity": angular_velocity * CONTROL_DT,
                         "hand_approach": approach * CONTROL_DT, "contact_match": contact * CONTROL_DT,
+                        "contact_positive_reward": contact_positive * CONTROL_DT,
+                        "contact_negative_penalty": contact_negative * CONTROL_DT,
                         "e_object_position": ep, "e_object_orientation": er,
                         "e_object_linear_velocity": ev, "e_object_angular_velocity": ew,
                         "expected_positive": (expected * valid).sum(-1), "contact_valid_pairs": (valid * actual_mask).sum(-1),

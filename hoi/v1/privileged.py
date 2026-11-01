@@ -3,7 +3,7 @@
 The kinematic/interaction blocks follow ULTRA's UltraG1Retarget teacher, not
 its student or sim2sim observation builder. This is an explicit new schema,
 not a 4052D ULTRA checkpoint adapter: unavailable measured body contacts are
-not replaced with geometric proximity. Existing reference hand intent retains
+not replaced with geometric proximity. Reference region contact intent retains
 its validity mask. The original actor inputs remain as an additive prefix.
 """
 from __future__ import annotations
@@ -14,8 +14,8 @@ import torch
 from supermimic.rotations import axis_angle_to_mat, quat_to_mat, yaw_mat
 
 BASE_PROFILE = "v1"
-TEACHER_PROFILE = "privileged_teacher_v1"
-PRIVILEGED_DIM = 3906
+TEACHER_PROFILE = "privileged_teacher_v3"
+PRIVILEGED_DIM = 3962
 TEACHER_SCHEMA = {
     "version": TEACHER_PROFILE,
     "dim": PRIVILEGED_DIM,
@@ -29,12 +29,13 @@ TEACHER_SCHEMA = {
     "per_lookahead": ["body_current583", "body_target_and_errors936", "action_q_qd_prevq_prevqd145",
                       "object_velocity_and_errors21", "interaction_graph_and_error234"],
     "shared": ["raw_robot_context33", "object_context12", "current_object_pose_and_velocity15",
-               "two_lookahead_expected_hand_contacts_and_validity8"],
+               "two_lookahead_expected_region_contacts_and_validity64"],
     "actor_noise": False,
+    "scene_context": "separate direct26 block; actual reset-held two-cuboid context shared with WM/critic",
     "context_path": "normalized direct decoder input; original robot/object goal encoders retained",
     "interaction_graph": "nearest of existing 128 object surface points; body-minus-surface; d/(norm+1e-6)*exp(-5*norm)",
     "reference_ig_frame": "each future reference robot heading, matching ULTRA reference generation",
-    "contact_inputs": "reference hand-object intent+validity only; actual body contacts deferred until native+WM schema extension",
+    "contact_inputs": "reference 16 region-object/ground interval intents+validity; identical in real and imagined actor calls",
     "differences_from_ultra": ["50Hz timebase", "existing 128-point geometry", "no stochastic heading perturbation",
                                "no measured-contact slots or zero torque placeholder", "explicit physical contexts",
                                "bound-URDF FK for actual, reference and imagined states", "original dense 10-frame goals retained"],
@@ -51,9 +52,9 @@ def feature_schema(profile, baseline):
     validate_profile(profile)
     result = deepcopy(baseline)
     if profile == TEACHER_PROFILE:
-        result["version"] = "supermimic_hoi_privileged_teacher_1"
+        result["version"] = "supermimic_hoi_privileged_teacher_3"
         result["privileged_actor"] = deepcopy(TEACHER_SCHEMA)
-        result["actor"] += [f"privileged_direct{PRIVILEGED_DIM}"]
+        result["actor"].insert(-1, f"privileged_direct{PRIVILEGED_DIM}")
     return result
 
 

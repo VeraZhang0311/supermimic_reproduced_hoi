@@ -12,11 +12,11 @@
 ## 当前新版科学基线
 
 - 无持续WM质量门：保留500轮WM-only warmup，之后固定日程更新actor/critic。holdout/WM质量只诊断，不能重新成为actor开关。
-- 原机器人网络只增不减。learned contact head为5通道，严格依次为 `left_hand_object`、`right_hand_object`、`object_ground`、`left_foot_object`、`right_foot_object`。
-- 标签schema `hoi_v1_pair_normal_impulse_v2`，feature schema `supermimic_hoi_v1_full_reference_2`。旧3通道HOI权重不能冒充新版直接resume。
+- 用户2026-10-31授权本teacher分支扩展为16区域contact；精确顺序/映射见 `contacts.py`。原机器人网络前缀保留，reference目标、actor/critic和replay同步扩展。
+- 标签schema `hoi_v1_region_pair_normal_impulse_v3`，feature `supermimic_hoi_v1_full_reference_4`，teacher profile v3；额外26D reset-held桌面上下文进入WM/actor/critic与replay/imagination。旧3/5通道HOI权重和旧双手bundle拒绝直接加载。
 - hand collision ON、body self-collision ON；共享CLI配置不另造默认值。保留引擎相邻/焊接link过滤。
 - 脚用同源ULTRA完整STL/原变换及已验证CoACD≤5 hull/≤16 vertices，关闭旧脚球；质量/COM/惯量不变，不宣称与PhysX VHACD cooker完全相同。
-- 五通道标签来自真实pair区间法向冲量，脚—地面不能混为脚—物体。reference expected-contact/contact-match reward仍为双手，不自动新增脚目标奖励。
+- 16通道真实标签为区域pair区间法向冲量，身体—地面/自碰撞不能混为身体—物体。WM普通masked BCE；reference组内any-positive/all-negative/else-unknown；统一正概率均值减负概率均值，unknown不参与。
 - native身份、overflow、非有限值硬错误检查保留。无质量门不等于取消这些检查。
 - 不为通过检查擅改模型、数据、观测、奖励、终止、PD、资产物理、环境数、batch、H、训练配比或优化参数；修复须记录差异和验证证据。
 
@@ -42,7 +42,7 @@
 
 ## 评估与W&B
 
-- 默认canonical HOI80，冻结checkpoint，0optimizer/0normalizer更新，真实物体物理，完整时长，不因失败重置或截断。
+- Curated数据用完整protected_eval（约10%按task/source group分层，已有保护不可进入train）；缺task保留unspecified。历史canonical HOI80继续保护。冻结checkpoint，0optimizer/normalizer更新、完整物理时长、不因失败重置截断。
 - T+1状态/reference，T action/obs/goal/control；保留时基/四元数。HOI-trained full-reference policy已有物体输入；历史zero-shot不得加物体policy观测来冒充旧协议。
 - 分开报告normalized return/作者终止、39body PHC、object pose及联合判据。PHC0.5m；object位置0.1m/角度30°持续0.3s为工程姿态判据，不等于抓取成功。
 - 新对照用独立私有W&B run，仅用户指定续训同实验时恢复原run。

@@ -88,7 +88,14 @@ def executed_action_reward_gap(wm, mdp, states, control, frames, points, *, hori
     survival weighting. Batching bounds additional memory independently of clip
     duration. No optimizer, parameter or normalizer update occurs.
     """
+    from .scene_context import scene_context, validate_scene_state
     T = len(control["action"])
+    if not all(key in control for key in ("support_pose_xyzw", "support_present")):
+        raise ValueError("paired reward diagnostic requires saved scene support state")
+    validate_scene_state(control["support_pose_xyzw"], control["support_present"], (T,))
+    if T and (not torch.equal(control["support_present"], control["support_present"][:1].expand_as(control["support_present"])) or
+              not torch.allclose(control["support_pose_xyzw"], control["support_pose_xyzw"][:1].expand_as(control["support_pose_xyzw"]), atol=2e-5, rtol=0)):
+        raise ValueError("paired reward diagnostic requires reset-held scene supports")
     if (T < 1 or states["s"].shape != (T + 1, 71) or states["o"].shape != (T + 1, 13) or
             len(frames) != T + 1 or type(batch_size) is not int or batch_size < 1 or
             any(type(h) is not int or h < 1 for h in horizons)):
@@ -120,15 +127,17 @@ def executed_action_reward_gap(wm, mdp, states, control, frames, points, *, hori
                 S = unflatten_state(states["s"][cpu_chunk].to(device))
                 O = unflatten_object(states["o"][cpu_chunk].to(device))
                 cloud = points[None].expand(len(chunk), -1, -1)
+                support_pose = control["support_pose_xyzw"][cpu_chunk].to(device).detach()
+                support_present = control["support_present"][cpu_chunk].to(device).detach()
                 predicted_return = torch.zeros(len(chunk), device=device)
                 actual_return = torch.zeros_like(predicted_return)
                 for offset in range(horizon):
                     indices, cpu_indices = chunk + offset, cpu_chunk + offset
                     action = control["action"][cpu_indices].to(device)
                     S, O, logits = wm.step(S, O, action, normalize_xi(control["xi"][cpu_indices].to(device)),
-                                             control["xi_o"][cpu_indices].to(device), cloud)
+                                             control["xi_o"][cpu_indices].to(device), cloud, scene_context(S, support_pose, support_present))
                     if logits.shape != (len(chunk), len(CHANNELS)):
-                        raise ValueError("paired reward diagnostic WM contact logits differ from the five-channel contract")
+                        raise ValueError("paired reward diagnostic WM contact logits differ from the 16-channel contract")
                     if not bool(torch.isfinite(logits).all()):
                         raise FloatingPointError("nonfinite paired WM contact logits")
                     predicted = mdp.reward(S, O, frames[indices + 1], action, control["a_prev"][cpu_indices].to(device),

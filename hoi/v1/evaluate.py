@@ -25,7 +25,7 @@ from .networks import Policy, WorldModel, Critic
 from .state import unflatten_state, unflatten_object
 
 
-ROLLOUT_SCHEMA = "supermimic_hoi_v1_full_duration_rollout_1"
+ROLLOUT_SCHEMA = "supermimic_hoi_v1_full_duration_rollout_2"
 
 
 def _evaluation_provenance(checkpoint):
@@ -76,10 +76,23 @@ def _state_record(snapshot, motion, fk39, joint_order):
     body = _virtual_state(S, fk39, joint_order)
     f = snapshot["f"]
     values = {"s": snapshot["s"], "o": snapshot["o"], "q": S[4], "qd": S[5],
-              "reference_source630": motion.source_reference[f],
               "reference_object_position": motion.object_p[f], "reference_object_velocity": motion.object_v[f],
               "reference_object_omega": motion.object_w[f], **body}
     from .state import flatten_state, flatten_object
+    support_keys=("support_pose_xyzw","reference_support_pose_xyzw","support_present")
+    if any(key in snapshot for key in support_keys):
+        if not all(key in snapshot for key in support_keys):
+            raise ValueError("native support display states must be recorded together")
+        if snapshot[support_keys[0]].shape != (len(f),2,7) or snapshot[support_keys[1]].shape != (len(f),2,7) or snapshot[support_keys[2]].shape != (len(f),2):
+            raise ValueError("native support display states lost fixed slot/frame alignment")
+        values.update({key:snapshot[key] for key in support_keys})
+    elif any(getattr(motion,"scene_supports",[])):
+        raise ValueError("evaluation cannot omit declared native scene support states")
+    if motion.source_reference is not None:
+        values["reference_source630"] = motion.source_reference[f]
+    ref_body = _virtual_state(motion.ref_state(f), fk39, joint_order)
+    values["reference_body_pos"] = ref_body["body_pos"]
+    values["reference_body_rot"] = ref_body["body_rot"]
     values["reference_robot"] = flatten_state(motion.ref_state(f))
     values["reference_object"] = flatten_object(motion.ref_object(f))
     for key, value in values.items():
@@ -91,15 +104,15 @@ def _state_record(snapshot, motion, fk39, joint_order):
 def _contact_metrics(control, expected, valid):
     from .diagnostics import contact_transition_events, validate_actual_contact_fields
     validate_actual_contact_fields(control, len(expected))
-    expected_transitions = contact_transition_events(expected, valid, CHANNELS[:2])
+    expected_transitions = contact_transition_events(expected, valid, tuple("object_ground_support" if name == "object_ground" else name for name in CHANNELS))
     actual_transitions = contact_transition_events(control["contact"], control["contact_valid"],
                                                    tuple("object_ground_support" if name == "object_ground" else name for name in CHANNELS))
-    actual = control["contact"][:, :2] > .5
-    pair_valid = control["contact_valid"][:, :2].bool()
+    actual = control["contact"] > .5
+    pair_valid = control["contact_valid"].bool()
     expected, valid = expected.bool(), valid.bool() & pair_valid
     missing = expected & ~actual & valid
     extra = ~expected & actual & valid
-    streak = torch.zeros(2, dtype=torch.long)
+    streak = torch.zeros(len(CHANNELS), dtype=torch.long)
     maximum = streak.clone()
     for step in missing:
         streak = torch.where(step, streak + 1, 0)
@@ -121,9 +134,46 @@ def _contact_metrics(control, expected, valid):
             "missing_contact_intervals": missing.sum(0).tolist(), "extra_contact_intervals": extra.sum(0).tolist(),
             "max_missing_streak_steps": maximum.tolist(), "max_missing_streak_seconds": (maximum * .02).tolist(),
             "missing_streak_ge16": (maximum >= 16).tolist(),
-            "all_known_expected_contact_matched": bool(not missing.any()) if has_pair_truth and expected_total else None,
+            "all_known_expected_contact_matched": bool(not missing.any() and not extra.any()) if has_pair_truth else None,
             "actual_transition_events": actual_transitions, "expected_transition_events": expected_transitions,
-            "definition": "five actual pair interval channels; expected/missing/reward labels remain LR hands only; no grasp-success assertion"}
+            "definition": "16 actual region-pair interval channels; grouped tri-state reference targets; unknown excluded; no functional-success assertion"}
+
+
+def _canonical_tracking_metrics(states, control, joint_order, body_names):
+    """Score audited G1 reference arrays directly, without manufacturing ULTRA source fields."""
+    from hoi.ultra_metrics import CRITERIA, first_sustained_violation
+    from supermimic.rotations import rot_angle_sq
+    ref_s = unflatten_state(states["reference_robot"])[0:6]
+    ref_o = unflatten_object(states["reference_object"])
+    actual_o = unflatten_object(states["o"])
+    body = states["body_pos"][1:]
+    ref_body = states["reference_body_pos"][1:]
+    if body.shape != ref_body.shape or body.shape[1:] != (39, 3):
+        raise ValueError("canonical tracking metrics require aligned 39-body reference FK")
+    distances = (body - ref_body).norm(dim=-1)
+    body_error = distances.mean(-1)
+    object_error = (actual_o[0][1:] - ref_o[0][1:]).norm(dim=-1)
+    angle = rot_angle_sq(actual_o[1][1:], ref_o[1][1:]).clamp_min(0).sqrt() * (180 / torch.pi)
+    object_bad = (object_error > CRITERIA["object_position_limit_m"]) | (angle > CRITERIA["object_orientation_limit_deg"])
+    failure = first_sustained_violation(object_bad, .02, CRITERIA["object_violation_duration_s"])
+    body_bad = torch.where(body_error > CRITERIA["body_frame_mean_limit_m"])[0]
+    names = list(body_names or [])
+    hand_ids = [names.index(name) for name in ("left_rubber_hand", "right_rubber_hand") if name in names]
+    T = len(control["action"])
+    result = {"criteria_version": CRITERIA["version"], "reference_basis": "audited_G1_reference_same_bound_URDF_FK",
+              "scored_frames": T, "scored_duration_s": T * .02, "reference_start_s": .02, "reference_end_s": T * .02,
+              "body_position_m": _stats(body_error), "object_position_m": _stats(object_error),
+              "object_orientation_deg": _stats(angle),
+              "joint_rmse_rad": float((states["q"][1:] - ref_s[4][1:]).square().mean().sqrt()),
+              "action_at_clip_fraction": float((control["action"].abs() >= 1 - 1e-6).float().mean()),
+              "phc_pass": not len(body_bad), "object_pose_pass": failure is None,
+              "body_and_object_pose_pass": not len(body_bad) and failure is None,
+              "first_phc_failure_reference_s": (int(body_bad[0]) + 1) * .02 if len(body_bad) else None,
+              "first_object_failure_reference_s": (failure + 1) * .02 if failure is not None else None,
+              "minimum_pelvis_height_m": float(states["s"][1:, 2].min()),
+              "pelvis_below_0_3m": bool((states["s"][1:, 2] < CRITERIA["pelvis_low_diagnostic_m"]).any())}
+    result["hand_position_m"] = _stats(distances[:, hand_ids].mean(-1)) if len(hand_ids) == 2 else None
+    return result
 
 
 def score_rollout(states, control, motion, clip_id, joint_order, *, max_human_reward=.1, source_body_names=None, variant="hoi_v1"):
@@ -133,15 +183,15 @@ def score_rollout(states, control, motion, clip_id, joint_order, *, max_human_re
         raise ValueError("full rollout requires T controls and T+1 states/reference fields")
     if any(len(value) != T for value in control.values()):
         raise ValueError("evaluation control fields have inconsistent durations")
-    source = states["reference_source630"]
-    if source.shape != (T + 1, 630):
+    source = states.get("reference_source630")
+    if source is not None and source.shape != (T + 1, 630):
         raise ValueError("full source reference630 is required for independent PHC scoring")
     obj = states["o"]
     object_xyzw = torch.cat((obj[:, :3], obj[:, [4, 5, 6, 3]], obj[:, 7:]), -1)
     packed = {"body_pos": states["body_pos"], "object_state": object_xyzw, "reference": source,
               "q": states["q"][:, joint_order], "action": torch.cat((torch.zeros_like(control["action"][:1]), control["action"])),
               "time": torch.arange(T + 1, dtype=torch.float64) * .02}
-    metrics = clip_metrics(packed, .02, exclude_initial=1)
+    metrics = clip_metrics(packed, .02, exclude_initial=1) if source is not None else _canonical_tracking_metrics(states, control, joint_order, source_body_names)
     # The legacy metric's |a|>=1 statistic is not saturation of G1 PD offsets.
     metrics["action_abs_ge_one_fraction"] = metrics.pop("action_at_clip_fraction")
     metrics["action_abs_ge_twenty_fraction"] = float((control["action"].abs() >= 20).float().mean())
@@ -155,13 +205,16 @@ def score_rollout(states, control, motion, clip_id, joint_order, *, max_human_re
     expected, valid = (value.detach().cpu() for value in motion.expected(frames))
     contacts = _contact_metrics(control, expected, valid)
     from .diagnostics import source_flag_comparison
-    source_comparison = source_flag_comparison(source[1:], expected, valid, source_body_names)
+    source_comparison = (source_flag_comparison(source[1:], expected[:, :2], valid[:, :2], source_body_names)
+                         if source is not None else {"available": False, "source_is_pair_truth": False,
+                         "affects_reward_or_gate": False, "reason": "source has no original ULTRA630 contact flags"})
     task_failure = torch.where(control["hoi_termination"].bool())[0]
     contact_pass = contacts["all_known_expected_contact_matched"]
     full_human = control["human_reward"].sum()
     full_hoi = control["reward"].sum()
-    approach_available = ((expected > .5) & (valid > .5)).any(-1)
-    contact_available = ((valid > .5) & control["contact_valid"][:, :2].bool()).any(-1)
+    approach_available = ((expected[:, :2] > .5) & (valid[:, :2] > .5)).any(-1)
+    # Signed contact reward has a positive ceiling only when a positive target exists.
+    contact_available = ((expected > .5) & (valid > .5) & control["contact_valid"].bool()).any(-1)
     # Human .10 + object pose/velocity .04 are always available. Each of
     # approach and pair-match contributes at most .005 when its mask is valid.
     from .variants import reward_config, max_step_reward
@@ -195,8 +248,6 @@ def evaluate_group(policy, motion, mdp, shapes, workers, clip_ids, *, fk39, join
     Worker snapshots must use global bank frames and retain the post-action
     state. Any reset or early frame jump is rejected, rather than scored.
     """
-    if motion.source_reference is None:
-        raise ValueError("evaluation must retain the original source reference630")
     group_metadata = deepcopy(metadata or {})
     group_metadata.setdefault("evaluation_source_content_sha256", source_identity()["content_sha256"])
     group_metadata.setdefault("checkpoint_training_source_content_sha256", None)
@@ -204,7 +255,7 @@ def evaluate_group(policy, motion, mdp, shapes, workers, clip_ids, *, fk39, join
     group_metadata.setdefault("checkpoint_training_progress", checkpoint_training_progress({}))
     if (group_metadata.get("contact_label_schema", LABEL_SCHEMA) != LABEL_SCHEMA or
             tuple(group_metadata.get("contact_channels", CHANNELS)) != CHANNELS):
-        raise ValueError("evaluation metadata differs from the current five-channel contact contract")
+        raise ValueError("evaluation metadata differs from the current 16-channel contact contract")
     group_metadata["contact_channels"] = list(CHANNELS)
     group_metadata["contact_label_schema"] = LABEL_SCHEMA
     if "contact_schema" in group_metadata:
@@ -244,6 +295,12 @@ def evaluate_group(policy, motion, mdp, shapes, workers, clip_ids, *, fk39, join
         if not torch.allclose(first["body_pos"][:, common], tracked.detach().cpu(), atol=2e-4, rtol=0):
             raise ValueError("ULTRA39 and original 14-body FK differ beyond the kinematic gate")
     records.append(first)
+    if "support_pose_xyzw" in first:
+        from .scene_supports import SUPPORT_IDS, SCENE_SUPPORT_SCHEMA, omni_support_recipe, digest
+        group_metadata["scene_support_display"]={"schema":SCENE_SUPPORT_SCHEMA,"support_ids":list(SUPPORT_IDS),
+            "pose_source":"saved_native_world_transforms_relative_to_environment_origin",
+            "reference_pose_source":"saved_sampled_reset_frame_held_for_episode",
+            "quaternion":"xyzw","geometry_recipe":omni_support_recipe(),"geometry_recipe_sha256":digest(omni_support_recipe())}
     try:
         for step in range(int(lengths.max())):
             f = torch.minimum(starts + step, ends)
@@ -255,7 +312,8 @@ def evaluate_group(policy, motion, mdp, shapes, workers, clip_ids, *, fk39, join
             hg, og = motion.goal(f, 10), motion.object_goal(S, O, f, 10)
             robot_hist = robot[:, None].expand(-1, 10, -1).clone() if robot_hist is None else torch.cat((robot_hist[:, 1:], robot[:, None]), 1)
             object_hist = obj[:, None].expand(-1, 10, -1).clone() if object_hist is None else torch.cat((object_hist[:, 1:], obj[:, None]), 1)
-            actor_extra = {}
+            from .scene_context import scene_from_record
+            actor_extra = {"scene_context":scene_from_record(S,snapshot)}
             if getattr(policy, "is_privileged_teacher", False):
                 previous = S if previous_teacher_state is None else previous_teacher_state
                 actor_extra["privileged"] = mdp.privileged_features(
@@ -287,7 +345,8 @@ def evaluate_group(policy, motion, mdp, shapes, workers, clip_ids, *, fk39, join
                       "contact_valid": transition["contact_valid"], "contact_impulse_Ns": transition["impulse"],
                       "expected_contact": expected, "expected_valid": expected_valid,
                       "contact_missing_counter": transition["contact_missing_counter"],
-                      "xi": snapshot["xi"], "xi_o": snapshot["xi_o"]}
+                      "xi": snapshot["xi"], "xi_o": snapshot["xi_o"],
+                      "support_pose_xyzw":snapshot["support_pose_xyzw"],"support_present":snapshot["support_present"]}
             if "contact_force" in transition:
                 values["contact_force_N"] = transition["contact_force"]
             if "failure_reason" in transition:
@@ -316,7 +375,9 @@ def evaluate_group(policy, motion, mdp, shapes, workers, clip_ids, *, fk39, join
             metrics["simulator_imagined_reward_gap"] = {"available": False, "reason": "frozen checkpoint WM not supplied"}
         name = f"case_{clip:05d}"
         extra = deepcopy(group_metadata)
-        source_frames = extra.get("clips", [{}] * len(motion.clip_len))[clip].get("source_frames") if "clips" in extra else None
+        clip_metadata = extra.get("clips", [{}] * len(motion.clip_len))[clip] if "clips" in extra else {}
+        # Curated sources already have an audited 50 Hz grid; never reinterpret native frame counts as 60 Hz.
+        source_frames = clip_metadata.get("source_frames") if motion.source_reference is not None else None
         clock = CanonicalTimebase().sample_grid(source_frames) if source_frames is not None else {"time": torch.arange(T + 1, dtype=torch.float64) * .02}
         if len(clock["time"]) != T + 1:
             raise ValueError("source60/control50 canonical frame count differs from recorded evaluation")
@@ -326,7 +387,7 @@ def evaluate_group(policy, motion, mdp, shapes, workers, clip_ids, *, fk39, join
                                 "virtual_body_quaternion": "xyzw", "body_names": list(fk39.body_names),
                                 "joint_names": list(joint_names), "virtual_dof_names": list(fk39.dof_names),
                                 "body_velocity_reference_point": "URDF_COM; source velocity semantics remain unverified",
-                                "timebase": CanonicalTimebase().metadata(), "no_failure_reset": True,
+                                "timebase": CanonicalTimebase().metadata() if source_frames is not None else {"control_hz": 50, "source": "audited_curated_target_grid"}, "no_failure_reset": True,
                                 "source_frames": source_frames,
                                 "canonical_duration_s": (source_frames - 1) / 60 if source_frames is not None else None,
                                 "last_control_time_s": T / 50,
@@ -360,6 +421,9 @@ def _load_fk39(bundle, joint_names, device):
 def _read_bundle_header(path):
     from .prepare import BUNDLE_SCHEMA, _digest_json
     bundle = json.loads(Path(path).read_text(encoding="utf-8"))
+    from hoi.data.curated_bundle import CURATED_BUNDLE_SCHEMA, read_curated_bundle_header
+    if bundle.get("schema_version") == CURATED_BUNDLE_SCHEMA:
+        return read_curated_bundle_header(path)
     digest = bundle.pop("bundle_content_sha256", None)
     if bundle.get("schema_version") != BUNDLE_SCHEMA or digest != _digest_json(bundle):
         raise ValueError("training/evaluation bundle schema/content hash changed")
@@ -405,7 +469,7 @@ def _validate_contact_contract(contact):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--bundle", type=Path, required=True, help="prepared eval80/test40/selected partition bundle")
+    parser.add_argument("--bundle", type=Path, required=True, help="prepared protected_eval/eval80/test40 partition bundle")
     parser.add_argument("--training-bundle", type=Path, required=True, help="original checkpoint train bundle identity")
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
@@ -432,8 +496,11 @@ def main(argv=None):
     torch.manual_seed(args.seed)
     kin = G1Kinematics(args.device, mjcf_path=args.robot_mjcf)
     motion, shapes, bundle = load_bundle(args.bundle, kin, device=args.device, require_train=False, retain_source_reference=True)
-    manifest = read_manifest(bundle["manifest"]["path"])
-    joint_names = manifest["bindings"]["target_joint_names"]
+    if "reference_joint_names" in bundle:
+        joint_names = bundle["reference_joint_names"]
+    else:
+        manifest = read_manifest(bundle["manifest"]["path"])
+        joint_names = manifest["bindings"]["target_joint_names"]
     fk39 = _load_fk39(bundle, joint_names, args.device)
     mdp = HOIMDP(kin, motion, torch.tensor(default_joint_pos_list(), device=args.device), shapes, cfg=reward_config(variant))
     from .privileged import TEACHER_PROFILE, configure_teacher

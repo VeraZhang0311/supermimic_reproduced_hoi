@@ -286,10 +286,8 @@ def main(argv=None):
             from .state import unflatten_state, unflatten_object
             window, wm_selection = full_active_wm_windows(replay, config.wm_batch, config.wm_window)
             predicted_s, predicted_o, logits = learner.wm_rollout(window)
-            ratio = learner.contact_negative / learner.contact_positive.clamp_min(1)
-            weights = torch.where(learner.contact_positive > 0, ratio, torch.ones_like(ratio)).clamp(1e-3, 100).float()
             losses = learner.wm.loss(predicted_s, predicted_o, unflatten_state(window["s1"]), unflatten_object(window["o1"]),
-                                     logits, window["contact"], window["contact_valid"], window["mask"], pos_weight=weights)
+                                     logits, window["contact"], window["contact_valid"], window["mask"])
             losses["total"].backward()
             wm_norm = torch.nn.utils.clip_grad_norm_(learner.wm.parameters(), 1.)
             wm_gradients = [p.grad for p in learner.wm.parameters() if p.grad is not None]
@@ -337,7 +335,8 @@ def main(argv=None):
                 f = torch.stack(trajectory["frames"]).flatten()
                 expand = lambda x: x[None].expand((probe.horizon + 1,) + x.shape).flatten(0, 1)
                 arguments = learner._critic_args(S, O, f, expand(normalize_xi(start["xi"])),
-                                                expand(start["xi_o"]), expand(start["asset_id"]))
+                                                expand(start["xi_o"]), expand(start["asset_id"]),
+                                         expand(start["support_pose_xyzw"]), expand(start["support_present"]))
                 learner.critic.update_normalizers(*arguments[:-1])
                 values = learner.critic(*arguments).reshape(probe.horizon + 1, probe.pi_batch)
                 target, targets = values[-1], []

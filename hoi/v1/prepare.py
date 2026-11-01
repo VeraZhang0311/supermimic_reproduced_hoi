@@ -542,6 +542,9 @@ def load_bundle(path, kin, device="cpu", require_train=True, asset_filter=None, 
                 retain_source_reference=None):
     path = Path(path)
     bundle = json.loads(path.read_text(encoding="utf-8"))
+    from hoi.data.curated_bundle import CURATED_BUNDLE_SCHEMA, load_curated_bundle
+    if bundle.get("schema_version") == CURATED_BUNDLE_SCHEMA:
+        return load_curated_bundle(path, kin, device, require_train, asset_filter, verify_source, retain_source_reference)
     digest = bundle.pop("bundle_content_sha256", None)
     if bundle.get("schema_version") != BUNDLE_SCHEMA or digest != _digest_json(bundle):
         raise ValueError("bundle schema/content hash mismatch")
@@ -608,6 +611,8 @@ def load_bundle(path, kin, device="cpu", require_train=True, asset_filter=None, 
         clips.append({**entry, "reference": reference, "expected_contact": contacts["expected_contact"], "expected_valid": contacts["expected_valid"]})
         global_frames.append(torch.arange(offset, offset + n, dtype=torch.long, device=device))
         offset += n
+    if any(clip["expected_contact"].shape[-1] != 16 for clip in clips):
+        raise ValueError("legacy hand-only bundle is incompatible with region16; prepare a curated region-contact bundle")
     bank = TrainingMotionBank(clips, kin, device, bundle["partition"], retain_source_reference=retain_source_reference)
     bank.global_frame_index = torch.cat(global_frames)
     bank.asset_id = bank.asset_ids
@@ -644,7 +649,9 @@ def main(argv=None):
     parser.add_argument("--manifest", required=True)
     parser.add_argument("--assets", required=True, help="explicit collider/physical/hand recipe JSON")
     parser.add_argument("--output", required=True)
-    parser.add_argument("--partition", default="train", choices=("train", "eval80", "test40", "validation", "regression", "test"))
+    parser.add_argument("--partition", default="train", choices=("train", "protected_eval", "eval80", "test40", "validation", "regression", "test"))
+    parser.add_argument("--curated", action="store_true", help="manifest is a curated task/group split; consume frozen 50 Hz geometric labels")
+    parser.add_argument("--curated-geometry-cache", help="hash-bound deterministic geometry manifest shared by the complete curated partitions")
     parser.add_argument("--limit", type=int)
     parser.add_argument("--one-per-asset-resource-fixture", action="store_true",
                         help="explicit nonformal train subset: first real motion per exact asset, bound to the unchanged canonical manifest")
@@ -652,8 +659,17 @@ def main(argv=None):
     parser.add_argument("--jobs", type=int, default=1, help="explicit CPU processes for clip adaptation/contact labels; each child uses one Torch thread")
     args = parser.parse_args(argv)
     from supermimic.kinematics import G1Kinematics
-    bundle = prepare_bundle(args.manifest, args.assets, args.output, G1Kinematics("cpu", mjcf_path=args.robot_mjcf), partition=args.partition,
-                            limit=args.limit, jobs=args.jobs, one_per_asset_resource_fixture=args.one_per_asset_resource_fixture)
+    if args.curated:
+        from hoi.data.curated_bundle import prepare_curated_bundle
+        if args.limit is not None or args.one_per_asset_resource_fixture:
+            parser.error("curated preparation requires the complete selected partition")
+        bundle = prepare_curated_bundle(args.manifest, args.assets, args.output, G1Kinematics("cpu", mjcf_path=args.robot_mjcf),
+                                        partition=args.partition, geometry_cache_manifest=args.curated_geometry_cache)
+    else:
+        if args.curated_geometry_cache:
+            parser.error("--curated-geometry-cache requires --curated")
+        bundle = prepare_bundle(args.manifest, args.assets, args.output, G1Kinematics("cpu", mjcf_path=args.robot_mjcf), partition=args.partition,
+                                limit=args.limit, jobs=args.jobs, one_per_asset_resource_fixture=args.one_per_asset_resource_fixture)
     print(json.dumps({"bundle": str(Path(args.output).resolve() / "bundle.json"), "scope": bundle["scope"], "validation": bundle["validation"]}, ensure_ascii=False))
 
 

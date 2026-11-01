@@ -17,7 +17,7 @@ import torch
 
 from .networks import FEATURE_SCHEMA
 
-CHECKPOINT_SCHEMA = "supermimic_hoi_v1_checkpoint_1"
+CHECKPOINT_SCHEMA = "supermimic_hoi_v1_checkpoint_3"
 MODEL_KEYS = ("pi", "wm", "critic")
 
 
@@ -160,7 +160,7 @@ def validate_checkpoint_features(checkpoint):
         raise ValueError("checkpoint actor profile and training configuration disagree")
     expected = feature_schema(profile, FEATURE_SCHEMA)
     if checkpoint.get("schema_version") != CHECKPOINT_SCHEMA or checkpoint.get("feature_schema") != expected:
-        raise ValueError("checkpoint feature schema/version differs; five-channel hand/foot-object contact requires an explicit migration for old three-channel HOI checkpoints")
+        raise ValueError("checkpoint feature schema/version differs; 16-channel region contact and observed scene context require migration for old scene-less or three/five-channel HOI checkpoints")
 
 
 def load_checkpoint(path, policy, wm, critic, optimizers=None, *, physics, data_identity, map_location="cpu", variant="hoi_v1"):

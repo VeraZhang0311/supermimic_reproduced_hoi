@@ -86,6 +86,31 @@ class PeriodicEvaluationTests(unittest.TestCase):
     def request(self, receipt):
         return json.loads(Path(receipt["dispatch"]).read_text(encoding="utf-8"))
 
+    def test_complete_curated_protected_partition_replaces_fixed_eighty_count(self):
+        rows = [{"dataset": "grail_sitting", "clip_id": str(i)} for i in range(3)]
+        evaluation = {**deepcopy(self.evaluation), "partition": "protected_eval", "clips": deepcopy(rows),
+                      "scope": {"is_subset": False, "selected_motions": 3, "available_motions": 3}}
+        with patch("hoi.data.curated.read_split", return_value=({}, {"train": [], "protected_eval": rows})):
+            self.assertTrue(validate_canonical80(self.train, evaluation))
+            bad=deepcopy(evaluation);bad["clips"][0]["clip_id"]="unprotected"
+            with self.assertRaisesRegex(ValueError,"complete frozen protected_eval"):
+                validate_canonical80(self.train,bad)
+            bad=deepcopy(evaluation);bad["clips"].pop()
+            with self.assertRaisesRegex(ValueError,"complete frozen protected_eval"):
+                validate_canonical80(self.train,bad)
+            bad=deepcopy(evaluation);bad["scope"]["is_subset"]=True
+            with self.assertRaisesRegex(ValueError,"complete frozen protected_eval"):
+                validate_canonical80(self.train,bad)
+
+    def test_teacher_feature_schema_is_valid_for_frozen_dispatch(self):
+        from hoi.v1.privileged import TEACHER_PROFILE, feature_schema
+        self.checkpoint["actor_observation_profile"]=TEACHER_PROFILE
+        self.checkpoint["feature_schema"]=feature_schema(TEACHER_PROFILE,FEATURE_SCHEMA)
+        torch.save(self.checkpoint,self.ck)
+        result=self.call(dry_run=True)
+        self.assertEqual(result["status"],"dry_run")
+        self.assertEqual(result["scheduler_calls"],0)
+
     def test_dry_run_reviewable_exact_hashes_no_scheduler_or_credentials(self):
         with patch("hoi.v1.periodic_eval.subprocess.run", side_effect=AssertionError("no scheduler in dry run")):
             result = self.call(dry_run=True)

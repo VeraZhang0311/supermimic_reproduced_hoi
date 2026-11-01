@@ -10,6 +10,7 @@ from hoi.data.reference import adapt_motion
 from hoi.v1.geometry import contact_missing_counter
 from hoi.v1.mdp import HOIMDP, HOIRewardCfg
 from hoi.v1.motion import TrainingMotionBank
+from hoi.v1.contacts import CHANNELS
 from supermimic.motion import MotionLib
 
 
@@ -49,8 +50,8 @@ class DistanceShapes:
 def bank_fixture():
     ref = reference()
     n = len(ref["robot"]["root_pos"])
-    clips = [{"reference": ref, "asset_id": 0, "expected_contact": torch.ones(n, 2), "expected_valid": torch.ones(n, 2)},
-             {"reference": ref, "asset_id": 1, "expected_contact": torch.zeros(n, 2), "expected_valid": torch.ones(n, 2)}]
+    clips = [{"reference": ref, "asset_id": 0, "expected_contact": torch.ones(n, len(CHANNELS)), "expected_valid": torch.ones(n, len(CHANNELS))},
+             {"reference": ref, "asset_id": 1, "expected_contact": torch.zeros(n, len(CHANNELS)), "expected_valid": torch.ones(n, len(CHANNELS))}]
     return TrainingMotionBank(clips, DummyKin())
 
 
@@ -68,7 +69,7 @@ class HOIMDPTests(unittest.TestCase):
         torch.testing.assert_close(self.mdp.obs(self.S, self.a, self.xi, self.f), self.mdp.human.obs(self.S, self.a, self.xi, self.f), rtol=0, atol=0)
         zero = HOIRewardCfg(w_position=0, w_orientation=0, w_linear_velocity=0, w_angular_velocity=0, w_approach=0, w_contact=0)
         self.mdp.cfg = zero
-        reward = self.mdp.reward(self.S, self.O, self.f, self.a, self.a, torch.zeros(2, 3))
+        reward = self.mdp.reward(self.S, self.O, self.f, self.a, self.a, torch.zeros(2, len(CHANNELS)))
         torch.testing.assert_close(reward, self.mdp.human.reward(self.S, self.f, self.a, self.a), rtol=0, atol=0)
         torch.testing.assert_close(self.mdp.termination(self.S, self.O, self.f), self.mdp.human.termination(self.S, self.f))
 
@@ -81,7 +82,7 @@ class HOIMDPTests(unittest.TestCase):
             mdp = HOIMDP(DummyKin(), self.bank, torch.zeros(29), PerfectShapes(), cfg)
             self.assertEqual(mdp.max_step_reward, ceiling)
             reward = mdp.reward(self.S, self.O, self.f, self.a, self.a,
-                                torch.cat((self.bank.expected(self.f)[0], torch.zeros(2,1)), -1))
+                                self.bank.expected(self.f)[0])
             torch.testing.assert_close(reward[:1], torch.full_like(reward[:1], ceiling), atol=1e-6, rtol=0)
             self.assertTrue(bool((reward <= ceiling + 1e-7).all()))
             self.assertEqual(max_step_reward(name), mdp.max_step_reward)
@@ -104,26 +105,26 @@ class HOIMDPTests(unittest.TestCase):
         self.assertEqual(self.bank.goal(self.f, 10).shape, (2, 730))
         self.assertEqual(self.mdp.obs(self.S, self.a, self.xi, self.f).shape, (2, 99))
         self.assertEqual(self.mdp.object_obs(self.S, self.O, self.f).shape, (2, 18))
-        self.assertEqual(self.bank.object_goal(self.S, self.O, self.f).shape, (2, 190))
-        self.assertEqual(self.mdp.critic_features(self.S, self.O, self.f, self.xi).shape, (2, 1138))
+        self.assertEqual(self.bank.object_goal(self.S, self.O, self.f).shape, (2, 470))
+        self.assertEqual(self.mdp.critic_features(self.S, self.O, self.f, self.xi).shape, (2, 1446))
         end = self.bank.clip_end.clone()
-        goals = self.bank.object_goal(self.bank.ref_state(end), self.bank.ref_object(end), end).reshape(2, 10, 19)
-        self.assertFalse(bool(goals[..., -4:].any()))
+        goals = self.bank.object_goal(self.bank.ref_state(end), self.bank.ref_object(end), end).reshape(2, 10, 47)
+        self.assertFalse(bool(goals[..., -32:].any()))
         future = self.bank.future_frames(torch.tensor([int(self.bank.clip_end[0]) - 1]), 10)
         self.assertTrue(bool((future <= self.bank.clip_end[0]).all()))
         self.assertTrue(bool((self.bank.asset_ids[future] == 0).all()))
 
     def test_current_heading_and_pose_recomputed_each_imagined_tick(self):
         shifted = (self.S[0] + torch.tensor([.3, -.2, 0]), *self.S[1:])
-        a = self.bank.object_goal(self.S, self.O, self.f).reshape(2, 10, 19)
-        b = self.bank.object_goal(shifted, self.O, self.f).reshape(2, 10, 19)
+        a = self.bank.object_goal(self.S, self.O, self.f).reshape(2, 10, 47)
+        b = self.bank.object_goal(shifted, self.O, self.f).reshape(2, 10, 47)
         torch.testing.assert_close(b[..., :3] - a[..., :3], torch.tensor([-.3, .2, 0]).expand(2, 10, 3))
         # Human future stays reference-only under the same simulated perturbation.
         torch.testing.assert_close(self.bank.goal(self.f, 10), self.bank.goal(self.f, 10), atol=0, rtol=0)
 
     def test_object_reward_gradients_and_finite_difference(self):
         p = (self.O[0] + torch.tensor([.03, .01, 0])).detach().requires_grad_(True)
-        probability = torch.full((2, 3), .4, requires_grad=True)
+        probability = torch.full((2, len(CHANNELS)), .4, requires_grad=True)
         O = (p, *self.O[1:])
         reward = self.mdp.reward(self.S, O, self.f, self.a, self.a, probability).sum()
         grad_p, grad_c = torch.autograd.grad(reward, (p, probability))
@@ -145,8 +146,44 @@ class HOIMDPTests(unittest.TestCase):
         torch.testing.assert_close(updated, torch.tensor([[16, 0], [0, 5]]))
         self.assertFalse(bool(self.mdp.termination(self.S, self.O, self.f).any()))
         self.bank.expected_valid.zero_()
-        _, terms = self.mdp.reward(self.S, self.O, self.f, self.a, self.a, torch.zeros(2, 3), terms=True)
+        _, terms = self.mdp.reward(self.S, self.O, self.f, self.a, self.a, torch.zeros(2, len(CHANNELS)), terms=True)
         self.assertFalse(bool(terms["hand_approach"].any() | terms["contact_match"].any()))
+
+    def test_contact_reward_balances_sets_and_masks_unknown_gradients(self):
+        # One required region and fourteen forbidden regions each get one
+        # normalized set vote; the final region is unknown.
+        self.bank.expected_contact[self.f] = 0
+        self.bank.expected_valid[self.f] = 1
+        self.bank.expected_contact[self.f, 7] = 1
+        self.bank.expected_valid[self.f, 15] = 0
+        probabilities = torch.full((2, 16), .2, requires_grad=True)
+        with torch.no_grad():
+            probabilities[:, 7] = .8
+            probabilities[:, 15] = .99
+        _, terms = self.mdp.reward(self.S, self.O, self.f, self.a, self.a, probabilities, terms=True)
+        torch.testing.assert_close(terms["contact_match"], torch.full((2,), (.8 - .2) * .02))
+        torch.testing.assert_close(terms["hand_approach"], torch.zeros(2))
+        terms["contact_match"].sum().backward()
+        torch.testing.assert_close(probabilities.grad[:, 7], torch.full((2,), .02))
+        torch.testing.assert_close(probabilities.grad[:, 0], torch.full((2,), -.02 / 14))
+        torch.testing.assert_close(probabilities.grad[:, 15], torch.zeros(2))
+        self.bank.expected_valid[self.f] = 0
+        _, unknown = self.mdp.reward(self.S, self.O, self.f, self.a, self.a, probabilities, terms=True)
+        torch.testing.assert_close(unknown["contact_match"], torch.zeros(2))
+
+    def test_contact_reward_empty_sets_and_actual_validity(self):
+        probabilities = torch.full((2, 16), .3)
+        self.bank.expected_contact[self.f] = 0
+        _, negatives = self.mdp.reward(self.S, self.O, self.f, self.a, self.a, probabilities, terms=True)
+        torch.testing.assert_close(negatives["contact_match"], torch.full((2,), -.3 * .02))
+        self.bank.expected_contact[self.f] = 1
+        _, positives = self.mdp.reward(self.S, self.O, self.f, self.a, self.a, probabilities, terms=True)
+        torch.testing.assert_close(positives["contact_match"], torch.full((2,), .3 * .02))
+        _, invalid = self.mdp.reward(self.S, self.O, self.f, self.a, self.a, probabilities,
+                                   contact_valid=torch.zeros_like(probabilities), terms=True)
+        torch.testing.assert_close(invalid["contact_match"], torch.zeros(2))
+        with self.assertRaisesRegex(ValueError, "16 region"):
+            self.mdp.reward(self.S, self.O, self.f, self.a, self.a, probabilities[:, :5])
 
     def test_object_hard_and_joint_soft_termination(self):
         O = (self.O[0] + torch.tensor([1.01, 0, 0]), *self.O[1:])
@@ -155,11 +192,25 @@ class HOIMDPTests(unittest.TestCase):
         op = torch.sigmoid((torch.tensor(1.01) - 1) / .1)
         torch.testing.assert_close(self.mdp.soft_termination(self.S, O, self.f), 1 - (1 - rp) * (1 - op))
 
+    def test_protected_eval_accepts_native_reference_without_ultra_cache(self):
+        ref = reference()
+        ref.pop("source_sampled")
+        n = len(ref["robot"]["root_pos"])
+        bank = TrainingMotionBank([{"reference": ref, "asset_id": 0,
+            "expected_contact": torch.zeros(n, 16), "expected_valid": torch.zeros(n, 16)}],
+            DummyKin(), partition="protected_eval")
+        self.assertIsNone(bank.source_reference)
+        self.assertEqual(bank.partition, "protected_eval")
+        self.assertEqual(bank.expected_contact.shape, (n, 16))
+        with self.assertRaisesRegex(ValueError, "16 region"):
+            TrainingMotionBank([{"reference": ref, "asset_id": 0,
+                "expected_contact": torch.zeros(n, 2), "expected_valid": torch.zeros(n, 2)}], DummyKin())
+
     def test_reset_bins_never_contain_only_the_terminal_state(self):
         ref = reference(61)  # 50 controls, 51 states; old bin loop adds state50.
         n = len(ref["time"])
         bank = TrainingMotionBank([{"reference": ref, "asset_id": 0,
-            "expected_contact": torch.zeros(n,2), "expected_valid": torch.zeros(n,2)}], DummyKin())
+            "expected_contact": torch.zeros(n,len(CHANNELS)), "expected_valid": torch.zeros(n,len(CHANNELS))}], DummyKin())
         self.assertEqual((bank.num_frames, bank.num_bins), (51,1))
         torch.testing.assert_close(bank.bin_start, torch.tensor([0]))
         self.assertTrue(bool((bank.bin_start < bank.clip_end[bank.bin_clip]).all()))

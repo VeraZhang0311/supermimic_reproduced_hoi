@@ -330,9 +330,8 @@ class BundleTests(unittest.TestCase):
             for key in original:
                 if key not in ("native_robot_asset", "validation", "bundle_content_sha256"):
                     self.assertEqual(result[key], original[key], key)
-            bank, _, loaded = load_bundle(self.root / "extended_bundle/bundle.json", self.kin)
-            self.assertEqual(bank.num_frames, sum(clip["state_frames"] for clip in original["clips"]))
-            self.assertEqual(loaded, result)
+            with self.assertRaisesRegex(ValueError, "legacy hand-only bundle"):
+                load_bundle(self.root / "extended_bundle/bundle.json", self.kin)
             foot.write_bytes(foot.read_bytes() + b"tamper")
             with self.assertRaisesRegex(ValueError, "foot-asset receipt bytes changed"):
                 load_bundle(self.root / "extended_bundle/bundle.json", self.kin)
@@ -363,12 +362,10 @@ class BundleTests(unittest.TestCase):
         bundle = prepare_bundle(self.manifest, self.recipes, output, self.kin)
         self.assertEqual(bundle["scope"]["selected_motions"], 2)
         self.assertEqual(bundle["validation"]["native_physics"], "not_run")
-        bank, shapes, loaded = load_bundle(output / "bundle.json", self.kin)
-        self.assertEqual(bank.num_frames, 4)
-        self.assertEqual(shapes.points(torch.tensor([1])).shape, (1,128,3))
-        filtered, _, _ = load_bundle(output / "bundle.json", self.kin, asset_filter=[1])
-        torch.testing.assert_close(filtered.global_frame_index, torch.tensor([2,3]))
-        self.assertTrue(bool((filtered.asset_ids == 1).all()))
+        with self.assertRaisesRegex(ValueError, "legacy hand-only bundle"):
+            load_bundle(output / "bundle.json", self.kin)
+        with self.assertRaisesRegex(ValueError, "legacy hand-only bundle"):
+            load_bundle(output / "bundle.json", self.kin, asset_filter=[1])
         for path, content in original.items():
             self.assertEqual(path.read_bytes(), content)
         with self.assertRaises(FileExistsError):
@@ -395,8 +392,8 @@ class BundleTests(unittest.TestCase):
         self.assertEqual(bundle["scope"]["purpose"], "one_per_asset_resource_fixture")
         self.assertEqual([c["asset_id"] for c in bundle["clips"]], [0,1])
         self.assertEqual(bundle["manifest"]["sha256"], hashlib.sha256(original_manifest).hexdigest())
-        bank, _, _ = load_bundle(output / "bundle.json", self.kin)
-        self.assertEqual(bank.num_frames, 4)
+        with self.assertRaisesRegex(ValueError, "legacy hand-only bundle"):
+            load_bundle(output / "bundle.json", self.kin)
         for kwargs in ({"limit": 1}, {"partition": "eval80"}):
             with self.assertRaisesRegex(ValueError, "resource fixture requires train"):
                 prepare_bundle(self.manifest, self.recipes, self.root / "invalid_resource_fixture", self.kin,
@@ -414,8 +411,8 @@ class BundleTests(unittest.TestCase):
         prepare_bundle(self.manifest, self.recipes, output, self.kin, partition="eval80")
         with self.assertRaisesRegex(ValueError, "only train partition"):
             load_bundle(output / "bundle.json", self.kin)
-        bank, _, _ = load_bundle(output / "bundle.json", self.kin, require_train=False)
-        self.assertEqual(bank.partition, "eval80")
+        with self.assertRaisesRegex(ValueError, "legacy hand-only bundle"):
+            load_bundle(output / "bundle.json", self.kin, require_train=False)
 
     def test_parallel_preparation_keeps_frozen_order_and_calibrated_palm_evidence(self):
         recipe = json.loads(self.recipes.read_text(encoding="utf-8"))
@@ -427,10 +424,12 @@ class BundleTests(unittest.TestCase):
         bundle = prepare_bundle(self.manifest, self.recipes, output, self.kin, jobs=2)
         self.assertEqual([c["asset_id"] for c in bundle["clips"]], [0,1])
         self.assertEqual(bundle["preparation"]["cpu_processes"], 2)
-        bank, shapes, _ = load_bundle(output / "bundle.json", self.kin)
-        self.assertEqual(bank.num_frames, 4)
-        self.assertTrue(shapes.hands["left"]["palm_selection_verified"])
-        self.assertEqual(shapes.hands["right"]["palm_selection_evidence"]["selected_face_indices"], [6])
+        with self.assertRaisesRegex(ValueError, "legacy hand-only bundle"):
+            load_bundle(output / "bundle.json", self.kin)
+        from hoi.v1.prepare import _bound_load
+        hands = _bound_load(bundle["hands"]["geometry_cache"])
+        self.assertTrue(hands["left"]["palm_selection_verified"])
+        self.assertEqual(hands["right"]["palm_selection_evidence"]["selected_face_indices"], [6])
 
     def test_identity_only_stage1_object_binding_uses_canonical_asset_identity(self):
         bindings_path = self.root / "bindings.json"

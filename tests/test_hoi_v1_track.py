@@ -26,14 +26,14 @@ def inputs():
                 "wm": [{"total": 2., "robot": 1., "object": 1., "contact": .1, "source": SECRET}],
                 "actor": {"pi_loss": -.2, "v_loss": .1, "pi_gradnorm": .03, "token": SECRET},
                 "real": [{"human_reward_normalized": .9, "hoi_reward_normalized": .7, "terminations": 0, "raw_state": SECRET}],
-                "fit_contact_positive": [2, 4, 6, 8, 10], "fit_contact_negative": [20, 40, 60, 80, 100],
+                "fit_contact_positive": [2*(i+1) for i in range(len(CHANNELS))], "fit_contact_negative": [20*(i+1) for i in range(len(CHANNELS))],
                 "policy_gate": {"passed": False, "blockers": [SECRET]}, "sourcecode": SECRET}]
     evaluation = {"partition": "eval80", "checkpoint_sha256": "e" * 64, "checkpoint": SECRET,
                   "aggregate": {"count": 1, "human_normalized_return": .9, "hoi_normalized_return": .7, "password": SECRET},
                   "cases": [{"id": SECRET, "object_asset": SECRET, "rollout": SECRET, "raw": SECRET,
                              "human_normalized_return": .9, "hoi_normalized_return": .7, "phc_pass": True,
                              "object_position_m": {"mean": .04, "max": .1, "path": SECRET},
-                             "contact": {"expected_contact_coverage": .8, "missing_contact_intervals": [2, 0], "source": SECRET}}]}
+                             "contact": {"expected_contact_coverage": .8, "missing_contact_intervals": [2] + [0] * (len(CHANNELS)-1), "source": SECRET}}]}
     return plan, records, evaluation
 
 
@@ -50,15 +50,15 @@ class TrackingEnvironment(unittest.TestCase):
 
 
 class TrackingTest(TrackingEnvironment):
-    def test_five_channel_feet_counts_events_and_impulses_are_curated_without_expected_feet(self):
+    def test_region_counts_events_and_impulses_include_expected_feet(self):
         plan, rows, evaluation = inputs()
         for value in (plan, rows[0], evaluation):
             value.update(contact_channels=list(CHANNELS), contact_label_schema=LABEL_SCHEMA)
         contact = evaluation["cases"][0]["contact"]
         contact.update(channels=list(CHANNELS), label_schema=LABEL_SCHEMA,
-                       actual_positive_intervals=[1, 2, 3, 4, 5], actual_valid_intervals=[6] * 5,
-                       actual_pair_valid_fraction=[1.] * 5, actual_contact_fraction=[.1, .2, .3, .4, .5],
-                       maximum_interval_normal_impulse_Ns=[.01, .02, .03, .04, .05],
+                       actual_positive_intervals=list(range(1, len(CHANNELS)+1)), actual_valid_intervals=[6] * len(CHANNELS),
+                       actual_pair_valid_fraction=[1.] * len(CHANNELS), actual_contact_fraction=[.1] * len(CHANNELS),
+                       maximum_interval_normal_impulse_Ns=[.01*(i+1) for i in range(len(CHANNELS))],
                        actual_transition_events={"channels": {
                            "left_foot_object": {"onset_count": 2, "release_count": 1, "valid_adjacent_intervals": 4,
                                                 "onset_endpoint_times_s": [.1, .2], "raw": SECRET},
@@ -66,34 +66,34 @@ class TrackingTest(TrackingEnvironment):
                        expected_transition_events={"channels": {"left_foot_object": {"onset_count": 99}}})
         payload = build_payload(plan, rows, evaluation)
         self.assertEqual(payload["config"]["contact/label_schema"], LABEL_SCHEMA)
-        self.assertEqual(payload["config"]["contact/channel_count"], 5)
+        self.assertEqual(payload["config"]["contact/channel_count"], len(CHANNELS))
         metrics = payload["events"][0]["metrics"]
-        self.assertEqual(metrics["contact/fit_positive/left_foot_object"], 8)
-        self.assertEqual(metrics["contact/fit_negative/right_foot_object"], 100)
+        self.assertEqual(metrics["contact/fit_positive/left_foot_object"], 26)
+        self.assertEqual(metrics["contact/fit_negative/right_foot_object"], 280)
         prefix = "evaluation/case_00000/contact/"
         self.assertEqual(payload["summary"][prefix + "actual_events/left_foot_object/onset_count"], 2)
         self.assertEqual(payload["summary"][prefix + "actual_events/right_foot_object/release_count"], 3)
-        self.assertEqual(payload["summary"][prefix + "actual_positive_intervals/right_foot_object"], 5)
-        self.assertEqual(payload["summary"][prefix + "maximum_interval_normal_impulse_Ns/left_foot_object"], .04)
-        self.assertNotIn(prefix + "expected_events/left_foot_object/onset_count", payload["summary"])
+        self.assertEqual(payload["summary"][prefix + "actual_positive_intervals/right_foot_object"], 14)
+        self.assertEqual(payload["summary"][prefix + "maximum_interval_normal_impulse_Ns/left_foot_object"], .13)
+        self.assertEqual(payload["summary"][prefix + "expected_events/left_foot_object/onset_count"], 99)
         self.assertNotIn(SECRET, json.dumps(payload, allow_nan=False))
         self.assertNotIn("onset_endpoint_times_s", json.dumps(payload))
 
     def test_old_three_channel_contract_and_counters_are_not_silently_uploaded(self):
         plan, rows, evaluation = inputs()
-        with self.assertRaisesRegex(ValueError, "five-channel"):
+        with self.assertRaisesRegex(ValueError, "16-channel"):
             build_payload({**plan, "contact_channels": list(CHANNELS[:3]),
                            "contact_label_schema": "hoi_v1_pair_normal_impulse_v1"}, rows, evaluation)
         plan.update(contact_channels=list(CHANNELS), contact_label_schema=LABEL_SCHEMA)
-        with self.assertRaisesRegex(ValueError, "five-channel"):
+        with self.assertRaisesRegex(ValueError, "16-channel"):
             build_payload(plan, rows, {**evaluation, "contact_channels": list(CHANNELS[:3]),
                                       "contact_label_schema": "hoi_v1_pair_normal_impulse_v1"})
         rows[0]["fit_contact_positive"] = rows[0]["fit_contact_positive"][:3]
-        with self.assertRaisesRegex(ValueError, "all five"):
+        with self.assertRaisesRegex(ValueError, "all 16"):
             build_payload(plan, rows, evaluation)
-        rows[0]["fit_contact_positive"] = [2, 4, 6, 8, 10]
+        rows[0]["fit_contact_positive"] = [2*(i+1) for i in range(len(CHANNELS))]
         evaluation["cases"][0]["contact"]["actual_contact_fraction"] = [1., 1., 1.]
-        with self.assertRaisesRegex(ValueError, "all five"):
+        with self.assertRaisesRegex(ValueError, "all 16"):
             build_payload(plan, rows, evaluation)
 
     def test_wm_quality_diagnostic_is_distinct_from_actual_policy_schedule(self):

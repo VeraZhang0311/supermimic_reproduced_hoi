@@ -94,11 +94,15 @@ def _snapshot(env):
     from .state import flatten_object
     S, O = env.state()
     f = env.f
-    return {"s": flatten_state(S), "o": flatten_object(O), "a_prev": env.a_prev.clone(),
+    snapshot = {"s": flatten_state(S), "o": flatten_object(O), "a_prev": env.a_prev.clone(),
             "xi": env.xi.clone(), "xi_o": env.xi_o.clone(),
             "f": env.motion.global_frame_index[f] if hasattr(env.motion, "global_frame_index") else f.clone(),
             "ep_step": env.ep_step.clone(), "asset_id": env.asset_id.clone(),
             "contact_missing_counter": env.contact_missing_counter.clone()}
+
+    # The same observed stationary scene feeds actor, replay and offline display.
+    snapshot.update(env.support_state())
+    return snapshot
 
 
 def _worker_main(connection, spec, config):

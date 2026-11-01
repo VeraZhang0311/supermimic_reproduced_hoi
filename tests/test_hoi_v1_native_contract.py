@@ -9,15 +9,25 @@ import json
 import torch
 
 from hoi.v1.contacts import (CHANNELS, LABEL_SCHEMA, GROUND, LEFT, RIGHT, OBJECT, OTHER, LEFT_FOOT, RIGHT_FOOT,
-                             PairContactRecorder, SolverContactAdapter, compiled_geom_roles,
+                             PairContactRecorder, SolverContactAdapter, compiled_geom_roles, BODY_ROLES, LINK_ROLES,
+                             BODY_GROUP_LINKS, CHANNEL_INDEX, canonical_geom_link,
                              aggregate_pairs, aggregate_ground_pairs, normal_impulse_to_label)
 from hoi.v1.native import (HOITrackingSim, compiled_convex_mesh, compiled_foot_probe_surface,
                            compiled_foot_world_minimum, compiled_foot_geometry_audit,
-                           lift_foot_probe_above_ground,
+                           lift_foot_probe_above_ground, compiled_geom_support,
                            com_to_link_velocity, link_to_com_velocity, palm_patch_points, physical_context,
-                           validate_physical_profile, shallow_support_contact, configure_hoi_capacity)
+                           validate_physical_profile, shallow_support_contact, configure_hoi_capacity, validate_native_scene_supports)
 from hoi.v1.workers import allocate_workers, geometry_group, resource_preflight
 from supermimic.rotations import so3_exp
+
+
+def expanded_contacts(values):
+    """Historical test's five physical events in the new named channel space."""
+    values = torch.as_tensor(values)
+    out = values.new_zeros(*values.shape[:-1], len(CHANNELS))
+    out[..., [CHANNEL_INDEX[name] for name in ("left_hand_object", "right_hand_object", "object_ground",
+                                               "left_foot_object", "right_foot_object")]] = values
+    return out
 
 
 def asset(i, scale=1.):
@@ -69,6 +79,18 @@ def mesh_foot_manifest(folder):
 
 
 class NativeContractTests(unittest.TestCase):
+    def test_declared_scene_supports_are_not_silently_dropped_before_simulator_import(self):
+        validate_native_scene_supports(SimpleNamespace(names=['historical']))
+        validate_native_scene_supports(SimpleNamespace(names=['empty'], scene_supports=[[]]))
+        for support in ({'partner_id':'table1','official_table1_uses':True},
+                        {'kind':'table','status':'incomplete_metadata'}, {'parked_below_scene':True}):
+            motion = SimpleNamespace(names=['needs_support'], scene_supports=[[support]])
+            with self.assertRaisesRegex(ValueError, 'cannot omit declared scene supports'):
+                # The guard must run before optional IsaacLab imports or any spawn.
+                HOITrackingSim(None, 1, motion, None, None, None)
+        with self.assertRaisesRegex(ValueError, 'align'):
+            validate_native_scene_supports(SimpleNamespace(names=['missing'], scene_supports=[]))
+
     def test_hoi_capacity_copy_preserves_legacy_and_all_physical_settings(self):
         solver = SimpleNamespace(nconmax=128, njmax=500, cone="pyramidal", integrator="implicitfast",
                                  iterations=100, ls_iterations=50, tolerance=1e-6, use_mujoco_contacts=True)
@@ -200,7 +222,7 @@ class NativeContractTests(unittest.TestCase):
         pairs = torch.tensor([[1, 3], [3, 1], [2, 3], [3, 0], [1, 0], [1, 2], [4, 3], [-1, 3]])
         impulse = aggregate_pairs(roles, pairs, torch.zeros(8, dtype=torch.long), torch.ones(8) * 10,
                                   num_envs=1, substep_dt=.005)
-        torch.testing.assert_close(impulse, torch.tensor([[.1, .05, .05, 0., 0.]]))
+        torch.testing.assert_close(impulse, expanded_contacts([[.1, .05, .05, 0., 0.]]))
 
     def test_interval_sums_all_four_substeps(self):
         roles = torch.tensor([LEFT, RIGHT, OBJECT, GROUND])
@@ -209,8 +231,8 @@ class NativeContractTests(unittest.TestCase):
             sums += aggregate_pairs(roles, torch.tensor([[0, 2], [2, 3], [1, 2]]),
                                     torch.tensor([0, 1, 1]), torch.tensor([n, 10., 1.]), num_envs=2, substep_dt=.005)
         force, labels = normal_impulse_to_label(sums)
-        torch.testing.assert_close(force, torch.tensor([[3.5, 0., 0., 0., 0.], [0., 1., 10., 0., 0.]]))
-        self.assertEqual(labels.tolist(), [[True, False, False, False, False], [False, False, True, False, False]])
+        torch.testing.assert_close(force, expanded_contacts([[3.5, 0., 0., 0., 0.], [0., 1., 10., 0., 0.]]))
+        self.assertTrue(torch.equal(labels, expanded_contacts([[True, False, False, False, False], [False, False, True, False, False]])))
 
     def test_foot_roles_use_actual_active_ankle_roll_body_not_visual_or_shin_names(self):
         import mujoco
@@ -234,7 +256,9 @@ class NativeContractTests(unittest.TestCase):
         self.assertEqual(by_name["actual_right_toe"], RIGHT_FOOT)
         self.assertEqual(envs[names.index("actual_left_toe")], 0)
         self.assertEqual(envs[names.index("actual_right_toe")], 1)
-        for name in ("left_visual", "misleading_left_ankle_roll_link", "misleading_foot", "suffix_old"):
+        self.assertEqual(by_name["misleading_left_ankle_roll_link"], LINK_ROLES["left_knee_link"])
+        self.assertEqual(by_name["misleading_foot"], LEFT_FOOT)
+        for name in ("left_visual", "suffix_old"):
             self.assertEqual(by_name[name], OTHER, name)
         model.geom_contype[names.index("actual_right_toe")] = 0
         model.geom_conaffinity[names.index("actual_right_toe")] = 0
@@ -242,14 +266,15 @@ class NativeContractTests(unittest.TestCase):
             compiled_geom_roles(model)
 
     def test_foot_object_pair_directions_and_ground_negative_controls(self):
-        self.assertEqual(CHANNELS, ("left_hand_object", "right_hand_object", "object_ground", "left_foot_object", "right_foot_object"))
-        self.assertEqual(LABEL_SCHEMA, "hoi_v1_pair_normal_impulse_v2")
+        self.assertEqual(len(CHANNELS), 16)
+        self.assertEqual(CHANNELS[-1], "object_ground")
+        self.assertEqual(LABEL_SCHEMA, "hoi_v1_region_pair_normal_impulse_v3")
         roles = torch.tensor([LEFT_FOOT, RIGHT_FOOT, OBJECT, GROUND, OTHER])
         pairs = torch.tensor([[0, 2], [2, 0], [1, 2], [2, 1], [0, 3], [3, 1], [4, 2], [0, 1], [9, 2]])
         force = torch.tensor([4., 6., 8., 2., 100., 200., 300., 400., 500.])
         ids = torch.zeros(len(pairs), dtype=torch.long)
         impulse = aggregate_pairs(roles, pairs, ids, force, num_envs=1, substep_dt=.005)
-        torch.testing.assert_close(impulse, torch.tensor([[0., 0., 0., .05, .05]]))
+        torch.testing.assert_close(impulse, expanded_contacts([[0., 0., 0., .05, .05]]))
         ground = aggregate_ground_pairs(roles, pairs, ids, force, roles=(LEFT_FOOT, RIGHT_FOOT), num_envs=1, substep_dt=.005)
         torch.testing.assert_close(ground, torch.tensor([[.5, 1.]]))
 
@@ -260,8 +285,65 @@ class NativeContractTests(unittest.TestCase):
             sums += aggregate_pairs(roles, torch.tensor([[0, 2], [2, 1]]), torch.tensor([0, 1]),
                                     torch.tensor([left, 1.]), num_envs=2, substep_dt=.005)
         forces, labels = normal_impulse_to_label(sums)
-        torch.testing.assert_close(forces[:, 3:], torch.tensor([[3.5, 0.], [0., 1.]]))
-        self.assertEqual(labels[:, 3:].tolist(), [[True, False], [False, False]])
+        torch.testing.assert_close(forces[:, 12:14], torch.tensor([[3.5, 0.], [0., 1.]]))
+        self.assertEqual(labels[:, 12:14].tolist(), [[True, False], [False, False]])
+
+    def test_all_regions_object_pairs_and_ground_self_negative_controls(self):
+        roles = torch.tensor([*BODY_ROLES, OBJECT, GROUND])
+        obj, ground = 15, 16
+        pairs = torch.tensor([[i, obj] for i in range(15)] + [[obj, i] for i in range(15)] +
+                             [[i, ground] for i in range(15)] + [[i, (i + 1) % 15] for i in range(15)] + [[obj, ground]])
+        impulse = aggregate_pairs(roles, pairs, torch.zeros(len(pairs), dtype=torch.long),
+                                  torch.ones(len(pairs)) * 4, num_envs=1, substep_dt=.005)
+        torch.testing.assert_close(impulse[0, :15], torch.full((15,), .04))
+        self.assertAlmostEqual(float(impulse[0, 15]), .02)
+        control = aggregate_ground_pairs(roles, pairs, torch.zeros(len(pairs), dtype=torch.long),
+                                        torch.ones(len(pairs)) * 4, roles=BODY_ROLES, num_envs=1, substep_dt=.005)
+        torch.testing.assert_close(control, torch.full((1, 15), .02))
+
+    def test_region_impulse_combines_neighbor_colliders_once_before_threshold(self):
+        roles = torch.tensor([LINK_ROLES[link] for link in BODY_GROUP_LINKS[0]] + [OBJECT])
+        # Each link contributes less than 1 N; the regional sum is 1.5 N.
+        impulse = aggregate_pairs(roles, torch.tensor([[0, 3], [1, 3], [2, 3]]),
+                                  torch.zeros(3, dtype=torch.long), torch.full((3,), .5), num_envs=1, substep_dt=.02)
+        force, label = normal_impulse_to_label(impulse)
+        self.assertEqual(int(label.sum()), 1)
+        self.assertAlmostEqual(float(force[0, 0]), 1.5)
+
+    def test_fixed_collider_identity_survives_welding_without_movable_relabelling(self):
+        self.assertEqual(canonical_geom_link("env_0_head_link_collision", "env_0_torso_link"), "head_link")
+        self.assertEqual(canonical_geom_link("/Robot/torso_link/head_link/collision", "env_0_torso_link"), "head_link")
+        self.assertEqual(canonical_geom_link("env_0_logo_link_collision", "env_0_torso_link"), "logo_link")
+        self.assertEqual(canonical_geom_link("env_0_pelvis_contour_link_collision", "env_0_pelvis"), "pelvis_contour_link")
+        self.assertEqual(canonical_geom_link("env_0_left_rubber_hand_hull_0", "env_0_left_wrist_yaw_link"), "left_rubber_hand")
+        self.assertEqual(canonical_geom_link("misleading_left_ankle_roll_link", "left_knee_link"), "left_knee_link")
+        self.assertIsNone(canonical_geom_link("left_knee_link_old", "unknown_body"))
+
+    def test_full_region_compiled_mapping_and_missing_region_rejection(self):
+        import mujoco
+        bodies = ''.join(f'<body name="{link}"><geom name="{link}_collision" size=".01"/></body>'
+                         for links in BODY_GROUP_LINKS for link in links)
+        model = mujoco.MjModel.from_xml_string('<mujoco><worldbody><geom name="ground" type="plane" size="10 10 .1"/>' +
+            bodies + '<body name="env_0_Object"><geom size=".01"/></body></worldbody></mujoco>')
+        roles, _, names = compiled_geom_roles(model, require_all_regions=True)
+        for link, expected in LINK_ROLES.items():
+            self.assertEqual(roles[names.index(link + '_collision')], expected)
+        head = names.index('head_link_collision')
+        model.geom_contype[head] = model.geom_conaffinity[head] = 0
+        with self.assertRaisesRegex(RuntimeError, 'Missing native pair entities'):
+            compiled_geom_roles(model, require_all_regions=True)
+
+    def test_actual_support_for_capsule_box_and_ellipsoid(self):
+        import mujoco
+        model = mujoco.MjModel.from_xml_string('<mujoco><worldbody><geom type="capsule" size=".1 .2"/>'
+            '<geom type="box" size=".1 .2 .3"/><geom type="ellipsoid" size=".1 .2 .3"/></worldbody></mujoco>')
+        point, _, _ = compiled_geom_support(model, 0, [0, 0, -1])
+        torch.testing.assert_close(point, torch.tensor([0., 0., -.3], dtype=torch.float64))
+        point, normal, _ = compiled_geom_support(model, 1, [1, 2, 1], facet=True)
+        torch.testing.assert_close(point, torch.tensor([0., .2, 0.], dtype=torch.float64))
+        torch.testing.assert_close(normal, torch.tensor([0., 1., 0.], dtype=torch.float64))
+        point, _, _ = compiled_geom_support(model, 2, [0, 0, -1])
+        torch.testing.assert_close(point, torch.tensor([0., 0., -.3], dtype=torch.float64))
 
     def test_native_recorder_isolates_named_environments_and_rejects_cross_env_dynamics(self):
         # The same native after_substep reduction runs against a thin CPU array
@@ -282,12 +364,21 @@ class NativeContractTests(unittest.TestCase):
         recorder.forces = torch.zeros(3, 6)
         recorder.forces[:, 0] = torch.tensor([8., 4., 3.])
         recorder.impulse = torch.zeros(2, len(CHANNELS))
+        recorder.body_ground_impulse = torch.zeros(2, len(BODY_ROLES))
+        recorder.support_impulse = torch.zeros(2, 2, len(BODY_ROLES)+1)
         recorder.hand_ground_impulse = torch.zeros(2, 2)
         recorder.foot_ground_impulse = torch.zeros(2, 2)
         recorder.calls = 0
         recorder.after_substep(.005)
-        torch.testing.assert_close(recorder.impulse[:, 3:], torch.tensor([[.04, 0.], [0., .02]]))
+        torch.testing.assert_close(recorder.impulse[:, 12:14], torch.tensor([[.04, 0.], [0., .02]]))
         torch.testing.assert_close(recorder.foot_ground_impulse, torch.tensor([[0., 0.], [0., .015]]))
+        recorder.forces[0, 0] = float('nan')
+        with self.assertRaisesRegex(RuntimeError, "Nonfinite active native contact force"):
+            recorder.after_substep(.005)
+        recorder.forces[0, 0] = 8.
+        data.contact.geom[0] = torch.tensor([-1, 1])
+        with self.assertRaisesRegex(RuntimeError, "Invalid active native contact identity"):
+            recorder.after_substep(.005)
         data.contact.geom[0] = torch.tensor([0, 3])
         with self.assertRaisesRegex(RuntimeError, "crosses environment boundaries"):
             recorder.after_substep(.005)

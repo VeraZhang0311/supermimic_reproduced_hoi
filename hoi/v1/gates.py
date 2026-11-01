@@ -15,7 +15,8 @@ import sys
 
 import torch
 
-from .contacts import CHANNELS, LABEL_SCHEMA
+from .contacts import CHANNELS, LABEL_SCHEMA, GROUP_SCHEMA, REGION_LINKS
+from .native_acceptance import native_acceptance_blockers
 
 
 class GateError(RuntimeError):
@@ -123,7 +124,7 @@ def _preserved_foot_physics(physical):
 
 
 def _native_foot_evidence(report, physics, contact, prefix):
-    """The five-channel experiment requires the explicitly bound mesh-foot profile."""
+    """The region-contact experiment requires the explicitly bound mesh-foot profile."""
     from .foot_collision import FOOT_PROFILE, FOOT_SCHEMA, FOOT_SHA, ULTRA_URDF_SHA256, RECIPE, ORIGINAL_VHACD
     audit = report.get("compiled_foot_audit", physics.get("compiled_foot_audit", {}))
     blockers = []
@@ -181,9 +182,9 @@ def _native_foot_evidence(report, physics, contact, prefix):
 
 
 def validate_native_evidence(report_or_path, *, expected_physics=None, required_asset_ids=None,
-                             expected_bundle_sha256=None):
+                             expected_bundle_sha256=None, expected_asset_profiles=None):
     if report_or_path is None:
-        return {"schema_version": "hoi_v1_native_gate_v1", "passed": False,
+        return {"schema_version": "hoi_v1_native_gate_v2", "passed": False,
                 "blockers": ["no native evidence supplied"], "evidence_sha256": None, "asset_ids": [], "status": "blocked"}
     payload, digest = _read(report_or_path)
     reports = payload if isinstance(payload, list) else payload.get("reports", [payload])
@@ -193,6 +194,7 @@ def validate_native_evidence(report_or_path, *, expected_physics=None, required_
     for number, report in enumerate(reports):
         prefix = f"report[{number}]"
         physics, contact = report.get("physics", {}), report.get("contact", {})
+        blockers.extend(f"{prefix}: {problem}" for problem in native_acceptance_blockers(report))
         asset_id = report.get("asset_id", report.get("spec", {}).get("asset_id"))
         if asset_id is None:
             blockers.append(f"{prefix}: missing static asset identity")
@@ -201,6 +203,10 @@ def validate_native_evidence(report_or_path, *, expected_physics=None, required_
             if asset_id in assets:
                 blockers.append(f"{prefix}: duplicate static asset report {asset_id}")
             assets.add(asset_id)
+            if expected_asset_profiles is not None:
+                expected_profile = expected_asset_profiles.get(asset_id)
+                if expected_profile is None or physics.get("bound_physical_profile") != expected_profile:
+                    blockers.append(f"{prefix}: native installed physical profile differs from bundle asset {asset_id}")
         observed_flags = physics.get("physics", {})
         desired = expected_physics or {"hand_collision": True, "self_collision": True}
         for key, expected in desired.items():
@@ -253,7 +259,14 @@ def validate_native_evidence(report_or_path, *, expected_physics=None, required_
             blockers.append(f"{prefix}: compiled nonadjacent self-collision audit missing")
         if (contact.get("schema") != LABEL_SCHEMA or list(contact.get("channels", [])) != list(CHANNELS) or
             contact.get("interval") != "(t,t+1]" or contact.get("num_substeps") != 4 or contact.get("substep_dt") != .005):
-            blockers.append(f"{prefix}: v2 five-channel pair labels do not cover the four physics substeps of (t,t+1]")
+            blockers.append(f"{prefix}: v3 sixteen-channel region pair labels do not cover the four physics substeps of (t,t+1]")
+        if (contact.get("group_schema") != GROUP_SCHEMA or
+                contact.get("region_links") != {name: list(links) for name, links in REGION_LINKS.items()}):
+            blockers.append(f"{prefix}: canonical region/link mapping is missing or differs from the learned schema")
+        for channel in CHANNELS[:-1]:
+            count = contact.get("region_collision_geom_counts", {}).get(channel)
+            if type(count) is not int or count < 1:
+                blockers.append(f"{prefix}: {channel} has no verified active collision geometry")
         for side in ("left", "right"):
             count = contact.get("foot_collision_geom_counts", {}).get(side)
             if (contact.get("foot_body_links", {}).get(side) != side + "_ankle_roll_link" or
@@ -284,11 +297,11 @@ def validate_native_evidence(report_or_path, *, expected_physics=None, required_
             placement = positive.get("ground_placement_audit", {})
             penetration = placement.get("maximum_ground_penetration_m")
             clearance = placement.get("minimum_final_world_z_m")
-            if (positive.get("foot_surface", {}).get("primitive") != "actual_compiled_convex_mesh" or
-                    positive.get("object_support_selection") != "lowest_world_z_vertex_on_opposing_support_plane" or
+            if (positive.get("object_support_selection") not in ("lowest_world_z_vertex_on_opposing_support_plane",
+                    "center_of_one_actual_exposed_convex_component_facet") or
                     placement.get("passed") is not True or placement.get("maximum_allowed_penetration_m") != .002 or
                     placement.get("minimum_required_clearance_m") != .002 or
-                    placement.get("root_and_object_translated_identically") is not True or
+                    placement.get("placement_method") != "all_robot_colliders_above_ground_exposed_target_up" or
                     type(clearance) not in (int, float) or not math.isfinite(clearance) or clearance < .002 - 2e-6 or
                     type(penetration) not in (int, float) or not math.isfinite(penetration) or not 0 <= penetration <= .002 + 2e-6):
                 blockers.append(f"{prefix}: {side} mesh-foot positive probe lacks a shallow above-ground object placement audit")
@@ -297,8 +310,17 @@ def validate_native_evidence(report_or_path, *, expected_physics=None, required_
             ground = negative.get("maximum_foot_ground_interval_force_N", [])
             if (probes.get("checks", {}).get(side + "_foot_ground_not_mislabelled") is not True or
                     len(values) != len(CHANNELS) or len(ground) != 2 or not _finite(values + ground) or
-                    ground[index] <= threshold or max(values[3:], default=math.inf) != 0):
+                    ground[index] <= threshold or max(values[:-1], default=math.inf) != 0):
                 blockers.append(f"{prefix}: {side} foot-ground negative identity control did not pass")
+        for index, channel in enumerate(CHANNELS[:-1]):
+            name = "hand_ground_negative" if index == 0 else channel.removesuffix("_object") + "_ground_negative"
+            negative = probes.get(name, {})
+            values = negative.get("maximum_interval_normal_force_N", [])
+            ground = negative.get("maximum_body_ground_interval_force_N", [])
+            if (probes.get("checks", {}).get(channel + "_ground_not_mislabelled") is not True or
+                    len(values) != len(CHANNELS) or len(ground) != len(CHANNELS) - 1 or not _finite(values + ground) or
+                    ground[index] <= threshold or max(values[:-1], default=math.inf) != 0):
+                blockers.append(f"{prefix}: {channel} region-ground negative identity control did not pass")
         if report.get("zero_action_smoke_completed") is not True:
             blockers.append(f"{prefix}: native smoke did not complete")
         if expected_bundle_sha256 is not None and report.get("bundle_content_sha256") != expected_bundle_sha256:
@@ -307,7 +329,7 @@ def validate_native_evidence(report_or_path, *, expected_physics=None, required_
         missing = set(int(x) for x in required_asset_ids) - assets
         if missing:
             blockers.append(f"missing native geometry groups: {sorted(missing)}")
-    return {"schema_version": "hoi_v1_native_gate_v1", "passed": not blockers, "blockers": blockers,
+    return {"schema_version": "hoi_v1_native_gate_v2", "passed": not blockers, "blockers": blockers,
             "evidence_sha256": digest, "asset_ids": sorted(assets), "status": "passed" if not blockers else "blocked"}
 
 
@@ -341,7 +363,7 @@ def validate_wm_evidence(report, proposal=None):
     blockers = []
     if report.get("finite") is not True:
         blockers.append("WM holdout contains nonfinite diagnostics or has not run")
-    if report.get("scope") != "training_reference_bins_reserved_from_wm_fit_not_eval80_or_test40":
+    if report.get("scope") != "training_reference_bins_reserved_from_wm_fit_not_protected_eval":
         blockers.append("WM policy gate requires reserved train-only real transitions")
     if report.get("real_executed_actions") is not True:
         blockers.append("WM diagnostics are not bound to real executed action sequences")
@@ -413,9 +435,10 @@ def main(argv=None):
     args = parser.parse_args(argv)
     try:
         from .prepare import BUNDLE_SCHEMA, _digest_json
+        from hoi.data.curated_bundle import CURATED_BUNDLE_SCHEMA
         bundle, bundle_sha = _read(args.bundle)
         content_sha = bundle.pop("bundle_content_sha256", None)
-        if bundle.get("schema_version") != BUNDLE_SCHEMA or content_sha != _digest_json(bundle):
+        if bundle.get("schema_version") not in (BUNDLE_SCHEMA, CURATED_BUNDLE_SCHEMA) or content_sha != _digest_json(bundle):
             raise ValueError("bundle schema/content hash changed")
         bundle["bundle_content_sha256"] = content_sha
         inputs, reports = [], []
@@ -434,7 +457,8 @@ def main(argv=None):
             stream.write("\n")
         required = sorted(set(clip["asset_id"] for clip in bundle["clips"]))
         gate = validate_native_evidence(evidence_path, expected_physics={"hand_collision": True, "self_collision": True},
-                                        required_asset_ids=required, expected_bundle_sha256=content_sha)
+                                        required_asset_ids=required, expected_bundle_sha256=content_sha,
+                                        expected_asset_profiles={int(a["asset_id"]): a["physical_profile"] for a in bundle["assets"]})
         with (output / "gate.json").open("x", encoding="utf-8") as stream:
             json.dump(gate, stream, sort_keys=True, indent=2, ensure_ascii=False, allow_nan=False)
             stream.write("\n")

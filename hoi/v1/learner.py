@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import math
 
+from .scene_context import scene_context, scene_from_record
 import torch
 from torch import nn
 
@@ -89,7 +90,7 @@ class Learner:
                                          torch.cat((self.object_history[:, 1:], obj[:, None]), 1))
         human_goal = self.motion.goal(f, 10)
         object_goal = self.motion.object_goal(S, O, f, 10)
-        actor_extra = {}
+        actor_extra = {"scene_context": scene_from_record(S, snapshot)}
         if self.privileged_teacher:
             previous = S if self.teacher_previous_state is None else tuple(
                 torch.where(fresh.reshape(fresh.shape + (1,) * (cur.ndim - fresh.ndim)), cur, prev)
@@ -104,6 +105,7 @@ class Learner:
             self.pi.goal_norm.update(human_goal)
             self.pi.object_obs_norm.update(obj)
             self.pi.object_goal_norm.update(object_goal)
+            self.pi.scene_norm.update(actor_extra["scene_context"])
             if self.privileged_teacher:
                 self.pi.privileged_norm.update(actor_extra["privileged"])
         a = self.pi(self.robot_history, human_goal, self.object_history, object_goal, self._points(assets), **actor_extra)
@@ -127,7 +129,8 @@ class Learner:
             S, O = unflatten_state(transition["s"][fit_rows]), unflatten_object(transition["o"][fit_rows])
             S1, O1 = unflatten_state(transition["s1"][fit_rows]), unflatten_object(transition["o1"][fit_rows])
             self.wm.update_normalizers(S, O, transition["a"][fit_rows], normalize_xi(transition["xi"][fit_rows]),
-                                       transition["xi_o"][fit_rows], self._points(transition["asset_id"][fit_rows]), S1, O1)
+                                       transition["xi_o"][fit_rows], self._points(transition["asset_id"][fit_rows]), S1, O1,
+                                       scene_context(S,transition["support_pose_xyzw"][fit_rows],transition["support_present"][fit_rows]))
         self.sim_steps += self.buffer.N
 
     def wm_rollout(self, window):
@@ -140,7 +143,8 @@ class Learner:
                 next_s, next_o, active_contact = self.wm.step(
                     tuple(value[active] for value in S), tuple(value[active] for value in O),
                     window["a"][active, step], normalize_xi(window["xi"][active, step]),
-                    window["xi_o"][active, step], self._points(window["asset_id"][active, step]))
+                    window["xi_o"][active, step], self._points(window["asset_id"][active, step]),
+                    scene_context(tuple(value[active] for value in S),window["support_pose_xyzw"][active,step],window["support_present"][active,step]))
                 S = tuple(previous.index_copy(0, active, value) for previous, value in zip(S, next_s))
                 O = tuple(previous.index_copy(0, active, value) for previous, value in zip(O, next_o))
                 contact = contact.index_copy(0, active, active_contact)
@@ -154,10 +158,8 @@ class Learner:
     def wm_update(self):
         window = self.buffer.sample_windows(self.config.wm_batch, self.config.wm_window, split="fit")
         predicted_s, predicted_o, logits = self.wm_rollout(window)
-        ratio = self.contact_negative / self.contact_positive.clamp_min(1)
-        weights = torch.where(self.contact_positive > 0, ratio, torch.ones_like(ratio)).clamp(1e-3, 100).float()
         losses = self.wm.loss(predicted_s, predicted_o, unflatten_state(window["s1"]), unflatten_object(window["o1"]),
-                              logits, window["contact"], window["contact_valid"], window["mask"], pos_weight=weights)
+                              logits, window["contact"], window["contact_valid"], window["mask"])
         optimizer = self.optimizers["wm"]
         optimizer.zero_grad(set_to_none=True)
         losses["total"].backward()
@@ -167,17 +169,19 @@ class Learner:
         optimizer.step()
         return {key: float(value.detach()) / self.config.wm_window for key, value in losses.items()}
 
-    def _critic_args(self, S, O, f, xi_n, xi_o, assets):
+    def _critic_args(self, S, O, f, xi_n, xi_o, assets, support_pose, support_present):
         expected, valid = self.motion.expected(f)
         legacy = torch.cat((self.mdp.legacy_critic_features(S, f, xi_n), self.motion.goal(f, 10)), -1)
         return (legacy, self.motion.object_goal(S, O, f, 10), object_features(S, O),
-                self.mdp.object_errors(S, O, f), xi_o, torch.cat((expected, valid), -1), self._points(assets))
+                self.mdp.object_errors(S, O, f), xi_o, torch.cat((expected, valid), -1), scene_context(S,support_pose,support_present), self._points(assets))
 
     def imagine(self, start, history, *, fixed_robot_noise=None):
         c = self.config
         S, O = unflatten_state(start["s"]), unflatten_object(start["o"])
         xi, xi_o, f, previous = start["xi"], start["xi_o"], start["f"], start["a_prev"]
         assets, xi_n = start["asset_id"], normalize_xi(xi)
+        support_pose=start["support_pose_xyzw"].detach().clone()
+        support_present=start["support_present"].detach().clone()
         with torch.no_grad():
             robot_hist = self.mdp.obs(unflatten_state(history["s"]), history["a_prev"], history["xi"], history["f"])
             obj_hist = self.mdp.object_obs(unflatten_state(history["s"]), unflatten_object(history["o"]), history["f"])
@@ -193,12 +197,13 @@ class Learner:
         for step in range(c.horizon):
             human_goal = self.motion.goal(f, 10)
             object_goal = self.motion.object_goal(S, O, f, 10)
-            actor_extra = {}
+            scene = scene_context(S,support_pose,support_present)
+            actor_extra = {"scene_context":scene}
             if self.privileged_teacher:
                 actor_extra["privileged"] = self.mdp.privileged_features(S, O, f, previous, xi, xi_o, previous_S)
             action = self.pi(robot_hist, human_goal, obj_hist, object_goal, points, shape_embedding=policy_shape, **actor_extra)
             previous_S = S
-            S, O, logits = self.wm.step(S, O, action, xi_n, xi_o, points)
+            S, O, logits = self.wm.step(S, O, action, xi_n, xi_o, points, scene)
             f = f + 1
             probabilities = torch.sigmoid(logits)
             rewards.append(self.mdp.reward(S, O, f, action, previous, probabilities))
@@ -221,7 +226,7 @@ class Learner:
         returns = (discounts[:, None] * survival * reward).sum(0)
         if not c.no_critic:
             returns = returns + c.gamma ** c.horizon * alive[-1] * self.critic(
-                *self._critic_args(S, O, f, xi_n, xi_o, assets))
+                *self._critic_args(S, O, f, xi_n, xi_o, assets, support_pose, support_present))
         return {"objective": returns.mean(), "reward": reward, "failure": failure, "survival": survival,
                 "states": states, "objects": objects, "frames": frames, "actions": actions,
                 "contact": contact_probabilities, "terminal_survival": alive[-1]}
@@ -235,7 +240,8 @@ class Learner:
             S, O = _flatten(_stack([_detach(state) for state in trajectory["states"]])), _flatten(_stack([_detach(state) for state in trajectory["objects"]]))
             f = torch.stack(trajectory["frames"]).flatten()
             expand = lambda value: value[None].expand((H + 1,) + value.shape).flatten(0, 1)
-            arguments = self._critic_args(S, O, f, expand(normalize_xi(start["xi"])), expand(start["xi_o"]), expand(start["asset_id"]))
+            arguments = self._critic_args(S, O, f, expand(normalize_xi(start["xi"])), expand(start["xi_o"]), expand(start["asset_id"]),
+                                          expand(start["support_pose_xyzw"]),expand(start["support_present"]))
         # Cache raw inputs/points only. PointNet remains inside each minibatch
         # forward so it is trained by the value loss.
         self.critic.update_normalizers(*arguments[:-1])
@@ -329,7 +335,8 @@ class Learner:
             if bool(active.any()):
                 _, selected_o, selected_c = self.wm.step(unflatten_state(window["s"][active, step]), unflatten_object(window["o"][active, step]),
                                                         window["a"][active, step], normalize_xi(window["xi"][active, step]),
-                                                        window["xi_o"][active, step], self._points(window["asset_id"][active, step]))
+                                                        window["xi_o"][active, step], self._points(window["asset_id"][active, step]),
+                                                        scene_context(unflatten_state(window["s"][active,step]),window["support_pose_xyzw"][active,step],window["support_present"][active,step]))
                 for target, source in zip(one_o, selected_o):
                     target[active] = source
                 one_c[active] = selected_c
@@ -347,14 +354,14 @@ class Learner:
         calibration = (probabilities - window["contact"]).square()
         counts = valid.sum((0, 1)).clamp_min(1)
         prevalence = positive.sum((0, 1)) / counts
-        hand_valid = valid[..., :2].all(-1)
-        in_contact = positive[..., :2].any(-1)
+        region_valid = valid[..., :-1].all(-1)
+        in_contact = positive[..., :-1].any(-1)
         connected = torch.zeros_like(in_contact)
-        connected[:, 1:] = hand_valid[:, 1:] & hand_valid[:, :-1]
+        connected[:, 1:] = region_valid[:, 1:] & region_valid[:, :-1]
         onset, release = torch.zeros_like(in_contact), torch.zeros_like(in_contact)
         onset[:, 1:] = in_contact[:, 1:] & ~in_contact[:, :-1] & connected[:, 1:]
         release[:, 1:] = ~in_contact[:, 1:] & in_contact[:, :-1] & connected[:, 1:]
-        phases = {"no_contact": ~in_contact & hand_valid, "contact": in_contact & hand_valid,
+        phases = {"no_contact": ~in_contact & region_valid, "contact": in_contact & region_valid,
                   "onset": onset, "release": release}
         scales = torch.maximum(self.wm.object_out_norm.std(), self.wm.object_error_floor)
         def error(predicted, truth, robot, selection):
@@ -400,7 +407,7 @@ class Learner:
                                         "brier_per_channel": ((calibration * valid).sum((0, 1)) / counts).tolist(),
                                         "prevalence_baseline_brier": (prevalence * (1 - prevalence)).tolist(),
                                         "probability_source": "teacher_forced_one_step_actual_state_inputs",
-                                        "phase_definition": "actual_left_or_right_hand_object; onset/release require both adjacent intervals valid"},
+                                        "phase_definition": "actual_any_body_region_object; object_ground_excluded; onset/release require both adjacent intervals valid"},
                 "finite": all(math.isfinite(float(value)) for value in loss.values()) and
                           all(bool(torch.isfinite(value).all()) for value in (position_error, baseline_error, zero_error, one_logits)),
-                "scope": "training_reference_bins_reserved_from_wm_fit_not_eval80_or_test40"}
+                "scope": "training_reference_bins_reserved_from_wm_fit_not_protected_eval"}

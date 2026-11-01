@@ -103,6 +103,104 @@ class RenderTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "quaternion"):
                 load_saved(path)
 
+    def test_curated_saved_reference_transforms_preserve_all_frames_and_quaternions(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "curated.pt"
+            data = saved_fixture(path)
+            states = data["states"]
+            states.pop("reference_source630")
+            states["reference_body_pos"] = torch.arange(3 * 39 * 3, dtype=torch.float32).reshape(3, 39, 3) / 100
+            quat_xyzw = torch.tensor([1., 2., 3., 4.]) / torch.sqrt(torch.tensor(30.))
+            states["reference_body_rot"] = quat_xyzw.expand(3, 39, 4).clone()
+            states["reference_object"] = torch.zeros(3, 13)
+            states["reference_object"][:, :3] = torch.tensor([[.1, .2, .3], [.4, .5, .6], [.7, .8, .9]])
+            states["reference_object"][:, 3:7] = quat_xyzw[[3, 0, 1, 2]]
+            # Deliberately inconsistent joint/root data: display uses saved
+            # transforms exclusively and does not infer reference poses.
+            states["reference_robot"] = torch.full((3, 71), 100.)
+            torch.save(data, path)
+            with patch("hoi.ultra_kinematics.UltraKinematics.forward", side_effect=AssertionError("renderer must not invoke FK")), \
+                    patch("hoi.v1.networks.Policy.forward", side_effect=AssertionError("renderer must not invoke policy")):
+                result = load_saved(path)
+            np.testing.assert_array_equal(result["reference_pos"], states["reference_body_pos"].numpy())
+            np.testing.assert_array_equal(result["reference_quat"], states["reference_body_rot"][..., [3, 0, 1, 2]].numpy())
+            np.testing.assert_array_equal(result["reference_object_pos"], states["reference_object"][:, :3].numpy())
+            np.testing.assert_array_equal(result["reference_object_quat"], states["reference_object"][:, 3:7].numpy())
+            np.testing.assert_array_equal(result["actual_pos"], states["body_pos"].numpy())
+            self.assertEqual(result["reference_display_source"], "saved_reference_body_and_object_transforms")
+            self.assertEqual(len(result["time"]), 3)
+            self.assertEqual(result["control_steps"], 2)
+            self.assertNotIn("reference_source630", states)
+
+    def test_curated_missing_truncated_or_invalid_reference_never_fabricated(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "curated.pt"
+            data = saved_fixture(path)
+            states = data["states"]
+            states.pop("reference_source630")
+            states["reference_body_pos"] = states["body_pos"].clone()
+            states["reference_body_rot"] = states["body_rot"].clone()
+            states["reference_object"] = states["o"].clone()
+            for field in ("reference_body_pos", "reference_body_rot", "reference_object"):
+                with self.subTest(field=field):
+                    original = states.pop(field)
+                    torch.save(data, path)
+                    with self.assertRaisesRegex(ValueError, "cannot reconstruct"):
+                        load_saved(path)
+                    states[field] = original[:-1]
+                    torch.save(data, path)
+                    with self.assertRaisesRegex(ValueError, "T\+1"):
+                        load_saved(path)
+                    states[field] = original
+            states["reference_body_rot"][0, 0] = 0
+            torch.save(data, path)
+            with self.assertRaisesRegex(ValueError, "quaternion"):
+                load_saved(path)
+            states["reference_body_rot"] = states["body_rot"].clone()
+            states["reference_object"][0, 0] = float("nan")
+            torch.save(data, path)
+            with self.assertRaisesRegex(ValueError, "nonfinite"):
+                load_saved(path)
+
+    def test_saved_supports_use_recorded_actual_and_reset_held_reference(self):
+        from hoi.v1.scene_supports import SCENE_SUPPORT_SCHEMA,SUPPORT_IDS,omni_support_recipe,digest
+        with tempfile.TemporaryDirectory() as temp:
+            path=Path(temp)/"supports.pt";payload=saved_fixture(path)
+            pose=torch.zeros(3,2,7);pose[...,6]=1
+            pose[:,:,2]=torch.tensor([.8,-5.])
+            actual=pose.clone();actual[1:,0,0]=1e-6
+            payload["states"].update(support_pose_xyzw=actual,reference_support_pose_xyzw=pose,support_present=torch.ones(3,2,dtype=torch.bool))
+            payload["metadata"]["scene_support_display"]={"schema":SCENE_SUPPORT_SCHEMA,"support_ids":list(SUPPORT_IDS),
+                "geometry_recipe":omni_support_recipe(),"geometry_recipe_sha256":digest(omni_support_recipe()),"quaternion":"xyzw"}
+            torch.save(payload,path);data=load_saved(path)
+            np.testing.assert_array_equal(data["actual_support_pos"],actual[...,:3].numpy())
+            np.testing.assert_array_equal(data["reference_support_pos"],pose[...,:3].numpy())
+            self.assertEqual(data["support_ids"],list(SUPPORT_IDS))
+            self.assertGreater(fixed_camera_parameters(data)["lookat"][2],-1.)
+            payload["states"]["reference_support_pose_xyzw"][1,0,0]=.1
+            torch.save(payload,path)
+            with self.assertRaisesRegex(ValueError,"held"):load_saved(path)
+            del payload["states"]["reference_support_pose_xyzw"]
+            torch.save(payload,path)
+            with self.assertRaisesRegex(ValueError,"cannot be reconstructed"):load_saved(path)
+
+    def test_support_display_model_has_no_dynamics_and_uses_saved_pose(self):
+        import mujoco
+        from hoi.v1.render import display_model
+        names=[f"b{i}" for i in range(39)]
+        with patch("hoi.v1.render.robot_visual_assets",return_value=([],{},{})):
+            model,maps,_=display_model("unused",[],names,support_ids=("table1",),support_size_m=[.3,.25,.01])
+        self.assertEqual((model.nq,model.nv),(0,0))
+        sim=mujoco.MjData(model)
+        data={}
+        for prefix in ("actual","reference"):
+            data[prefix+"_pos"]=np.zeros((1,39,3));data[prefix+"_quat"]=np.tile([1,0,0,0],(1,39,1))
+            data[prefix+"_object_pos"]=np.zeros((1,3));data[prefix+"_object_quat"]=np.array([[1,0,0,0]])
+            data[prefix+"_support_pos"]=np.array([[[.2,.3,.8]]]);data[prefix+"_support_quat"]=np.array([[[1,0,0,0]]])
+        with patch("mujoco.mj_step",side_effect=AssertionError("offline renderer cannot step physics")):
+            apply_saved_frame(model,sim,maps,data,0)
+        np.testing.assert_allclose(sim.mocap_pos[maps["actual_support"]],[[.2,.3,.8]])
+
     def test_multi_hull_USD_metadata_and_transform_guard(self):
         mesh = '''def Mesh "NAME" (apiSchemas = ["PhysicsCollisionAPI"]) {
 point3f[] points = [(0,0,0),(1,0,0),(0,1,0),(0,0,1)]

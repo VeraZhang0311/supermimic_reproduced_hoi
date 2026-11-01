@@ -15,7 +15,8 @@ import torch
 from supermimic.mdp import flatten_state
 from supermimic.motion import CONTROL_DT
 from supermimic.rotations import mat_to_quat, quat_to_mat
-from .contacts import CHANNELS, GROUND, LEFT, OBJECT, RIGHT, LEFT_FOOT, RIGHT_FOOT, PairContactRecorder
+from .contacts import (CHANNELS, CHANNEL_INDEX, CHANNEL_ROLES, BODY_ROLES, GROUND, LEFT, OBJECT,
+                       RIGHT, LEFT_FOOT, RIGHT_FOOT, PairContactRecorder, compiled_geom_links)
 from .state import flatten_object
 from .probes import palm_patch_points, _write_palm_qa
 
@@ -64,6 +65,60 @@ def compiled_convex_mesh(model, mesh_id):
                 "source_vertex_ids": referenced.tolist(), "graph_record_sha256": hashlib.sha256(record.tobytes()).hexdigest(),
                 "full_mesh_vertex_buffer_sha256": hashlib.sha256(original_vertices.tobytes()).hexdigest()}
     return vertices, faces, evidence
+
+
+def compiled_geom_support(model, geom, direction, *, facet=False):
+    """Actual compiled collider support, in geom frame; no joint-center proxy."""
+    import mujoco
+    d = torch.as_tensor(direction, dtype=torch.float64)
+    if d.shape != (3,) or not bool(torch.isfinite(d).all()) or float(d.norm()) <= 1e-12:
+        raise ValueError("support direction must be a finite nonzero 3-vector")
+    d = d / d.norm()
+    size = torch.as_tensor(model.geom_size[geom], dtype=torch.float64)
+    kind = int(model.geom_type[geom])
+    proof = {"geom_id": int(geom), "primitive": int(kind), "source": "actual_compiled_collision_surface"}
+    if kind == int(mujoco.mjtGeom.mjGEOM_MESH):
+        v, f, hull_proof = compiled_convex_mesh(model, int(model.geom_dataid[geom]))
+        vertices, faces = torch.tensor(v), torch.tensor(f)
+        if facet:
+            triangles = vertices[faces]
+            normals = torch.linalg.cross(triangles[:, 1] - triangles[:, 0], triangles[:, 2] - triangles[:, 0])
+            lengths = normals.norm(dim=-1)
+            good = lengths > 1e-12
+            normals = normals / lengths.clamp_min(1e-12)[:, None]
+            signs = ((triangles.mean(1) - vertices.mean(0)) * normals).sum(-1)
+            normals = torch.where((signs < 0)[:, None], -normals, normals)
+            score = torch.where(good, normals @ d, torch.full_like(lengths, -2))
+            chosen = int(score.argmax())
+            normal = normals[chosen]
+            plane = vertices @ normal
+            point = vertices[(plane - plane.max()).abs() < 1e-7].mean(0)
+        else:
+            point, normal = vertices[int((vertices @ d).argmax())], d
+        proof["native_convex_evidence"] = hull_proof
+    elif kind == int(mujoco.mjtGeom.mjGEOM_SPHERE):
+        point, normal = size[0] * d, d
+    elif kind == int(mujoco.mjtGeom.mjGEOM_CAPSULE):
+        point, normal = size[0] * d, d
+        point[2] += size[1] * torch.sign(d[2])
+    elif kind == int(mujoco.mjtGeom.mjGEOM_ELLIPSOID):
+        point, normal = size.square() * d / (size * d).norm(), d
+    elif kind == int(mujoco.mjtGeom.mjGEOM_BOX):
+        if facet:
+            normal = torch.zeros(3, dtype=torch.float64)
+            axis = int(d.abs().argmax()); normal[axis] = torch.sign(d[axis])
+            point = normal * size
+        else:
+            point, normal = torch.sign(d) * size, d
+    elif kind == int(mujoco.mjtGeom.mjGEOM_CYLINDER):
+        radial = d[:2] / d[:2].norm().clamp_min(1e-12)
+        point = torch.cat((radial * size[0], (size[1] * torch.sign(d[2])).reshape(1)))
+        normal = d
+    else:
+        raise RuntimeError(f"Unsupported actual body collider primitive {kind}; native evidence cannot be inferred")
+    if not bool(torch.isfinite(point).all() and torch.isfinite(normal).all()):
+        raise RuntimeError("Nonfinite compiled collider support")
+    return point, normal, proof
 
 
 def link_to_com_velocity(R, v_link, omega_world, local_com):
@@ -361,7 +416,7 @@ def validate_physical_profile(profile):
 
 
 
-def prepare_object_usd(asset, output):
+def prepare_object_usd(asset, output, *, allow_deferred_inertia=False):
     """Flatten an independent copy; source USD is read only and already scaled."""
     import numpy as np
     from pxr import Gf, Usd, UsdPhysics
@@ -381,16 +436,26 @@ def prepare_object_usd(asset, output):
     bodies = [p for p in stage.Traverse() if p.HasAPI(UsdPhysics.RigidBodyAPI)]
     if len(bodies) != 1:
         raise ValueError("v1 requires exactly one object rigid body")
-    mass, com, inertia, _, _ = validate_physical_profile(asset["physical_profile"])
+    from .native_fixture import DEFERRED_INERTIA_MODE, validate_cooking_mass_profile
+    deferred = asset.get("inertia_mode") == DEFERRED_INERTIA_MODE
+    if asset.get("inertia_mode") is not None and (not allow_deferred_inertia or not deferred):
+        raise ValueError("deferred inertia is only permitted in the explicit native cooking fixture")
     mass_api = UsdPhysics.MassAPI.Apply(bodies[0])
-    mass_api.CreateMassAttr(mass)
-    mass_api.CreateCenterOfMassAttr(Gf.Vec3f(*map(float, com)))
-    values, axes = np.linalg.eigh(inertia.numpy())
-    if np.linalg.det(axes) < 0:
-        axes[:, 0] *= -1
-    q = Rotation.from_matrix(axes).as_quat()
-    mass_api.CreateDiagonalInertiaAttr(Gf.Vec3f(*map(float, values)))
-    mass_api.CreatePrincipalAxesAttr(Gf.Quatf(float(q[3]), Gf.Vec3f(*map(float, q[:3]))))
+    if deferred:
+        mass, _, _ = validate_cooking_mass_profile(asset["physical_profile"])
+        if mass_api.GetCenterOfMassAttr().HasAuthoredValueOpinion() or mass_api.GetDiagonalInertiaAttr().HasAuthoredValueOpinion():
+            raise ValueError("deferred native cooking source must not author placeholder COM/inertia")
+        mass_api.CreateMassAttr(mass)
+    else:
+        mass, com, inertia, _, _ = validate_physical_profile(asset["physical_profile"])
+        mass_api.CreateMassAttr(mass)
+        mass_api.CreateCenterOfMassAttr(Gf.Vec3f(*map(float, com)))
+        values, axes = np.linalg.eigh(inertia.numpy())
+        if np.linalg.det(axes) < 0:
+            axes[:, 0] *= -1
+        q = Rotation.from_matrix(axes).as_quat()
+        mass_api.CreateDiagonalInertiaAttr(Gf.Vec3f(*map(float, values)))
+        mass_api.CreatePrincipalAxesAttr(Gf.Quatf(float(q[3]), Gf.Vec3f(*map(float, q[:3]))))
     rigid = UsdPhysics.RigidBodyAPI(bodies[0])
     rigid.CreateRigidBodyEnabledAttr(True)
     rigid.CreateKinematicEnabledAttr(False)
@@ -406,11 +471,21 @@ def make_hoi_sim(device, args):
     return configure_hoi_capacity(make_sim(device, args))
 
 
+from .scene_supports import (validate_native_scene_supports, NativeSceneSupportBank, omni_support_recipe,
+                              SUPPORT_IDS, SUPPORT_ROLES, digest as support_digest)
+
+
 class HOITrackingSim:
     def __init__(self, sim_cfg, num_envs, motion, mdp, asset, output, *, gamma=.99,
-                 eval_mode=False, reset_noise=True, max_episode_steps=500, robot_asset=None):
+                 eval_mode=False, reset_noise=True, max_episode_steps=500, robot_asset=None, cooking_only=False):
+        if asset is not None and asset.get("inertia_mode") is not None and not cooking_only:
+            raise ValueError("deferred inertia cannot enter a training or evaluation environment")
+        validate_native_scene_supports(motion)
         import isaaclab.sim as sim_utils
         import warp as wp
+        from .native_runtime import configure_native_forward_compat, require_native_physics_driver
+        require_native_physics_driver(wp, cooking_only=cooking_only)
+        self.warp_compilation = configure_native_forward_compat(wp, physics_autograd=False)
         from isaaclab.assets import RigidObjectCfg
         from isaaclab.utils import configclass
         from supermimic.env import TrackingSceneCfg, TrackingSim
@@ -418,7 +493,8 @@ class HOITrackingSim:
         compatible = motion.compatible_bins(asset_id)
         if not len(compatible):
             raise ValueError("worker asset has no compatible motion bins")
-        usd = prepare_object_usd(asset, Path(output) / "object_asset")
+        support_bank = NativeSceneSupportBank(motion, asset_id, sim_cfg.device)
+        usd = prepare_object_usd(asset, Path(output) / "object_asset", allow_deferred_inertia=cooking_only)
 
         @configclass
         class HOISceneCfg(TrackingSceneCfg):
@@ -429,6 +505,19 @@ class HOITrackingSim:
 
         def scene_factory(**kwargs):
             config = HOISceneCfg(**kwargs)
+            recipe = omni_support_recipe()
+            for sid in support_bank.support_ids:
+                setattr(config, "support_" + sid, RigidObjectCfg(
+                    prim_path="{ENV_REGEX_NS}/Support_" + sid,
+                    spawn=sim_utils.CuboidCfg(size=tuple(recipe["size_m"]),
+                        rigid_props=sim_utils.RigidBodyPropertiesCfg(kinematic_enabled=True, disable_gravity=True,
+                            linear_damping=recipe["linear_damping"], angular_damping=recipe["angular_damping"]),
+                        mass_props=sim_utils.MassPropertiesCfg(mass=recipe["mass_kg"]),
+                        collision_props=sim_utils.CollisionPropertiesCfg(contact_offset=recipe["source_contact_offset_m"],
+                            rest_offset=recipe["source_rest_offset_m"]),
+                        physics_material=sim_utils.RigidBodyMaterialCfg(static_friction=recipe["static_friction"],
+                            dynamic_friction=recipe["dynamic_friction"], restitution=recipe["restitution"])),
+                    init_state=RigidObjectCfg.InitialStateCfg(pos=(0.,0.,-10. if sid == "table1" else -5.))))
             if robot_asset is not None:
                 from supermimic.physics import load_hand_asset, sha
                 if sha(robot_asset["path"]) != robot_asset["sha256"]:
@@ -456,19 +545,27 @@ class HOITrackingSim:
         self.env = AssetTrackingSim(sim_cfg, num_envs, motion, mdp.human, gamma=gamma, eval_mode=eval_mode,
                                    max_episode_steps=max_episode_steps, reset_noise=reset_noise, scene_factory=scene_factory)
         self.device, self.N, self.motion, self.mdp = self.env.device, num_envs, motion, mdp
-        self.asset = asset
+        self.asset = dict(asset)
+        self.cooking_only = cooking_only
         self.output = Path(output)
         self.object_usd = usd
         self.asset_id = torch.full((num_envs,), asset_id, device=self.device, dtype=torch.long)
         self.object = self.env.scene["object"]
+        self.support_bank = support_bank
+        self.supports = {sid: self.env.scene["support_" + sid] for sid in support_bank.support_ids}
+        self.support_reset_poses = {sid: torch.zeros(num_envs,7,device=self.device) for sid in self.supports}
+        self.support_reset_present = torch.zeros(num_envs,2,dtype=torch.bool,device=self.device)
+        self.support_alignment = {"reset_count": 0, "step_count": 0, "max_position_error_m": 0., "max_quaternion_error": 0.}
         self.env.G_max = mdp.max_step_reward / (1 - gamma)
-        self.contact_missing_counter = torch.zeros(num_envs, 2, device=self.device, dtype=torch.int32)
+        self.contact_missing_counter = torch.zeros(num_envs, len(CHANNELS), device=self.device, dtype=torch.int32)
         self.physics_report = self._apply_and_read_physics()
+        self.physics_report["warp_compilation"] = self.warp_compilation
         # MuJoCo-Warp exposes this supported scheduling option independently of
         # Newton's outer graph setting. No package/runtime files are patched.
         solver = self.env.sim.backend_manager._solver
         solver.mjw_model.opt.graph_conditional = bool(wp.is_conditional_graph_supported())
         self.contacts = PairContactRecorder(self.env.sim.backend_manager, num_envs)
+        self.support_geometry_audit = self._audit_support_geometry()
         self.native_robot_asset = robot_asset
         self.foot_asset_manifest = None
         self.compiled_foot_audit = {"passed": False, "reason": "no explicit ULTRA-aligned foot asset binding"}
@@ -493,6 +590,32 @@ class HOITrackingSim:
     def _apply_and_read_physics(self):
         import warp as wp
         from newton import ModelFlags
+        from .native_acceptance import physical_profile_identity
+        from .native_fixture import DEFERRED_INERTIA_MODE
+        deferred_readback = None
+        if self.asset.get("inertia_mode") == DEFERRED_INERTIA_MODE:
+            if not self.cooking_only:
+                raise ValueError("deferred inertia cannot supply native rollout physics")
+            import mujoco
+            mj = self.env.sim.backend_manager._solver.mj_model
+            body_ids = [i for i in range(mj.nbody) if (mujoco.mj_id2name(mj,mujoco.mjtObj.mjOBJ_BODY,i) or "").endswith("Object")]
+            if not body_ids:
+                raise RuntimeError("cooking import has no bound target Object body")
+            records=[]
+            for body in body_ids:
+                R=quat_to_mat(torch.tensor(mj.body_iquat[body],dtype=torch.float64))
+                I=R@torch.diag(torch.tensor(mj.body_inertia[body],dtype=torch.float64))@R.T
+                records.append({"mass":float(mj.body_mass[body]),"com":mj.body_ipos[body].tolist(),"inertia":I.tolist()})
+            reference=records[0]
+            if any(not torch.allclose(torch.tensor(r[k]),torch.tensor(reference[k]),atol=1e-7,rtol=1e-6) for r in records for k in ('mass','com','inertia')):
+                raise RuntimeError("native temporary cooking inertia differs across environments")
+            original=self.asset["physical_profile"]
+            if abs(reference['mass']-float(original['mass']))>1e-6*max(1.,float(original['mass'])):
+                raise RuntimeError("native cooking import changed the explicitly supplied source mass")
+            self.asset["physical_profile"]={**original,**reference}
+            deferred_readback={"mode":DEFERRED_INERTIA_MODE,"native_import_mass_properties":reference,
+                "status":"temporary_import_readback_only; not_final_uniform_compound_inertia",
+                "physics_steps_permitted":False,"final_profile_requires_closed_compound_hull_integration":True}
         mass, com, inertia, friction, ground = validate_physical_profile(self.asset["physical_profile"])
         obj, env = self.object, self.env
         m = torch.full_like(obj.data.body_mass.torch, mass)
@@ -509,6 +632,9 @@ class HOITrackingSim:
         all_mu = wp.to_torch(model.shape_material_mu)
         shape_body = wp.to_torch(model.shape_body)
         all_mu[shape_body < 0] = ground
+        for sid, support in self.supports.items():
+            support_material = wp.to_torch(support._root_view.get_attribute("shape_material_mu", model))
+            support_material[:] = omni_support_recipe()["dynamic_friction"]
         manager.add_model_change(ModelFlags.SHAPE_PROPERTIES)
         read_m = obj.data.body_mass.torch[:, 0]
         read_c = obj.data.body_com_pose_b.torch[:, 0, :3]
@@ -519,7 +645,10 @@ class HOITrackingSim:
         read_mu = material.reshape(self.N, -1)
         if not torch.allclose(read_mu, torch.full_like(read_mu, friction), atol=1e-7, rtol=0):
             raise RuntimeError("Object friction readback differs")
-        read_ground = all_mu[shape_body < 0]
+        ground_mask = shape_body < 0
+        # Newton shape views retain exact entity indices; support material above
+        # is checked independently by the compiled support geometry audit.
+        read_ground = all_mu[ground_mask]
         if not read_ground.numel() or not torch.allclose(read_ground, torch.full_like(read_ground, ground), atol=1e-7, rtol=0):
             raise RuntimeError("Scene ground friction readback differs")
         mu = read_mu[:, 0].clone()
@@ -542,7 +671,10 @@ class HOITrackingSim:
                         "body_exclusion_signatures": mj.exclude_signature.tolist(),
                         "constraint_capacity_per_world": int(manager._solver.mjw_data.njmax),
                         "total_contact_capacity": int(manager._solver.mjw_data.naconmax)}
-        return {"mass": read_m.detach().cpu().tolist(), "com": read_c.detach().cpu().tolist(),
+        return {"deferred_cooking_inertia": deferred_readback,
+                "bound_physical_profile": self.asset["physical_profile"],
+                "bound_physical_profile_sha256": physical_profile_identity(self.asset["physical_profile"]),
+                "mass": read_m.detach().cpu().tolist(), "com": read_c.detach().cpu().tolist(),
                 "inertia": read_I.detach().cpu().tolist(), "object_friction": mu.detach().cpu().tolist(),
                 "ground_friction": ground, "gravity": gravity.detach().cpu().tolist(),
                 "object_pose_origin": "link", "velocity_reference_point": "link_origin", "frame": "world",
@@ -556,6 +688,228 @@ class HOITrackingSim:
                     "overflow_policy": "abort without replay insertion or successful native gate"},
                 "flattened_object_usd": str(self.object_usd), "flattened_object_usd_sha256": sha(self.object_usd),
                 "compiled_collision_geometry_verified_against_bundle": False}
+
+    def support_state(self):
+        """Observed support state in the same world axes/origin as robot state."""
+        from .scene_context import empty_scene_state
+        result=empty_scene_state((self.N,),device=self.device)
+        reference=result["support_pose_xyzw"].clone()
+        for sid,support in self.supports.items():
+            slot=SUPPORT_IDS.index(sid)
+            result["support_pose_xyzw"][:,slot]=support.data.root_link_pose_w.torch
+            reference[:,slot]=self.support_reset_poses[sid]
+            result["support_pose_xyzw"][:,slot,:3]-=self.scene.env_origins
+            reference[:,slot,:3]-=self.scene.env_origins
+        result["support_present"]=self.support_reset_present.clone()
+        result["reference_support_pose_xyzw"]=reference
+        return result
+
+    def _check_support_alignment(self, env_ids=None, *, reset=False):
+        ids = torch.arange(self.N,device=self.device) if env_ids is None else env_ids
+        for sid, support in self.supports.items():
+            pose = support.data.root_link_pose_w.torch[ids]
+            expected = self.support_reset_poses[sid][ids]
+            velocity = support.data.root_link_vel_w.torch[ids]
+            if not bool(torch.isfinite(pose).all() and torch.isfinite(velocity).all()):
+                raise RuntimeError("Nonfinite native scene support state")
+            ep = float((pose[:,:3]-expected[:,:3]).abs().max())
+            # q and -q encode the same rotation.
+            eq = float(torch.minimum((pose[:,3:]-expected[:,3:]).abs().amax(-1),
+                                     (pose[:,3:]+expected[:,3:]).abs().amax(-1)).max())
+            self.support_alignment["max_position_error_m"] = max(self.support_alignment["max_position_error_m"],ep)
+            self.support_alignment["max_quaternion_error"] = max(self.support_alignment["max_quaternion_error"],eq)
+            if ep > 2e-5 or eq > 2e-5 or not torch.allclose(velocity,torch.zeros_like(velocity),atol=2e-5,rtol=0):
+                raise RuntimeError(f"Native kinematic {sid} drifted from its sampled reference reset frame")
+        self.support_alignment["reset_count" if reset else "step_count"] += 1
+
+    def _write_support_probe_pose(self, sid, pose):
+        ids = torch.arange(self.N,device=self.device)
+        support = self.supports[sid]
+        support.write_root_link_pose_to_sim_index(root_pose=pose.contiguous(),env_ids=ids)
+        support.write_root_com_velocity_to_sim_index(root_velocity=torch.zeros(self.N,6,device=self.device),env_ids=ids)
+        self.support_reset_poses[sid][:] = pose
+
+    def _park_supports_for_probe(self):
+        # Disposable calibration only. Every normal reset restores source poses.
+        for sid in self.supports:
+            pose = torch.zeros(self.N,7,device=self.device);pose[:,6]=1
+            pose[:,:3] = self.scene.env_origins
+            pose[:,2] += -10. if sid == "table1" else -5.
+            self._write_support_probe_pose(sid,pose)
+        self.env.refresh()
+        self._check_support_alignment()
+
+    def _audit_support_geometry(self):
+        import mujoco
+        import warp as wp
+        from newton import BodyFlags
+        model = self.contacts.solver.mj_model
+        records = []
+        for sid in self.supports:
+            role = SUPPORT_ROLES[SUPPORT_IDS.index(sid)]
+            geoms = [i for i,r in enumerate(self.contacts.roles) if r == role]
+            expected = 1 if self.contacts.topology == "one_mujoco_world_per_environment" else self.N
+            if self.contacts.topology == "one_world_with_named_environments" and {self.contacts.geom_envs[g] for g in geoms} != set(range(self.N)):
+                raise RuntimeError(f"{sid} collider identity does not cover every environment")
+            if len(geoms) != expected:
+                raise RuntimeError(f"{sid} must retain exactly one bound cuboid collider per native world")
+            native_flags = wp.to_torch(self.supports[sid]._root_view.get_attribute("body_flags",self.env.sim.backend_manager.get_model()))
+            if native_flags.numel() != self.N or not bool(((native_flags.long() & int(BodyFlags.KINEMATIC)) != 0).all()):
+                raise RuntimeError(f"{sid} did not import as a native kinematic body")
+            instances = []
+            for g in geoms:
+                if int(model.geom_type[g]) != int(mujoco.mjtGeom.mjGEOM_BOX):
+                    raise RuntimeError("Native table must compile as the exact authored cuboid")
+                actual_size = torch.as_tensor(model.geom_size[g],dtype=torch.float64)*2
+                if not torch.allclose(actual_size,torch.tensor(omni_support_recipe()["size_m"],dtype=torch.float64),atol=1e-7,rtol=0):
+                    raise RuntimeError("Native support cuboid dimensions differ from bound author recipe")
+                if abs(float(model.geom_friction[g,0])-omni_support_recipe()["dynamic_friction"]) > 1e-6:
+                    raise RuntimeError("Native support friction differs from bound author material")
+                body = int(model.geom_bodyid[g])
+                if body == 0 or self.contacts.links[g] is not None:
+                    raise RuntimeError("Scene support lost its independent native entity identity")
+                instances.append({"geom_id":g,"geom_name":self.contacts.names[g],"role":role,
+                    "body_id":body,"body_name":mujoco.mj_id2name(model,mujoco.mjtObj.mjOBJ_BODY,body),
+                    "body_mocap_id":int(model.body_mocapid[body]),"body_mass_kg":float(model.body_mass[body]),
+                    "size_m":actual_size.tolist(),"geom_friction":model.geom_friction[g].tolist(),
+                    "geom_margin_m":float(model.geom_margin[g]),"geom_gap_m":float(model.geom_gap[g])})
+            records.append({"support_id":sid,"geometry_recipe_sha256":self.support_bank.manifest["geometry_recipe_sha256"],
+                            "compiled_geom_ids":geoms,"native_body_flags":native_flags.cpu().tolist(),
+                            "kinematic_verified":True,"instances":instances})
+        return records
+
+    def _body_support_probe_placement(self, ids):
+        """Place a held legal hand pose from compiled geometry, never stale live FK."""
+        from .probe_pose import CompiledProbePlanner
+        planner = getattr(self, "_compiled_probe_planner", None)
+        if planner is None:
+            planner = CompiledProbePlanner(self.contacts.solver.mj_model, self.contacts.roles,
+                joint_names=list(self.robot.joint_names), environment_ids=self.contacts.geom_envs)
+            planner.search(self.env.default_q.detach().cpu().reshape(-1).tolist())
+            self._compiled_probe_planner = planner
+        root, rotation, joint, surface, normal, audit = planner.placement(LEFT, ground=True)
+        cast = lambda value: torch.as_tensor(value, device=self.device, dtype=torch.float32)
+        # The exact same rigid translation applies to root and surface. All
+        # geometry was evaluated at this prescribed q/R in the compiled model;
+        # env.refresh() is deliberately not used as an mjw geom-cache refresh.
+        translation = cast([0., 0., 3.])
+        root_world = cast(root).expand(self.N, -1) + self.scene.env_origins + translation
+        rotation = cast(rotation).expand(self.N, -1, -1)
+        root_q = mat_to_quat(rotation)
+        joint = cast(joint).expand(self.N, -1).contiguous()
+        surface_world = cast(surface).expand(self.N, -1) + self.scene.env_origins + translation
+        normal = cast(normal).expand(self.N, -1)
+        self.robot.write_root_link_pose_to_sim_index(root_pose=torch.cat(
+            (root_world, root_q[:, 1:4], root_q[:, :1]), -1).contiguous(), env_ids=ids)
+        self.robot.write_root_link_velocity_to_sim_index(
+            root_velocity=torch.zeros(self.N, 6, device=self.device), env_ids=ids)
+        self.robot.write_joint_position_to_sim_index(position=joint, env_ids=ids)
+        self.robot.write_joint_velocity_to_sim_index(velocity=torch.zeros_like(joint), env_ids=ids)
+        actions = (joint - self.env.default_q - self.env.xi[:, 1:30]) / self.env.alpha
+        self.env.refresh()
+        initial, _ = self.state()
+        errors = {
+            "robot_root_position_m": float((initial[0] + self.scene.env_origins - root_world).abs().max()),
+            "robot_root_rotation": float((initial[1] - rotation).abs().max()),
+            "robot_root_linear_velocity_m_s": float(initial[2].abs().max()),
+            "robot_root_angular_velocity_rad_s": float(initial[3].abs().max()),
+            "robot_joint_position_rad": float((initial[4] - joint).abs().max()),
+            "robot_joint_velocity_rad_s": float(initial[5].abs().max()),
+            "held_pd_target_rad": float((self.env.default_q + self.env.xi[:, 1:30] + self.env.alpha * actions - joint).abs().max())}
+        if max(errors.values()) > 2e-5:
+            raise RuntimeError(f"native support probe initial state differs from prescribed pose/velocity: {errors}")
+        support_pose = torch.zeros(self.N, 7, device=self.device)
+        # Planner exposes the actual hand downward; gravity therefore pushes
+        # the free robot toward the static table instead of away from it.
+        if not torch.allclose(normal, cast([0., 0., -1.]).expand_as(normal), atol=1e-6, rtol=0):
+            raise RuntimeError("support probe requires the compiled exposed downward hand surface")
+        support_pose[:, 6] = 1.
+        support_pose[:, :3] = surface_world + normal * (.005 - .002)
+        definition = {"placement": "exposed_compiled_hand_surface_vs_table_face", "region": CHANNELS[0],
+            "region_pose_audit": audit, "prescribed_penetration_m": .002,
+            "rigid_translation_world_m": translation.cpu().tolist(),
+            "surface_point_before_translation": cast(surface).cpu().tolist(),
+            "surface_point_world": surface_world.cpu().tolist(), "outward_normal_world": normal.cpu().tolist(),
+            "initial_state_readback": {"robot_root_position_world": (initial[0] + self.scene.env_origins).cpu().tolist(),
+                "robot_root_rotation": initial[1].cpu().tolist(), "robot_joint_positions": initial[4].cpu().tolist(),
+                "robot_joint_velocities": initial[5].cpu().tolist(), "maximum_errors": errors},
+            "held_pd_offset_actions": actions.cpu().tolist(), "extra_physics_steps": 0}
+        return support_pose, actions, definition
+
+    def calibrate_support_probes(self, ticks=8):
+        """Real isolated support collisions; these must never label the 16 head."""
+        ids = torch.arange(self.N,device=self.device)
+        frames = self.f.clone(); actions=torch.zeros(self.N,29,device=self.device)
+        report = {"schema":"hoi_native_scene_supports_v1", **self.support_bank.manifest,
+                  "supports":self.support_geometry_audit,"isolation_probes":{}}
+        report["schema"] = "hoi_native_scene_supports_v1"
+        vertices = torch.cat([m["vertices"] for m in self.mdp.shapes.geometries[int(self.asset["asset_id"])]["collision_meshes"]]).to(self.device,dtype=torch.float32)
+        for sid in self.supports:
+            support_column=SUPPORT_IDS.index(sid)
+            report["isolation_probes"][sid]={}
+            for case in ("object_support","body_support"):
+                self.active_pair_probe=sid+"_"+case
+                self.reset(ids,frames);self._park_supports_for_probe()
+                actions = torch.zeros(self.N,29,device=self.device)
+                self._advance(actions)
+                S,O=self.state()
+                # Move the entire robot above the plane to avoid body-ground
+                # contacts and isolate the finite table from other entities.
+                root_q=mat_to_quat(S[1]); root=S[0]+self.scene.env_origins
+                root[:,2]+=3.
+                self.robot.write_root_link_pose_to_sim_index(root_pose=torch.cat((root,root_q[:,1:4],root_q[:,:1]),-1).contiguous(),env_ids=ids)
+                self.robot.write_root_link_velocity_to_sim_index(root_velocity=torch.zeros(self.N,6,device=self.device),env_ids=ids)
+                self.robot.write_joint_velocity_to_sim_index(velocity=torch.zeros(self.N,29,device=self.device),env_ids=ids)
+                object_pose=torch.zeros(self.N,7,device=self.device);object_pose[:,6]=1
+                object_pose[:,:3]=self.scene.env_origins+object_pose.new_tensor([8.,8.,5.])
+                support_pose=torch.zeros(self.N,7,device=self.device);support_pose[:,6]=1
+                self.env.refresh()
+                if case=="object_support":
+                    support_pose[:,:3]=self.scene.env_origins+support_pose.new_tensor([4.,4.,3.])
+                    # Actual target object collision geometry, identity object
+                    # orientation. Its lowest support rests 2 mm into table top.
+                    lowest = vertices[int(vertices[:,2].argmin())]
+                    object_pose[:,:3]=support_pose[:,:3]-lowest
+                    object_pose[:,2]+=.005-.002
+                    diagnostic_column=len(BODY_ROLES)
+                    definition={"placement":"object_lowest_surface_vs_table_top","prescribed_penetration_m":.002}
+                else:
+                    support_pose, actions, definition = self._body_support_probe_placement(ids)
+                    diagnostic_column=0
+                self.object.write_root_link_pose_to_sim_index(root_pose=object_pose.contiguous(),env_ids=ids)
+                self.object.write_root_com_velocity_to_sim_index(root_velocity=torch.zeros(self.N,6,device=self.device),env_ids=ids)
+                self._write_support_probe_pose(sid,support_pose);self.env.refresh()
+                actual_support = self.supports[sid].data.root_link_pose_w.torch
+                support_error = float((actual_support[:,:3]-support_pose[:,:3]).abs().max())
+                rotation_error = float(torch.minimum((actual_support[:,3:]-support_pose[:,3:]).abs().amax(-1),
+                    (actual_support[:,3:]+support_pose[:,3:]).abs().amax(-1)).max())
+                if max(support_error,rotation_error) > 2e-5:
+                    raise RuntimeError("native support probe table writeback differs from prescribed pose")
+                definition["support_initial_readback"] = {"pose_xyzw":actual_support.cpu().tolist(),
+                    "position_error_m":support_error,"quaternion_error":rotation_error}
+                learned,diagnostic=[],[]
+                for _ in range(ticks):
+                    pair=self._advance(actions)
+                    learned.append(pair["impulse"].cpu().tolist())
+                    diagnostic.append(pair["support_impulse"][:,support_column,diagnostic_column].cpu().tolist())
+                learned_t=torch.tensor(learned); diagnostic_t=torch.tensor(diagnostic)
+                passed=bool((learned_t==0).all() and (diagnostic_t.amax(0)/CONTROL_DT>self.contacts.threshold).all())
+                report["isolation_probes"][sid][case]={"ticks":ticks,"definition":definition,
+                    "control_dt_s":CONTROL_DT,"substeps_per_interval":4,"interval_normal_impulse_Ns":learned,
+                    "interval_support_impulse_Ns":diagnostic,"support_initial_pose_xyzw":support_pose.cpu().tolist(),
+                    "object_initial_pose_xyzw":object_pose.cpu().tolist(),"passed":passed}
+        self.active_pair_probe=None;self.reset(ids,frames)
+        report["alignment"] = dict(self.support_alignment)
+        report["reference_reset_audit"] = {
+            "environment_ids":ids.cpu().tolist(),"frames":frames.cpu().tolist(),
+            "clip_indices":self.motion.clip_id[frames].cpu().tolist(),
+            "clip_local_frames":(frames-self.motion.clip_start[self.motion.clip_id[frames]]).cpu().tolist(),
+            "supports":{sid:{"expected_pose_xyzw":self.support_bank.sample(sid,frames,self.scene.env_origins).cpu().tolist(),
+                "actual_pose_xyzw":support.data.root_link_pose_w.torch.cpu().tolist(),
+                "actual_velocity":support.data.root_link_vel_w.torch.cpu().tolist()}
+                for sid,support in self.supports.items()}}
+        report["passed"] = all(p["passed"] for cases in report["isolation_probes"].values() for p in cases.values())
+        return report
 
     def state(self):
         S = self.env.state()
@@ -604,8 +958,15 @@ class HOITrackingSim:
         else:
             v_com = link_to_com_velocity(R, v, w, self.xi_o[env_ids, 1:4])
             self.object.write_root_com_velocity_to_sim_index(root_velocity=torch.cat((v_com, w), -1).contiguous(), env_ids=env_ids)
+        for sid, support in self.supports.items():
+            support_pose = self.support_bank.sample(sid, f, self.scene.env_origins[env_ids])
+            support.write_root_link_pose_to_sim_index(root_pose=support_pose.contiguous(), env_ids=env_ids)
+            support.write_root_com_velocity_to_sim_index(root_velocity=torch.zeros(len(env_ids),6,device=self.device), env_ids=env_ids)
+            self.support_reset_poses[sid][env_ids] = support_pose
+            self.support_reset_present[env_ids,SUPPORT_IDS.index(sid)] = self.support_bank.present[sid][f]
         self.env.scene.reset(env_ids)
         self.env.refresh()
+        self._check_support_alignment(env_ids, reset=True)
         self.contact_missing_counter[env_ids] = 0
         _, actual = self.state()
         if not torch.allclose(actual[0][env_ids], p, atol=2e-5, rtol=0):
@@ -635,6 +996,8 @@ class HOITrackingSim:
             raise RuntimeError(f"MuJoCo-Warp collision/constraint capacity overflow: {value.cpu().tolist()}")
 
     def _advance(self, action):
+        if self.__dict__.get("cooking_only", False) or self.asset.get("inertia_mode") is not None:
+            raise RuntimeError("native cooking fixture is geometry-only; physics rollout is prohibited")
         e = self.env
         target = e.default_q + e.xi[:, 1:30] + e.alpha * action
         e.robot.set_joint_position_target_index(target=target)
@@ -643,6 +1006,7 @@ class HOITrackingSim:
         e.sim.step(render=False)
         e.scene.update(CONTROL_DT)
         self._overflow_gate()
+        self._check_support_alignment()
         S, O = self.state()
         names = ("robot_p", "robot_R", "robot_v", "robot_w", "robot_q", "robot_qd",
                  "object_p", "object_R", "object_v", "object_w")
@@ -655,7 +1019,13 @@ class HOITrackingSim:
             torch.save({"robot": tuple(v.detach().cpu() for v in S), "object": tuple(v.detach().cpu() for v in O),
                         "action": action.detach().cpu(), "frame": self.env.f.detach().cpu()}, self.output / "failure_state.pt")
             raise RuntimeError(f"Native physics produced nonfinite state: {bad}")
-        return self.contacts.end_interval()
+        interval = self.contacts.end_interval()
+        # Optional one-shot smoke evidence, after real integration and before
+        # step() can reset. Never armed during cooking, training or probes.
+        capture = self.__dict__.pop("_post_advance_capture", None)
+        if capture is not None:
+            capture(self)
+        return interval
 
     def _role_point(self, role):
         import warp as wp
@@ -671,6 +1041,38 @@ class HOITrackingSim:
             points.append(data[0, selected[0]])
         return torch.stack(points).clone()
 
+    def _region_surface(self, role, *, lowest=False):
+        """Read actual live solver geometry, including welded/merged body transforms."""
+        import warp as wp
+        model, data = self.contacts.solver.mj_model, self.contacts.solver.mjw_data
+        positions = wp.to_torch(data.geom_xpos)
+        rotations = wp.to_torch(data.geom_xmat).reshape(*positions.shape[:-1], 3, 3)
+        root = self.state()[0][0] + self.scene.env_origins
+        surfaces, normals, records = [], [], []
+        for env_id in range(self.N):
+            world = env_id if self.contacts.topology == "one_mujoco_world_per_environment" else 0
+            ids = [g for g, r in enumerate(self.contacts.roles) if r == role and
+                   (self.contacts.topology == "one_mujoco_world_per_environment" or self.contacts.geom_envs[g] == env_id)]
+            if not ids:
+                raise RuntimeError("Full-body probe has no bound native collider")
+            if not lowest:
+                ids = [max(ids, key=lambda g: float(model.geom_rbound[g]))]
+            candidates = []
+            for geom in ids:
+                center, rotation = positions[world, geom], rotations[world, geom]
+                direction = center.new_tensor([0., 0., -1.]) if lowest else center - root[env_id]
+                if float(direction.norm()) < 1e-6:
+                    direction = center.new_tensor([1., 0., 0.])
+                local_direction = (rotation.T @ direction).detach().cpu().double()
+                local, normal, proof = compiled_geom_support(model, geom, local_direction, facet=not lowest)
+                surface = center + rotation @ local.to(center)
+                world_normal = rotation @ normal.to(center)
+                proof.update(geom_name=self.contacts.names[geom], canonical_link=self.contacts.links[geom])
+                candidates.append((surface, world_normal, proof))
+            surface, normal, proof = min(candidates, key=lambda x: float(x[0][2])) if lowest else candidates[0]
+            surfaces.append(surface); normals.append(normal); records.append(proof)
+        return torch.stack(surfaces), torch.stack(normals), records
+
     def calibrate_pair_probes(self, ticks=8):
         """Shallow surface-contact probes in a disposable validation environment.
 
@@ -679,136 +1081,136 @@ class HOITrackingSim:
         four substeps; hand/ground and each foot/ground are independently
         measured negative controls. Placements and outcomes are saved verbatim.
         """
+        from .probe_pose import CompiledProbePlanner, object_support_facet
         ids = torch.arange(self.N, device=self.device)
         frames = self.f.clone()
-        actions = torch.zeros(self.N, 29, device=self.device)
+        baseline_actions = torch.zeros(self.N, 29, device=self.device)
         report = {}
         geometries = self.mdp.shapes.geometries[int(self.asset["asset_id"])]
         vertices = torch.cat([m["vertices"] for m in geometries["collision_meshes"]]).to(self.device, dtype=torch.float32)
-        cases = tuple(zip(CHANNELS, (LEFT, RIGHT, GROUND, LEFT_FOOT, RIGHT_FOOT))) + (
-            ("hand_ground_negative", LEFT), ("left_foot_ground_negative", LEFT_FOOT),
-            ("right_foot_ground_negative", RIGHT_FOOT))
+        object_rotation, object_support, object_facet = object_support_facet(geometries["collision_meshes"])
+        planner = CompiledProbePlanner(self.contacts.solver.mj_model, self.contacts.roles,
+            joint_names=list(self.robot.joint_names), environment_ids=self.contacts.geom_envs)
+        try:
+            planner.search(self.env.default_q.detach().cpu().reshape(-1).tolist())
+        finally:
+            (self.output / "probe-pose-search.json").write_text(
+                json.dumps(planner.search_evidence, indent=2) + "\n", encoding="utf-8")
+        self._compiled_probe_planner = planner
+        cases = tuple(zip(CHANNELS, CHANNEL_ROLES)) + tuple(
+            (("hand_ground_negative" if role == LEFT else name.removesuffix("_object") + "_ground_negative"), role)
+            for name, role in zip(CHANNELS[:-1], BODY_ROLES))
         for name, role in cases:
             self.active_pair_probe = name
             self.reset(ids, frames)
-            # Populate solver kinematics and save a measured baseline, then
-            # write only this disposable probe's object/root initial state.
-            self._advance(actions)
+            self._park_supports_for_probe()
+            # The source reference can have substantial joint/root velocities.
+            # Probe initial conditions hold the searched legal articulation;
+            # PD gains, action scales and collision filters remain unchanged.
             S, O = self.state()
             q = mat_to_quat(O[1])
             position = O[0] + self.scene.env_origins
             probe_velocity = torch.zeros(self.N, 6, device=self.device)
-            definition = {"placement": "object_ground_support_surface", "prescribed_penetration_m": .002}
-            if name in ("left_hand_object", "right_hand_object"):
-                side = "left" if role == LEFT else "right"
-                hand = self.mdp.shapes.hands[side]
-                points = torch.as_tensor(hand["palm_points"], device=self.device, dtype=torch.float32)
-                point_id = int((points - points.mean(0)).square().sum(-1).argmin())
-                local = points[point_id] + torch.as_tensor(hand["mount"], device=self.device)
-                kin = self.mdp.human.kin
-                P, R, V, W = kin.forward(*S, all_bodies=True)
-                wrist = kin.body_names.index(side + "_wrist_yaw_link")
-                offset = (R[:, wrist] @ local[:, None]).squeeze(-1)
-                palm = P[:, wrist] + offset + self.scene.env_origins
-                local_normal = position.new_tensor([0., -1. if side == "left" else 1., 0.])
-                normal = (R[:, wrist] @ local_normal[:, None]).squeeze(-1)
-                world_offsets = (O[1] @ vertices.T).transpose(-1, -2)
-                # The object support surface lies 2mm inside the measured
-                # actual palm plane. Center embedding would create thousands
-                # of irrelevant overlaps and does not calibrate a hand touch.
-                position, support_id = shallow_support_contact(palm, normal, world_offsets)
-                probe_velocity[:, :3] = V[:, wrist] + torch.linalg.cross(W[:, wrist], offset)
-                definition = {"placement": "actual_palm_patch_vs_object_support_surface",
-                              "palm_point_index": point_id, "object_support_vertex_indices": support_id.cpu().tolist(),
-                              "palm_point_world": palm.cpu().tolist(), "outward_normal_world": normal.cpu().tolist(),
-                              "prescribed_penetration_m": .002,
-                              "object_linear_velocity": "matched to measured palm-point velocity"}
-            elif name in ("left_foot_object", "right_foot_object"):
-                side = "left" if role == LEFT_FOOT else "right"
-                geom_ids = [g for g, r in enumerate(self.contacts.roles) if r == role and
-                            (self.contacts.topology == "one_mujoco_world_per_environment" or self.contacts.geom_envs[g] == 0)]
-                local, local_normal, foot_surface = compiled_foot_probe_surface(self.contacts.solver.mj_model, geom_ids)
-                kin = self.mdp.human.kin
-                P, R, V, W = kin.forward(*S, all_bodies=True)
-                foot = kin.body_names.index(side + "_ankle_roll_link")
-                offset = (R[:, foot] @ local.to(self.device, dtype=P.dtype)[:, None]).squeeze(-1)
-                surface = P[:, foot] + offset + self.scene.env_origins
-                normal = (R[:, foot] @ local_normal.to(self.device, dtype=P.dtype)[:, None]).squeeze(-1)
-                world_offsets = (O[1] @ vertices.T).transpose(-1, -2)
-                position, support_id = shallow_support_contact(surface, normal, world_offsets, lowest_support=True)
-                root_world, position, surface, root_lift, initial_minimum_z, object_minimum_z = lift_foot_probe_above_ground(
-                    S[0] + self.scene.env_origins, position, surface, world_offsets)
-                root_q = mat_to_quat(S[1])
-                self.robot.write_root_link_pose_to_sim_index(
-                    root_pose=torch.cat((root_world, root_q[:, 1:4], root_q[:, :1]), -1).contiguous(), env_ids=ids)
-                support_world = position + world_offsets[torch.arange(self.N, device=self.device), support_id]
-                ground_penetration = (-object_minimum_z).clamp_min(0)
-                ground_ok = bool(torch.isfinite(object_minimum_z).all() and (object_minimum_z >= .002 - 2e-6).all())
-                probe_velocity[:, :3] = V[:, foot] + torch.linalg.cross(W[:, foot], offset)
-                definition = {"placement": "actual_ankle_roll_collision_surface_vs_object_support_surface",
-                              "foot_surface": foot_surface, "object_support_vertex_indices": support_id.cpu().tolist(),
-                              "object_support_selection": "lowest_world_z_vertex_on_opposing_support_plane",
-                              "object_support_point_world": support_world.cpu().tolist(),
-                              "robot_root_lift_world_z_m": root_lift.cpu().tolist(),
-                              "initial_object_minimum_world_z_m": initial_minimum_z.cpu().tolist(),
-                              "object_minimum_world_z_m": object_minimum_z.cpu().tolist(),
-                              "ground_placement_audit": {"passed": ground_ok, "maximum_allowed_penetration_m": .002,
-                                  "minimum_required_clearance_m": .002, "minimum_final_world_z_m": float(object_minimum_z.min()),
-                                  "root_and_object_translated_identically": True,
-                                  "maximum_ground_penetration_m": float(ground_penetration.max()),
-                                  "per_environment_ground_penetration_m": ground_penetration.cpu().tolist()},
-                              "surface_point_world": surface.cpu().tolist(), "outward_normal_world": normal.cpu().tolist(),
-                              "prescribed_penetration_m": .002,
-                              "object_linear_velocity": "matched to measured foot-surface velocity"}
-                if not ground_ok:
-                    failure = {"probe": name, "definition": definition, "scope": "placement_rejected_before_physics_steps",
-                               "reason": "common robot/object probe translation did not establish finite ground clearance"}
-                    with (self.output / (name + "-placement-failure.json")).open("x", encoding="utf-8") as stream:
-                        json.dump(failure, stream, indent=2, allow_nan=False)
-                    raise RuntimeError("Foot positive probe would deeply embed the object in the ground; placement audit preserved")
-            elif name == "object_ground":
-                world_offsets = (O[1] @ vertices.T).transpose(-1, -2)
-                position[:, 2] = -world_offsets[..., 2].amin(-1) - .002
-            elif name == "hand_ground_negative":
-                definition = {"placement": "hand_ground_negative_control; object_displaced_clear"}
-                left = self._role_point(LEFT)
-                root_q = mat_to_quat(S[1])
-                root_p = S[0] + self.scene.env_origins
-                root_p[:, 2] -= left[:, 2] + .015
-                root_pose = torch.cat((root_p, root_q[:, 1:4], root_q[:, :1]), -1).contiguous()
-                self.robot.write_root_link_pose_to_sim_index(root_pose=root_pose, env_ids=ids)
-                position[:] = position.new_tensor([8., 8., 5.]) + self.scene.env_origins
+            actions = baseline_actions
+            if role in BODY_ROLES:
+                negative = name not in CHANNELS
+                root, rotation, joint, surface, normal, audit = planner.placement(role, ground=negative)
+                cast = lambda value: torch.as_tensor(value, device=self.device, dtype=torch.float32)
+                root_world = cast(root).expand(self.N, -1) + self.scene.env_origins
+                root_q = mat_to_quat(cast(rotation).expand(self.N, -1, -1))
+                joint = cast(joint).expand(self.N, -1).contiguous()
+                self.robot.write_root_link_pose_to_sim_index(root_pose=torch.cat(
+                    (root_world, root_q[:, 1:4], root_q[:, :1]), -1).contiguous(), env_ids=ids)
+                self.robot.write_root_link_velocity_to_sim_index(
+                    root_velocity=torch.zeros(self.N, 6, device=self.device), env_ids=ids)
+                self.robot.write_joint_position_to_sim_index(position=joint, env_ids=ids)
+                self.robot.write_joint_velocity_to_sim_index(velocity=torch.zeros_like(joint), env_ids=ids)
+                # _advance applies exactly default_q + xi + alpha * action.
+                actions = (joint - self.env.default_q - self.env.xi[:, 1:30]) / self.env.alpha
+                definition = {"placement": "exposed_compiled_region_ground_negative" if negative else
+                              "exposed_compiled_region_vs_object_support_surface",
+                              "prescribed_penetration_m": .002, "region_pose_audit": audit}
+                if negative:
+                    position = position.new_tensor([8., 8., 5.]).expand(self.N, -1) + self.scene.env_origins
+                else:
+                    surface = cast(surface).expand(self.N, -1) + self.scene.env_origins
+                    normal = cast(normal).expand(self.N, -1)
+                    object_R = cast(object_rotation).expand(self.N, -1, -1)
+                    q = mat_to_quat(object_R)
+                    world_offsets = (object_R @ vertices.T).transpose(-1, -2)
+                    position = surface - cast(object_support) - .002 * normal
+                    # A hovering free robot and object share gravity. A gentle
+                    # relative approach supplies a defined real contact impulse;
+                    # no additional force, constraint or physics tuning is used.
+                    probe_velocity[:, :3] = -.2 * normal
+                    minimum_z = (position[:, None, 2] + world_offsets[..., 2]).amin(-1)
+                    definition.update(surface_point_world=surface.cpu().tolist(), outward_normal_world=normal.cpu().tolist(),
+                        object_support_facet=object_facet,
+                        object_support_selection="center_of_one_actual_exposed_convex_component_facet",
+                        prescribed_relative_approach_speed_m_s=.2,
+                        ground_placement_audit={"passed": bool((minimum_z >= .002-2e-6).all()),
+                            "maximum_allowed_penetration_m": .002, "minimum_required_clearance_m": .002,
+                            "minimum_final_world_z_m": float(minimum_z.min()),
+                            "maximum_ground_penetration_m": float((-minimum_z).clamp_min(0).max()),
+                            "per_environment_ground_penetration_m": (-minimum_z).clamp_min(0).cpu().tolist(),
+                            "placement_method": "all_robot_colliders_above_ground_exposed_target_up"})
+                    if not definition["ground_placement_audit"]["passed"]:
+                        raise RuntimeError("Exposed-region object probe failed ground clearance")
             else:
-                side = "left" if role == LEFT_FOOT else "right"
-                geom_ids = [g for g, r in enumerate(self.contacts.roles) if r == role and
-                            (self.contacts.topology == "one_mujoco_world_per_environment" or self.contacts.geom_envs[g] == 0)]
-                kin = self.mdp.human.kin
-                P, R, _, _ = kin.forward(*S, all_bodies=True)
-                foot = kin.body_names.index(side + "_ankle_roll_link")
-                # Include every actual hull after its current rotation. A local
-                # -z support point is not the world minimum of a tilted foot.
-                minimum_z, foot_surface = compiled_foot_world_minimum(self.contacts.solver.mj_model, geom_ids,
-                    P[:, foot] + self.scene.env_origins, R[:, foot])
-                root_p = S[0] + self.scene.env_origins
-                root_p[:, 2] -= minimum_z + .002
+                # The object-ground control is spatially separated from the
+                # robot, so a source reset cannot contaminate its identity.
+                world_offsets = (O[1] @ vertices.T).transpose(-1, -2)
+                position = self.scene.env_origins.clone()
+                position[:, 2] = -world_offsets[..., 2].amin(-1) - .002
                 root_q = mat_to_quat(S[1])
-                self.robot.write_root_link_pose_to_sim_index(
-                    root_pose=torch.cat((root_p, root_q[:, 1:4], root_q[:, :1]), -1).contiguous(), env_ids=ids)
-                position[:] = position.new_tensor([8., 8., 5.]) + self.scene.env_origins
-                definition = {"placement": f"{side}_foot_ground_negative_control; object_displaced_clear",
-                              "foot_surface": foot_surface, "minimum_world_z_before_shift": minimum_z.cpu().tolist(),
+                root_world = S[0] + self.scene.env_origins
+                root_world[:, 2] += (world_offsets[..., 2].amax(-1) - world_offsets[..., 2].amin(-1)) + 3.
+                self.robot.write_root_link_pose_to_sim_index(root_pose=torch.cat(
+                    (root_world, root_q[:, 1:4], root_q[:, :1]), -1).contiguous(), env_ids=ids)
+                self.robot.write_root_link_velocity_to_sim_index(
+                    root_velocity=torch.zeros(self.N, 6, device=self.device), env_ids=ids)
+                self.robot.write_joint_velocity_to_sim_index(velocity=torch.zeros(self.N, 29, device=self.device), env_ids=ids)
+                actions = (S[4] - self.env.default_q - self.env.xi[:, 1:30]) / self.env.alpha
+                definition = {"placement": "object_ground_support_surface_robot_raised_clear",
                               "prescribed_penetration_m": .002}
             pose = torch.cat((position, q[:, 1:4], q[:, :1]), -1).contiguous()
             self.object.write_root_link_pose_to_sim_index(root_pose=pose, env_ids=ids)
             self.object.write_root_com_velocity_to_sim_index(root_velocity=probe_velocity, env_ids=ids)
             self.env.refresh()
+            initial_robot, initial_object = self.state()
+            definition["initial_state_readback"] = {
+                "robot_root_position_world": (initial_robot[0] + self.scene.env_origins).cpu().tolist(),
+                "robot_root_rotation": initial_robot[1].cpu().tolist(),
+                "robot_joint_positions": initial_robot[4].cpu().tolist(),
+                "robot_joint_velocities": initial_robot[5].cpu().tolist(),
+                "object_position_world": (initial_object[0] + self.scene.env_origins).cpu().tolist(),
+                "object_rotation": initial_object[1].cpu().tolist(),
+                "object_link_velocity_world": initial_object[2].cpu().tolist(),
+                "object_angular_velocity_world": initial_object[3].cpu().tolist()}
+            desired_joint = joint if role in BODY_ROLES else S[4]
+            errors = {
+                "robot_root_position_m": float((initial_robot[0] + self.scene.env_origins - root_world).abs().max()),
+                "robot_root_rotation": float((initial_robot[1] - quat_to_mat(root_q)).abs().max()),
+                "robot_joint_position_rad": float((initial_robot[4] - desired_joint).abs().max()),
+                "robot_joint_velocity_rad_s": float(initial_robot[5].abs().max()),
+                "held_pd_target_rad": float((self.env.default_q + self.env.xi[:, 1:30] + self.env.alpha * actions - desired_joint).abs().max()),
+                "object_position_m": float((initial_object[0] + self.scene.env_origins - position).abs().max()),
+                "object_rotation": float((initial_object[1] - quat_to_mat(q)).abs().max()),
+                "object_linear_velocity_m_s": float((initial_object[2] - probe_velocity[:, :3]).abs().max()),
+                "object_angular_velocity_rad_s": float(initial_object[3].abs().max())}
+            definition["initial_state_readback"]["maximum_errors"] = errors
+            if max(errors.values()) > 2e-5:
+                raise RuntimeError(f"native probe initial state differs from prescribed pose/velocity: {errors}")
             max_force = torch.zeros(len(CHANNELS), device=self.device)
             hand_ground, foot_ground = torch.zeros(2, device=self.device), torch.zeros(2, device=self.device)
-            impulse_trace, force_trace, hand_ground_trace, foot_ground_trace = [], [], [], []
+            body_ground = torch.zeros(len(BODY_ROLES), device=self.device)
+            impulse_trace, force_trace, hand_ground_trace, foot_ground_trace, body_ground_trace = [], [], [], [], []
             try:
                 for _ in range(ticks):
                     pair = self._advance(actions)
                     max_force = torch.maximum(max_force, pair["contact_force"].amax(0))
+                    body_ground = torch.maximum(body_ground, (pair["body_ground_impulse"] / CONTROL_DT).amax(0))
+                    body_ground_trace.append(pair["body_ground_impulse"].cpu().tolist())
                     hand_ground = torch.maximum(hand_ground, (pair["hand_ground_impulse"] / CONTROL_DT).amax(0))
                     foot_ground = torch.maximum(foot_ground, (pair["foot_ground_impulse"] / CONTROL_DT).amax(0))
                     impulse_trace.append(pair["impulse"].cpu().tolist())
@@ -825,8 +1227,11 @@ class HOITrackingSim:
                     json.dump(failure, stream, indent=2)
                 raise
             report[name] = {"object_initial_pose_xyzw": pose.cpu().tolist(), "ticks": ticks,
-                            "definition": definition, "object_initial_com_velocity_world": probe_velocity.cpu().tolist(),
+                            "definition": definition, "held_pd_offset_actions": actions.cpu().tolist(),
+                            "object_initial_com_velocity_world": probe_velocity.cpu().tolist(),
                             "maximum_interval_normal_force_N": max_force.cpu().tolist(),
+                            "maximum_body_ground_interval_force_N": body_ground.cpu().tolist(),
+                            "interval_body_ground_impulse_Ns": body_ground_trace,
                             "maximum_hand_ground_interval_force_N": hand_ground.cpu().tolist(),
                             "maximum_foot_ground_interval_force_N": foot_ground.cpu().tolist(),
                             "interval_normal_impulse_Ns": impulse_trace, "interval_mean_normal_force_N": force_trace,
@@ -834,7 +1239,7 @@ class HOITrackingSim:
                             "interval_foot_ground_impulse_Ns": foot_ground_trace,
                             "control_dt_s": CONTROL_DT, "substeps_per_interval": 4}
             (self.output / "pair-probes-progress.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
-        checks = {name: report[name]["maximum_interval_normal_force_N"][channel] > self.contacts.threshold
+        checks = {name: bool((torch.tensor(report[name]["interval_mean_normal_force_N"])[..., channel].amax(0) > self.contacts.threshold).all())
                   for channel, name in enumerate(CHANNELS)}
         negative = report["hand_ground_negative"]
         negative_ok = max(negative["maximum_hand_ground_interval_force_N"]) > self.contacts.threshold and max(negative["maximum_interval_normal_force_N"][:2]) == 0
@@ -843,14 +1248,24 @@ class HOITrackingSim:
             negative = report[side + "_foot_ground_negative"]
             checks[side + "_foot_ground_not_mislabelled"] = (
                 negative["maximum_foot_ground_interval_force_N"][index] > self.contacts.threshold and
-                max(negative["maximum_interval_normal_force_N"][3:]) == 0)
-        report["passed"], report["checks"] = all(checks.values()), checks
+                max(negative["maximum_interval_normal_force_N"][:-1]) == 0)
+        for index, (channel, role) in enumerate(zip(CHANNELS[:-1], BODY_ROLES)):
+            name = "hand_ground_negative" if role == LEFT else channel.removesuffix("_object") + "_ground_negative"
+            negative = report[name]
+            checks[channel + "_ground_not_mislabelled"] = (
+                negative["maximum_body_ground_interval_force_N"][index] > self.contacts.threshold and
+                max(negative["maximum_interval_normal_force_N"][:-1]) == 0)
+        from .native_acceptance import probe_trace_blockers
+        trace_blockers = probe_trace_blockers(report, self.N, self.contacts.threshold)
+        report["passed"], report["checks"] = not trace_blockers, checks
+        report["every_environment_trace_blockers"] = trace_blockers
         self.active_pair_probe = None
         self.reset(ids, frames)
         return report
 
     def step(self, action):
         e = self.env
+        scene = self.support_state()
         if action.shape != (self.N, 29) or not bool(torch.isfinite(action).all()):
             raise ValueError("Expected finite [N,29] G1 PD-offset actions")
         S, O = self.state()
@@ -873,14 +1288,15 @@ class HOITrackingSim:
         failure_reason = (height_fail.int() | (tilt_fail.int() << 1) | (object_fail.int() << 2) |
                           ((f + 1 >= clip_end).int() << 3) | ((ep_step + 1 >= e.max_episode_steps).int() << 4))
         expected, valid = self.motion.expected(f1)
-        missing = (expected > .5) & (valid > .5) & pair["contact_valid"][:, :2] & (pair["contact"][:, :2] < .5)
+        missing = (expected > .5) & (valid > .5) & pair["contact_valid"] & (pair["contact"] < .5)
         self.contact_missing_counter = torch.where(missing, self.contact_missing_counter + 1, 0)
         tr = {"s": flatten_state(S), "s1": flatten_state(S1), "o": flatten_object(O), "o1": flatten_object(O1),
               "a": action.clone(), "a_prev": a_prev, "xi": e.xi.clone(), "xi_o": self.xi_o.clone(), "f": f,
               "ep_step": ep_step, "done": done, "term": term, "asset_id": self.asset_id.clone(),
               "failure_reason": failure_reason,
               "r": reward, "r_human": terms["human_reward"], "r_hoi": reward - terms["human_reward"],
-              "contact_missing_counter": self.contact_missing_counter.clone(), "terms": terms, **pair}
+              "contact_missing_counter": self.contact_missing_counter.clone(), "terms": terms, **pair,
+              "support_pose_xyzw":scene["support_pose_xyzw"],"support_present":scene["support_present"]}
         e.ep_disc_ret += (e.gamma ** ep_step.float()) * reward
         e.ep_ret += reward
         e.f, e.ep_step, e.a_prev = f1, ep_step + 1, action.clone()
@@ -926,10 +1342,12 @@ class HOITrackingSim:
         names = [mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, i) or "" for i in range(model.nbody)]
         object_body = next(i for i, n in enumerate(names) if "Object" in n and int(model.body_jntnum[i]) == 1)
 
-        def extract(role, body, offset=None):
+        links = compiled_geom_links(model)
+
+        def extract(role, body, offset=None, canonical_link=None):
             meshes = []
             for g, r in enumerate(self.contacts.roles):
-                if r != role:
+                if r != role or (canonical_link is not None and links[g] != canonical_link):
                     continue
                 # Export first environment only when the CPU model encodes all.
                 ge = self.contacts.geom_envs[g]
@@ -954,7 +1372,7 @@ class HOITrackingSim:
         repo = Path(__file__).resolve().parents[2]
         for side, role in (("left", LEFT), ("right", RIGHT)):
             body = next(i for i, n in enumerate(names) if side + "_wrist_yaw_link" in n)
-            meshes = extract(role, body, ORIGIN[side])
+            meshes = extract(role, body, ORIGIN[side], canonical_link=side + "_rubber_hand")
             stl = repo / "data/g1_description/meshes" / f"{side}_rubber_hand.STL"
             if sha(stl) != HAND_SHA[side]:
                 raise RuntimeError("Native hand source STL identity changed")
@@ -1004,6 +1422,9 @@ class HOITrackingSim:
         q = Rotation.from_matrix(axes).as_quat()
         mass.CreateDiagonalInertiaAttr(Gf.Vec3f(*map(float, values)))
         mass.CreatePrincipalAxesAttr(Gf.Quatf(float(q[3]), Gf.Vec3f(*map(float, q[:3]))))
+        if self.asset.get("repair_binding"):
+            from hoi.data.native_repairs import read_binding, apply_hull_vertex_contract
+            read_binding(self.asset["repair_binding"]["path"])
         for i, mesh in enumerate(object_meshes):
             prim = UsdGeom.Mesh.Define(stage, f"/Object/hull_{i:03d}")
             prim.CreatePointsAttr([Gf.Vec3f(*map(float, v)) for v in mesh["vertices"]])
@@ -1012,6 +1433,8 @@ class HOITrackingSim:
             prim.CreateSubdivisionSchemeAttr("none")
             UsdPhysics.CollisionAPI.Apply(prim.GetPrim()).CreateCollisionEnabledAttr(True)
             UsdPhysics.MeshCollisionAPI.Apply(prim.GetPrim()).CreateApproximationAttr("convexHull")
+            if self.asset.get("repair_binding"):
+                apply_hull_vertex_contract(prim.GetPrim(),len(mesh["vertices"]))
         stage.GetRootLayer().Save()
         record = {"object_asset": self.asset["object_asset"], "exact_scale": self.asset["exact_scale"],
                   "mesh_to_object": np.eye(4).tolist(), "native_asset": str(target), "native_asset_sha256": sha(target),
@@ -1020,6 +1443,23 @@ class HOITrackingSim:
                   "compiled_geometry_frame": "object_root_link_origin", "compiled_mesh_names": [m["source_native_geom"] for m in object_meshes],
                   "native_convex_evidence": [m["native_convex_evidence"] for m in object_meshes],
                   "source_native_asset": self.asset["native_asset"], "source_native_asset_sha256": self.asset["native_asset_sha256"]}
+        if getattr(self, "cooking_source_evidence", None):
+            from hoi.data.native_assets import digest as surface_digest
+            evidence = self.cooking_source_evidence
+            if evidence.get("repair_binding"):
+                from hoi.data.native_repairs import compare_candidate_export
+                record["repair_import_comparison"]=compare_candidate_export(evidence["repair_binding"]["path"],record["collision_meshes"])
+                record.update(repair_binding=evidence["repair_binding"],
+                    cooking_input_geometry_sha256=evidence["cooking_input_geometry_sha256"],
+                    cooking_input_surface_sha256=evidence["cooking_input_surface_sha256"],
+                    original_source_build=evidence["original_source_build"],
+                    hull_vertex_policy="per_component_input_vertex_count_no_decimation")
+            record.update(object_geometry_sha256=evidence["source_object_geometry_sha256"],
+                source_exact_surface_sha256=evidence["source_exact_surface_sha256"],
+                native_compiled_surface_sha256=surface_digest(record["collision_meshes"]),
+                source_build_receipt=evidence["build_receipt"],physical_evidence=evidence["physical_evidence"],
+                geometry_stage="native_compiled_export_requires_second_import_geometry_gate",
+                training_ready=False)
         recipe = {"schema": "hoi_v1_compiled_geometry_recipe_v1", "assets": [record], "hands": hands,
                   "native_physics_readback": self.physics_report,
                   "hand_runtime_report": self.env.physics_settings["hand_asset"],
@@ -1028,6 +1468,9 @@ class HOITrackingSim:
                   "limitations": "Actual Newton CoACD meshes; does not claim original PhysX cooker equivalence"}
         if getattr(self, "reference_kinematics", None) is not None:
             recipe["reference_kinematics"] = self.reference_kinematics
+        if getattr(self, "cooking_source_evidence", None):
+            recipe["robot_geometry_sha256"] = self.cooking_source_evidence["robot_geometry_sha256"]
+            recipe["cooking_fixture_source"] = self.cooking_source_evidence
         (output / "assets.json").write_text(json.dumps(recipe, indent=2) + "\n", encoding="utf-8")
         return recipe, object_meshes
 
@@ -1104,9 +1547,10 @@ class HOITrackingSim:
         from hoi.hand_collision import ORIGIN
         from supermimic.rotations import so3_exp
         records = []
+        links = compiled_geom_links(model)
         for side, role in (("left", LEFT), ("right", RIGHT)):
             wrist = next(i for i, name in enumerate(names) if side + "_wrist_yaw_link" in name)
-            hand_geoms = [g for g, r in enumerate(self.contacts.roles) if r == role and
+            hand_geoms = [g for g, r in enumerate(self.contacts.roles) if r == role and links[g] == side + "_rubber_hand" and
                           (self.contacts.topology == "one_mujoco_world_per_environment" or self.contacts.geom_envs[g] == 0)]
             hands = self.mdp.shapes.hands[side]["collision_meshes"]
             mount = torch.tensor(ORIGIN[side], dtype=torch.float64)
@@ -1169,7 +1613,7 @@ def _load_legacy_fixture(path, asset_id, kin, device):
     frames = torch.load(source_case["motion"], weights_only=True, map_location="cpu")
     reference = adapt_motion(frames, manifest["robot_joint_names"], G1_JOINT_NAMES)
     n = len(reference["time"])
-    unknown = torch.zeros(n, 2)
+    unknown = torch.zeros(n, len(CHANNELS))
     # Expected-contact masks are unknown here. This path never computes HOI
     # reward, updates a normalizer, creates replay or enters a learner.
     bank = TrainingMotionBank([{"name": source_case["id"], "asset_id": 0, "reference": reference,
@@ -1195,15 +1639,22 @@ def main(argv=None):
     inputs = parser.add_mutually_exclusive_group(required=True)
     inputs.add_argument("--bundle", type=Path)
     inputs.add_argument("--legacy-prepared-fixture", type=Path)
+    inputs.add_argument("--curated-cooking-fixture", type=Path, help="First-stage source-bound native collision cook; no reward or training")
     parser.add_argument("--robot-asset-evidence", type=Path, help="Fixture-only recipe binding an already verified exact hand overlay")
     parser.add_argument("--asset-id", type=int, required=True)
     parser.add_argument("--num-envs", type=int, default=8)
     parser.add_argument("--steps", type=int, default=64)
+    parser.add_argument("--capture-smoke-visual", action="store_true", help="Capture/render one existing smoke step before autoreset; no additional physics; unavailable for cooking")
+    parser.add_argument("--audit-scene-resets", action="store_true", help="Terminal all-clip sampled support reset/readback audit; no additional physics; state discarded")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--output", type=Path, required=True)
     add_physics_arguments(parser)
     add_launcher_args(parser)
     args = parser.parse_args(argv)
+    if args.capture_smoke_visual and (args.curated_cooking_fixture is not None or args.steps < 1):
+        raise ValueError("--capture-smoke-visual requires standard native smoke with existing physics steps; cooking stays geometry-only")
+    if args.audit_scene_resets and (args.curated_cooking_fixture is not None or args.legacy_prepared_fixture is not None or args.steps < 1):
+        raise ValueError("--audit-scene-resets requires a bound bundle and completed standard smoke")
     settings, _ = resolve_arguments(args)
     if not (settings.hand_collision and settings.self_collision):
         parser.error("v1 native gate requires the specified hand ON/self ON profile")
@@ -1222,6 +1673,7 @@ def main(argv=None):
     torch.manual_seed(args.seed)
     device = "cuda:0"
     kin = G1Kinematics(device)
+    is_fixture = bool(args.legacy_prepared_fixture or args.curated_cooking_fixture)
     if args.legacy_prepared_fixture:
         bank, mdp, asset, source = _load_legacy_fixture(args.legacy_prepared_fixture, args.asset_id, kin, device)
         robot_asset = None
@@ -1234,12 +1686,17 @@ def main(argv=None):
             if robot_asset is None:
                 raise ValueError("Robot evidence recipe does not bind an exact verified hand overlay")
             source["robot_asset_evidence"] = {"path": str(args.robot_asset_evidence), "sha256": hashlib.sha256(args.robot_asset_evidence.read_bytes()).hexdigest()}
+    elif args.curated_cooking_fixture:
+        if args.robot_asset_evidence or args.asset_id != 0:
+            parser.error("curated cooking fixture binds its robot internally and requires --asset-id 0")
+        from .native_fixture import load_curated_cooking_fixture
+        bank, mdp, asset, source, robot_asset = load_curated_cooking_fixture(args.curated_cooking_fixture,kin,device)
     else:
         if args.robot_asset_evidence:
             parser.error("--robot-asset-evidence applies only to the independent legacy physics fixture")
         from hoi.v1.prepare import load_bundle
         from hoi.v1.mdp import HOIMDP
-        bank, shapes, bundle = load_bundle(args.bundle, kin, device=device, require_train=True, asset_filter=[args.asset_id])
+        bank, shapes, bundle = load_bundle(args.bundle, kin, device=device, require_train=False, asset_filter=[args.asset_id])
         asset = next(a for a in bundle["assets"] if int(a["asset_id"]) == args.asset_id)
         mdp = HOIMDP(kin, bank, torch.tensor(default_joint_pos_list(), device=device), shapes)
         robot_asset = bundle.get("native_robot_asset")
@@ -1248,47 +1705,90 @@ def main(argv=None):
         source = {"bundle": str(args.bundle), "scope": "single_asset_native_bundle_gate",
                   "bundle_content_sha256": bundle["bundle_content_sha256"]}
     cfg = make_hoi_sim(device, args)
+    cfg.physics.solver_cfg.save_to_mjcf = str(args.output / "compiled_model.generated.xml")
     with launch_simulation(cfg, args), torch.no_grad():
-        env = HOITrackingSim(cfg, args.num_envs, bank, mdp, asset, args.output, eval_mode=False, reset_noise=False, robot_asset=robot_asset)
+        env = HOITrackingSim(cfg, args.num_envs, bank, mdp, asset, args.output, eval_mode=False, reset_noise=False, robot_asset=robot_asset, cooking_only=bool(args.curated_cooking_fixture))
         env.reference_kinematics = source.get("reference_kinematics")
+        env.cooking_source_evidence = source if args.curated_cooking_fixture else None
         from hoi.hand_collision import compiled_audit
         from supermimic.physics import compiled_self_collision_audit
         hand_audit = compiled_audit(env.contacts.solver.mj_model, True)
         self_audit = compiled_self_collision_audit(env.contacts.solver.mj_model, True)
+        from .native_model_debug import export_actual_model
+        export_actual_model(env.contacts.solver.mj_model, args.output,
+            args.output / "compiled_model.generated.xml", recorder=env.contacts,
+            scene_snapshot={**env.support_state(), "environment_origins": env.scene.env_origins,
+                "reference_frames": env.f, "declared_support_ids": list(env.supports)})
         export, meshes = env.export_compiled_geometry(args.output / "compiled_geometry")
-        if args.legacy_prepared_fixture:
+        if args.curated_cooking_fixture:
+            from .native_fixture import finish_geometry_only_cooking
+            finish_geometry_only_cooking(env,source,args.output,hand_audit=hand_audit,self_audit=self_audit,seed=args.seed)
+            return
+        if is_fixture:
             from types import SimpleNamespace
             mdp.shapes = SimpleNamespace(geometries=[{"collision_meshes": meshes}], hands=export["hands"])
             env.physics_report["independent_native_geometry_queries"] = env._native_distance_audit()
         else:
             env.verify_compiled_geometry(meshes, compiled_hands=export["hands"])
         probes = env.calibrate_pair_probes()
+        support_probes = env.calibrate_support_probes()
         (args.output / "pair-probes.json").write_text(json.dumps(probes, indent=2) + "\n", encoding="utf-8")
+        smoke_visual = {"enabled": False}
+        if args.capture_smoke_visual:
+            from .native_model_debug import enable_smoke_visual_capture
+            smoke_visual = enable_smoke_visual_capture(env,args.output / "smoke_visual",args.output / "compiled_model.generated.xml")
+        input_contract = {"passed": False, "reason": "independent fixture has no bound training/reference inputs"}
+        if not is_fixture:
+            from .privileged import configure_teacher
+            configure_teacher(mdp, bundle, device)
         totals = torch.zeros(len(CHANNELS), device=device)
         maximum_force = torch.zeros(len(CHANNELS), device=device)
         for _ in range(args.steps):
             action = torch.zeros(args.num_envs, 29, device=device)
-            tr = env._advance(action) if args.legacy_prepared_fixture else env.step(action)
+            tr = env._advance(action) if is_fixture else env.step(action)
+            if not is_fixture and not input_contract.get("passed"):
+                from .native_input_contract import validate_transition_inputs
+                input_contract = validate_transition_inputs(tr, mdp, args.output / "first_transition_inputs.pt")
             totals += tr["contact"].sum(0)
             maximum_force = torch.maximum(maximum_force, tr["contact_force"].amax(0))
         palm_verified = False
-        if not args.legacy_prepared_fixture:
+        if not is_fixture:
             palm_verified = all(bool(mdp.shapes.hands[s].get("palm_selection_verified", False)) for s in ("left", "right"))
-        report = {"physics": env.physics_report, "contact": env.contacts.manifest(), "steps": args.steps, "source": source,
+        from .native_acceptance import capture_native_runtime
+        report = {"native_runtime": capture_native_runtime(env.contacts, compilation=env.warp_compilation),
+                  "physics": env.physics_report, "contact": env.contacts.manifest(), "steps": args.steps, "source": source,
                   "source_code_sha256": source_code,
                   "asset_id": int(asset["asset_id"]), "object_asset": asset["object_asset"],
                   "seed": args.seed,
                   "bundle_content_sha256": source.get("bundle_content_sha256"), "palm_selection_verified": palm_verified,
-                  "palm_selection_evidence": None if args.legacy_prepared_fixture else {s: mdp.shapes.hands[s].get("palm_selection_evidence") for s in ("left", "right")},
+                  "palm_selection_evidence": None if is_fixture else {s: mdp.shapes.hands[s].get("palm_selection_evidence") for s in ("left", "right")},
                   "compiled_hand_audit": hand_audit, "compiled_self_collision_audit": self_audit,
                   "compiled_foot_audit": env.compiled_foot_audit,
                   "compiled_geometry_export": str(args.output / "compiled_geometry/assets.json"),
                   "num_envs": args.num_envs, "contact_positives": totals.cpu().tolist(),
                   "maximum_interval_force_N": maximum_force.cpu().tolist(),
                   "zero_action_smoke_completed": True, "formal_training_started": False,
-                  "native_pair_calibration_complete": probes["passed"], "pair_probes": probes}
+                  "native_pair_calibration_complete": probes["passed"], "pair_probes": probes,
+                  "native_scene_supports": support_probes, "native_input_contract": input_contract, "smoke_visual_snapshot": smoke_visual}
+        if args.capture_smoke_visual and not smoke_visual["captured"]:
+            raise RuntimeError("Requested smoke visual was not captured by an existing control interval")
+        # All ordinary acceptance results and visual/input captures are fixed.
+        # This optional terminal audit only writes/reads reset state; no later
+        # physics or network inference is permitted before environment close.
+        if args.audit_scene_resets:
+            from .native_scene_reset_audit import audit_scene_resets
+            report["native_scene_reset_audit"] = audit_scene_resets(env, args.output / "scene_reset_audit.json")
         (args.output / "native.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
         env.close()
+        if args.capture_smoke_visual:
+            # A fresh interpreter selects EGL before MuJoCo imports its GL
+            # backend; rendering performs no FK, policy or integration calls.
+            import subprocess
+            import sys
+            subprocess.run([sys.executable,"-m","hoi.v1.native_snapshot_render",
+                "--manifest",str(args.output / "smoke_visual/compiled_model_manifest.json"),
+                "--output",str(args.output / "smoke_visual/render")],check=True,
+                env={**os.environ,"MUJOCO_GL":"glfw" if os.name == "nt" else "egl"})
 
 
 if __name__ == "__main__":

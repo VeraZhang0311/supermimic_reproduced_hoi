@@ -53,27 +53,76 @@ def load_saved(path, expected_sha256=None):
     names = list(meta["body_names"])
     if len(names) != 39 or len(set(names)) != 39 or T < 1:
         raise ValueError("renderer requires original 39 saved body names and nonempty controls")
-    values = {key: states[key].detach().cpu().numpy() for key in ("body_pos", "body_rot", "o", "reference_source630")}
+    # New curated sources do not have ULTRA's 630D cache. Their reference
+    # body poses were saved by evaluation; rendering must never reconstruct
+    # them from joint states, substitute actual poses, or synthesize a cache.
+    source630 = states.get("reference_source630")
+    reference_fields = ("reference_source630",) if source630 is not None else (
+        "reference_body_pos", "reference_body_rot", "reference_object")
+    required = ("body_pos", "body_rot", "o") + reference_fields
+    if any(not isinstance(states.get(key), torch.Tensor) for key in required):
+        raise ValueError("saved reference/body/object transforms are required; rendering cannot reconstruct missing reference poses")
+    values = {key: states[key].detach().cpu().numpy() for key in required}
     n = T + 1
-    if (values["body_pos"].shape != (n, 39, 3) or values["body_rot"].shape != (n, 39, 4) or
-            values["o"].shape != (n, 13) or values["reference_source630"].shape != (n, 630)):
+    shapes = {"body_pos": (n, 39, 3), "body_rot": (n, 39, 4), "o": (n, 13)}
+    shapes.update({"reference_source630": (n, 630)} if source630 is not None else {
+        "reference_body_pos": (n, 39, 3), "reference_body_rot": (n, 39, 4), "reference_object": (n, 13)})
+    if any(values[key].shape != shape for key, shape in shapes.items()):
         raise ValueError("saved display fields must retain all T+1 state/reference frames")
     timing = payload["time"].detach().cpu().numpy().astype(np.float64)
     if timing.shape != (n,) or not np.allclose(timing, np.arange(n) / FPS, rtol=0, atol=1e-10):
         raise ValueError("recorded control clock must be the unmodified complete 50 Hz grid")
     if any(not np.isfinite(value).all() for value in values.values()):
         raise ValueError("recorded transforms contain nonfinite values")
-    ref = values["reference_source630"]
+    if source630 is not None:
+        ref = values["reference_source630"]
+        reference_pos = ref[:, 84:201].reshape(n, 39, 3)
+        reference_quat = ref[:, 201:357].reshape(n, 39, 4)[..., [3, 0, 1, 2]]
+        reference_object_pos = ref[:, 71:74]
+        reference_object_quat = ref[:, 74:78][:, [3, 0, 1, 2]]
+        reference_display_source = "saved_ULTRA_source630_body_and_object_transforms"
+    else:
+        reference_pos = values["reference_body_pos"]
+        # Both saved body_rot fields use xyzw; object state uses wxyz.
+        reference_quat = values["reference_body_rot"][..., [3, 0, 1, 2]]
+        reference_object_pos = values["reference_object"][:, :3]
+        reference_object_quat = values["reference_object"][:, 3:7]
+        reference_display_source = "saved_reference_body_and_object_transforms"
     data = {"actual_pos": values["body_pos"], "actual_quat": values["body_rot"][..., [3, 0, 1, 2]],
-            "reference_pos": ref[:, 84:201].reshape(n, 39, 3),
-            "reference_quat": ref[:, 201:357].reshape(n, 39, 4)[..., [3, 0, 1, 2]],
+            "reference_pos": reference_pos, "reference_quat": reference_quat,
             "actual_object_pos": values["o"][:, :3], "actual_object_quat": values["o"][:, 3:7],
-            "reference_object_pos": ref[:, 71:74], "reference_object_quat": ref[:, 74:78][:, [3, 0, 1, 2]],
+            "reference_object_pos": reference_object_pos, "reference_object_quat": reference_object_quat,
+            "reference_display_source": reference_display_source,
             "time": timing, "names": names, "metadata": meta, "metrics": payload.get("metrics", {}),
             "rollout_sha256": digest, "source": str(path.resolve()), "control_steps": T}
     for key in ("actual_quat", "reference_quat", "actual_object_quat", "reference_object_quat"):
         if not np.allclose(np.linalg.norm(data[key], axis=-1), 1., atol=1e-3, rtol=0):
             raise ValueError(f"invalid saved quaternion: {key}")
+    support_meta=meta.get("scene_support_display")
+    if support_meta is not None:
+        from .scene_supports import SCENE_SUPPORT_SCHEMA, SUPPORT_IDS, omni_support_recipe, digest as support_digest
+        if support_meta.get("schema") != SCENE_SUPPORT_SCHEMA or support_meta.get("support_ids") != list(SUPPORT_IDS) or support_meta.get("geometry_recipe") != omni_support_recipe() or support_meta.get("geometry_recipe_sha256") != support_digest(omni_support_recipe()) or support_meta.get("quaternion") != "xyzw":
+            raise ValueError("saved scene-support display binding mismatch")
+        keys=("support_pose_xyzw","reference_support_pose_xyzw","support_present")
+        if not all(isinstance(states.get(key),torch.Tensor) for key in keys):
+            raise ValueError("saved scene supports cannot be reconstructed from reference frames")
+        actual,reference,present=[states[key].numpy() for key in keys]
+        if actual.shape != (n,2,7) or reference.shape != (n,2,7) or present.shape != (n,2) or not np.isfinite(actual).all() or not np.isfinite(reference).all():
+            raise ValueError("saved scene support frame/shape/finite mismatch")
+        if not np.all(present == present[0]) or not np.allclose(reference,reference[:1],atol=2e-5,rtol=0):
+            raise ValueError("saved support reference must remain held at the sampled reset phase")
+        for pose in (actual,reference):
+            if not np.allclose(np.linalg.norm(pose[...,3:],axis=-1),1.,atol=1e-3,rtol=0):
+                raise ValueError("invalid saved support quaternion")
+        selected=np.nonzero(present[0])[0]
+        data.update(support_ids=[SUPPORT_IDS[i] for i in selected],support_size_m=omni_support_recipe()["size_m"],
+            actual_support_pos=actual[:,selected,:3],actual_support_quat=actual[:,selected][:,:,[6,3,4,5]],
+            reference_support_pos=reference[:,selected,:3],reference_support_quat=reference[:,selected][:,:,[6,3,4,5]],
+            support_display_source="saved_native_and_reset_held_support_transforms")
+    else:
+        if any(key in states for key in ("support_pose_xyzw","reference_support_pose_xyzw","support_present")):
+            raise ValueError("saved support states require their geometry/timing metadata")
+        data["support_ids"]=[]
     return data
 
 
@@ -81,6 +130,15 @@ def fixed_camera_parameters(data):
     """One camera enclosing both complete trajectories, with no alignment."""
     positions = np.concatenate([data[key].reshape(-1, 3) for key in
                                 ("actual_pos", "reference_pos", "actual_object_pos", "reference_object_pos")])
+    for key in ("actual_support_pos","reference_support_pos"):
+        if key in data:
+            support=data[key].reshape(-1,3)
+            # Author-parked tables below the infinite floor are not visible;
+            # do not zoom the common camera down to a hidden parking location.
+            support=support[support[:,2]+float(data["support_size_m"][2])/2 >= 0]
+            if len(support):
+                half=np.asarray(data["support_size_m"])/2
+                positions=np.concatenate((positions,support-half,support+half))
     lo, hi = positions.min(0), positions.max(0)
     center = (lo + hi) / 2
     radius = np.linalg.norm((hi - lo) / 2) + .35
@@ -271,7 +329,7 @@ def robot_visual_assets(urdf, names, *, mesh_root=None, verify_hands=True):
                                  "real_hand_STL_verified": verify_hands and seen_hands == {"left", "right"}}
 
 
-def display_model(urdf, object_paths, names, *, width=1280, height=720, verify_hands=True, mesh_root=None):
+def display_model(urdf, object_paths, names, *, width=1280, height=720, verify_hands=True, mesh_root=None, support_ids=(), support_size_m=None):
     """Mocap-only display model with zero generalized coordinates."""
     import mujoco
     mesh_specs, visuals, robot_record = robot_visual_assets(urdf, names, mesh_root=mesh_root, verify_hands=verify_hands)
@@ -302,6 +360,16 @@ def display_model(urdf, object_paths, names, *, width=1280, height=720, verify_h
         for index in range(len(object_paths)):
             ET.SubElement(body, "geom", type="mesh", mesh=f"object_{index}", contype="0", conaffinity="0",
                           rgba=" ".join(map(str, REFERENCE_RGBA)) if prefix == "reference" else ".72 .36 .12 1")
+    if support_ids:
+        from .scene_supports import SUPPORT_IDS, omni_support_recipe
+        if any(sid not in SUPPORT_IDS for sid in support_ids) or list(support_size_m or []) != omni_support_recipe()["size_m"]:
+            raise ValueError("display support geometry must be the bound author cuboid")
+        for prefix in ("actual","reference"):
+            for sid in support_ids:
+                body=ET.SubElement(world,"body",name=prefix+"/support/"+sid,mocap="true")
+                colour=REFERENCE_RGBA if prefix=="reference" else ((.8,.15,.12,1.) if sid=="table1" else (.15,.65,.2,1.))
+                ET.SubElement(body,"geom",type="box",size=" ".join(str(float(v)/2) for v in support_size_m),
+                    contype="0",conaffinity="0",rgba=" ".join(map(str,colour)))
     model = mujoco.MjModel.from_xml_string(ET.tostring(root, encoding="unicode"))
     if model.nq != 0 or model.nv != 0:
         raise RuntimeError("offline display model unexpectedly contains simulated degrees of freedom")
@@ -311,6 +379,9 @@ def display_model(urdf, object_paths, names, *, width=1280, height=720, verify_h
     for prefix in ("actual", "reference"):
         maps[prefix] = np.array([model.body_mocapid[mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, prefix + "/" + n)] for n in names])
         maps[prefix + "_object"] = model.body_mocapid[mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, prefix + "/object")]
+    if support_ids:
+        for prefix in ("actual","reference"):
+            maps[prefix+"_support"]=np.array([model.body_mocapid[mujoco.mj_name2id(model,mujoco.mjtObj.mjOBJ_BODY,prefix+"/support/"+sid)] for sid in support_ids])
     return model, maps, robot_record
 
 
@@ -322,6 +393,10 @@ def apply_saved_frame(model, sim_data, maps, data, frame):
         sim_data.mocap_quat[maps[prefix]] = data[prefix + "_quat"][frame]
         sim_data.mocap_pos[maps[prefix + "_object"]] = data[prefix + "_object_pos"][frame]
         sim_data.mocap_quat[maps[prefix + "_object"]] = data[prefix + "_object_quat"][frame]
+    for prefix in ("actual","reference"):
+        if prefix+"_support" in maps:
+            sim_data.mocap_pos[maps[prefix+"_support"]]=data[prefix+"_support_pos"][frame]
+            sim_data.mocap_quat[maps[prefix+"_support"]]=data[prefix+"_support_quat"][frame]
     mujoco.mj_kinematics(model, sim_data)
 
 
@@ -359,7 +434,7 @@ def render_saved(rollout, urdf, asset, output, *, expected_sha256=None, explicit
     meshes, object_record = object_display(asset, output / "object_display", explicit_visual=explicit_visual,
                                             use_collision_geometry=use_collision_geometry)
     model, maps, robot_record = display_model(urdf, meshes, data["names"], width=width, height=height,
-                                            verify_hands=verify_hands, mesh_root=robot_mesh_root)
+                                            verify_hands=verify_hands, mesh_root=robot_mesh_root, support_ids=data.get("support_ids",()), support_size_m=data.get("support_size_m"))
     sim_data, camera = mujoco.MjData(model), mujoco.MjvCamera()
     parameters = fixed_camera_parameters(data)
     camera.lookat[:] = parameters["lookat"]
@@ -408,6 +483,8 @@ def render_saved(rollout, urdf, asset, output, *, expected_sha256=None, explicit
               "full_reference_completed": data["metrics"].get("full_reference_completed"),
               "video_display_duration_s": n / FPS, "video": target.name if not preview_only else None,
               "video_sha256": sha(target) if not preview_only else None, "previews": frames,
+              "reference_display_source": data["reference_display_source"],
+              "scene_supports": {"support_ids":data["support_ids"],"pose_source":data.get("support_display_source"),"size_m":data.get("support_size_m")},
               "reference_rgba": REFERENCE_RGBA, "actual_robot": "original URDF visual colours", "actual_object": "solid orange",
               "camera": parameters, "robot": robot_record, "object": object_record, "render_seconds": time.monotonic() - started,
               "render_method": "saved body/object world transforms; mocap visual bodies; mj_kinematics only",

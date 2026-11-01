@@ -16,6 +16,23 @@ class WindowSamplingTests(unittest.TestCase):
         replay.data["ep_step"][:] = torch.arange(length)[:, None]
         return replay
 
+    def test_native_region_counters_survive_replay_sampling(self):
+        from hoi.v1.contacts import CHANNELS
+        replay = ReplayBuffer(2, 2)
+        transition = {key: value[0].clone() for key, value in replay.data.items()}
+        # Construct from the native region contract independently of FIELDS.
+        counters = torch.arange(2 * len(CHANNELS), dtype=torch.int32).reshape(2, len(CHANNELS))
+        transition["contact_missing_counter"] = counters
+        transition["contact"] = torch.zeros(2, len(CHANNELS))
+        transition["contact_valid"] = torch.ones(2, len(CHANNELS), dtype=torch.bool)
+        transition["impulse"] = torch.zeros(2, len(CHANNELS))
+        replay.add(transition)
+        window = replay._windows_at(torch.tensor([0, 0]), torch.tensor([0, 1]), 1)
+        torch.testing.assert_close(window["contact_missing_counter"][:, 0], counters)
+        self.assertEqual(window["contact_missing_counter"].shape, (2, 1, 16))
+        with self.assertRaisesRegex(ValueError, "contact_missing_counter shape"):
+            replay.add({**transition, "contact_missing_counter": counters[:, :2]})
+
     def test_production_holdout_batch_fills_with_rare_32_step_windows(self):
         replay = self.continuous_buffer()
         # 19 of 969 possible start ages qualify; replacement is intentional.
