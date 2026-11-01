@@ -333,7 +333,7 @@ full_native_batch_02/plan.json覆盖273个train与106个protected_eval资产任�
 这些结果只覆盖首批8个分区/资产任务，不能据此宣布全379项通过或完成tracking评估。
 
 CPU作业1486786严格重验首批8项成功回执后生成剩余371项新调度；
-GPU数组1486788正在执行，93个槽位、每槽最多4项、最多4卡并发，每槽4CPU/32GiB、
+GPU数组1486788现已全部COMPLETED 0:0；共93个槽位、每槽最多4项、最多4卡并发，每槽4CPU/32GiB、
 2小时上限。每项仍保持8环境、64控制步、31个pair探针、CUDA输入、保存状态、
 渲染及terminal scene reset检查。成功任务不重复执行；最终仍须全量收集和实际图像QA。
 单片段对照确认一处carry双桌重叠来自原始发布坐标；soccer地下桌的presence不能当作
@@ -341,3 +341,14 @@ GPU数组1486788正在执行，93个槽位、每槽最多4项、最多4卡并发
 
 最新计划、提交、清理和QA回执保存在ignored data/curated_contact16_20261031/native_acceptance/，
 恢复入口为其中的operation_status.json与shutdown_recovery_20261031.json。未启动训练。
+
+2026-11-01全量机器验收结果：379/379个分区/资产任务成功、0失败；
+CPU汇总1486825与保存状态渲染1486831均COMPLETED 0:0。两个分区的全部11120个片段
+共33360个terminal reset采样点已纳入审计。选出46个实际视图，其中4个非env0视图
+完成零物理/零FK/零策略的补充渲染，原env0图保留原SHA。
+最终逐图复核尚未完成，不能把机器汇总成功等同于完整视觉覆盖通过。
+动态截图未覆盖两个分区的soccer/case2_kick_left和case3_kick_right；
+桌面mask在动态快照和terminal审计中均只出现00/11，未观察到01/10。
+QA工具的ULTRA类别预期8是实例/类别计数混用：实际8个资产ID全部存在，
+对应largebox、plasticbox、smallbox、suitcase四类，并非漏验四个资产。
+完整机器回执在ignored native_acceptance/full_native_final_machine_01中。未启动训练。
