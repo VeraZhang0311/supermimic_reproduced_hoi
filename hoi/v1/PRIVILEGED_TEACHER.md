@@ -567,3 +567,17 @@ closed ACK及exit code 0，不忽略强杀。若退出超过10秒，child输出�
 只调整退出阶段，未改物理、数据或模型计算。57项相关CPU检查通过，最终18项退出回归
 再次通过，其中真实spawn子进程ACK后等待3秒再exit 0，验证不再被旧2秒窗口误杀。
 真实GPU退出修复仍需独立预检通过，才能继续全量容量结论。
+
+source_06退出/隔离预检1488910已COMPLETED 0:0（6分23秒）：同一collector承载4资产×2env，
+12步及162次非激活状态比较全部通过，原物理配置不变。真实关闭日志确认closed ACK、
+exit code 0、无遗留PID、无错误；整个关闭过程11.1909秒。容量重测1488911依赖其afterok，
+已开始完整273资产4096环境测量，随后运行2048；输出full_capacity_{4096,2048}_03，
+汇总full_capacity_summary_03.json。申请3张A10/30CPU/96GiB仍只是测量资源，不是峰值结论。
+独立提交回执位于capacity_submission_03，未启动新的正式训练。
+
+与此同时，原5卡作业1488620的容量预检最终FAILED 1:0（21分23秒）：report.passed=false，
+optimizer_steps=0、formal_training_started=false，正式train_01目录未创建。仅完成全量
+reference/models与replay/Adam预留，随后在独立worker初始化结果的CPU tensor共享句柄
+接收处报RuntimeError: received 0 items of ancdata；不是完成真实采集/反传后的容量通过。
+该错误本身不能证明OOM，也未取得原父进程FD上限/占用证据来断言句柄耗尽。冻结source_02、
+失败报告与日志均保留，原作业未被取消或改写；它按原启动器约定在预检失败后退出。
