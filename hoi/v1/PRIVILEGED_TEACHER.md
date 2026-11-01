@@ -6,12 +6,14 @@
 `hoi/privileged_teacher`，不包含 v1.1/v1.2 感知路径。本次实现 actor 特权观测及
 collection / imagination / frozen evaluation / checkpoint 完整接线。2026-10-31 按用户授权扩展为 16 区域接触、统一 reference 驱动奖惩、普通 masked BCE。
 真实接触采集、reference loader、actor/critic、replay、评估和版本校验同步更新。
-终止、PD、动力学随机化、物理资产和固定训练日程保持原值。未启动训练。
+2026-11-01 按用户授权将倾斜终止改为 reference 相对重力夹角，并给物体位置容限加 2m 上限（下文详述）。
+PD、动力学随机化、物理资产和固定训练日程保持原值。未启动训练。
 
 配置：`configs/hoi_v1_privileged_teacher.json`，profile=`privileged_teacher_v3`。
 使用现有 `python -m hoi.v1.train --from-scratch --config ...` 入口，还必须提供
 已验证的 bundle、native evidence 和新的 output。完整新数据集bundle已完成，
-全资产GPU验收尚待完成，未提交训练作业。当前 default 配置仍为原 v1，所有数值训练日程不变。
+冻结 source10 的全资产 GPU 验收和视觉复核已完成；新终止规则的 CPU 回归另行记录，
+不把 source10 的物理结果当作修改后源码的 GPU 验收。未提交训练作业，所有数值训练日程不变。
 
 ## Actor 输入与 ULTRA 对照
 
@@ -376,3 +378,38 @@ native_acceptance/final_visual_review_01/。机器验收成功不等同于来源
 无策略调用）；蓝色机器人为原始URDF外观，橙色为作者绑定足球。视频不是native rollout。
 本地交付目录为HOI/privileged_teacher_kick_reference_videos，索引/脚本在ignored
 final_visual_review_01/reference_video；26个弃用预览文件已精确清理，6段视频SHA保持不变。
+
+
+2026-11-01用户已确认截图和参考动作视频目测通过，并决定数据清洗在此收尾。
+asset67保留来源薄片；上述历史“待用户复核”状态在此关闭。该接受范围为数据视觉检查，
+不等于训练策略tracking成功。用户确认回执保存在ignored final_visual_review_01/。
+
+## 扩展任务的终止条件（2026-11-01）
+
+用户授权后，HOI使用独立ReferenceGravityMDP，保留共享supermimic motion-only实现。
+令R为pelvis到世界的旋转，g=R[2,:]为体坐标中的世界竖直方向（两边同时取负即重力）。
+倾斜误差改为atan2(||g_actual × g_reference||, g_actual · g_reference)，世界yaw不影响它。
+倾斜硬终止阈值robot_tilt_limit_rad=acos(0.2)，约78.463°：保留旧规则在reference直立时
+|1-cos(theta)|>0.8的边界，但能识别reference与actual反方向倾斜。跟随reference的坐下、
+倚靠不因绝对姿态低/斜而失败。高度仍为相对reference的pelvis高度误差>0.25m。
+
+物体位置失败阈值为clamp(2 × 资产包围盒对角线, 1m, 2m)，距离仍是实际物体位置相对
+reference物体位置的欧氏误差。CPU作业1488521（COMPLETED 0:0）逐一核对完整计划和
+303个实际geometry cache的SHA后读取尺度：对角线中位数0.971675m，最大1.952116m；
+旧位置容限最大3.904233m。2m上限保留163个资产原阈值、收紧140个；若用1.5m上限则
+会影响250个。选择2m是基于现有尺度分布的宽松工程界限，尚无训练结果证明最优。
+完整逐资产审计保存在ignored native_acceptance/termination_review_01/。
+
+真实采集reset和failure_reason位共享termination_components；冻结评估使用相同human
+判据。imagined rollout的soft termination也使用同一角度/位置阈值，sigmoid温度分别为
+倾斜0.04弧度、高度0.02m、物体0.10m；倾斜温度的单位已由旧标量差变为弧度。
+角度用cross/dot的atan2避免acos在完全对齐处的无穷梯度；半精度输入先升为float32。
+片段结束/500控制步timeout、接触仅作诊断的终止约定不变，无任务类别专属分支。
+
+新增8项回归覆盖坐下/倚靠与yaw不变性、反向倾斜、硬/软阈值一致性、大小资产的下限/
+中间值/上限、对齐及反向旋转的有限梯度、批维/低精度、非法参数，以及实际collector step
+的reset和reason bits。collector测试用张量替身隔离物理，是CPU控制流证据；本次没有重跑
+GPU原生物理，也没有修改冻结source10、原资产、数据或划分。未启动训练。
+
+本次完整CPU回归453项：451通过、2项因可选pxr/Windows symlink权限跳过；历史HOI边界6项全部通过。
+定向20项也全部通过；日志与验证范围保存在ignored termination_review_01。提交前队列为空。

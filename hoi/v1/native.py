@@ -1277,14 +1277,11 @@ class HOITrackingSim:
         clip_end = self.motion.clip_end[self.motion.clip_id[f]]
         f1 = torch.minimum(f + 1, clip_end)
         reward, terms = self.mdp.reward(S1, O1, f1, action, a_prev, pair["contact"], pair["contact_valid"], terms=True)
-        term = self.mdp.termination(S1, O1, f1)
+        height_fail, tilt_fail, object_fail = self.mdp.termination_components(S1, O1, f1)
+        term = height_fail | tilt_fail | object_fail
         timeout = (f + 1 >= clip_end) | (ep_step + 1 >= e.max_episode_steps)
         done = term | timeout
-        # Diagnostic-only reason bits; no additional termination is introduced.
-        human = self.mdp.human
-        height_fail = (self.motion.root_p[f1, 2] - S1[0][:, 2]).abs() > human.cfg.term_height
-        tilt_fail = (self.motion.root_R[f1, 2, 2] - S1[1][:, 2, 2]).abs() > human.cfg.term_tilt
-        object_fail = torch.linalg.vector_norm(O1[0] - self.motion.object_p[f1], dim=-1) > self.mdp.object_failure_threshold(f1)
+        # The reset and diagnostic bits use the exact same reference-relative predicates.
         failure_reason = (height_fail.int() | (tilt_fail.int() << 1) | (object_fail.int() << 2) |
                           ((f + 1 >= clip_end).int() << 3) | ((ep_step + 1 >= e.max_episode_steps).int() << 4))
         expected, valid = self.motion.expected(f1)

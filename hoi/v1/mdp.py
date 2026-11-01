@@ -1,14 +1,16 @@
-"""Additive HOI heads; the original human MDP is called without changing it."""
+"""Additive HOI heads and reference-relative termination; shared rewards unchanged."""
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 
 import torch
 
-from supermimic.mdp import MDP, RewardCfg
+from supermimic.mdp import RewardCfg
 from supermimic.motion import CONTROL_DT
 from supermimic.rotations import mat_to_6d, rot_angle_sq, yaw_mat
 from .contacts import CHANNELS
+from .termination import ReferenceGravityMDP
 
 MAX_STEP_REWARD = .15
 HUMAN_MAX_STEP_REWARD = .1
@@ -30,7 +32,10 @@ class HOIRewardCfg:
     w_angular_velocity: float = .25
     w_approach: float = .25
     w_contact: float = .25
+    # Preserve the old upright-reference boundary: 1 - cos(theta) = .8.
+    robot_tilt_limit_rad: float = math.acos(.2)
     object_term_min_m: float = 1.0
+    object_term_max_m: float = 2.0
     object_term_bbox_multiplier: float = 2.0
     object_soft_temperature: float = .10
 
@@ -55,7 +60,13 @@ class HOIMDP:
         # Anchor the unchanged main configuration at the exact historical v1
         # constant, while deriving ablation sampler ceilings from active heads.
         self.max_step_reward = MAX_STEP_REWARD + CONTROL_DT * (weight_sum - 2.5)
-        self.human = MDP(kin, motion, default_q, human_cfg if human_cfg is not None else RewardCfg())
+        if (not all(math.isfinite(v) for v in (self.cfg.object_term_min_m, self.cfg.object_term_max_m,
+                                               self.cfg.object_term_bbox_multiplier, self.cfg.object_soft_temperature))
+                or not 0 < self.cfg.object_term_min_m <= self.cfg.object_term_max_m
+                or self.cfg.object_term_bbox_multiplier <= 0 or self.cfg.object_soft_temperature <= 0):
+            raise ValueError("invalid HOI object termination bounds/temperature")
+        self.human = ReferenceGravityMDP(kin, motion, default_q,
+            human_cfg if human_cfg is not None else RewardCfg(), tilt_limit_rad=self.cfg.robot_tilt_limit_rad)
         self.default_q = default_q
 
     def obs(self, S, a_prev, xi, f):
@@ -147,11 +158,18 @@ class HOIMDP:
                         "palm_penetration_m": (-distance).clamp_min(0).amax(dim=(-1, -2))}
 
     def object_failure_threshold(self, f):
-        return (self.shapes.bbox_diagonal(self.motion.asset_ids[f]) * self.cfg.object_term_bbox_multiplier).clamp_min(self.cfg.object_term_min_m)
+        return (self.shapes.bbox_diagonal(self.motion.asset_ids[f]) * self.cfg.object_term_bbox_multiplier).clamp(
+            min=self.cfg.object_term_min_m, max=self.cfg.object_term_max_m)
+
+    def termination_components(self, S, O, f):
+        """One predicate source for collector reset and recorded failure bits."""
+        height, tilt = self.human.termination_components(S, f)
+        distance = torch.linalg.vector_norm(O[0] - self.motion.object_p[f], dim=-1)
+        return height, tilt, distance > self.object_failure_threshold(f)
 
     def termination(self, S, O, f):
-        distance = torch.linalg.vector_norm(O[0] - self.motion.object_p[f], dim=-1)
-        return self.human.termination(S, f) | (distance > self.object_failure_threshold(f))
+        height, tilt, obj = self.termination_components(S, O, f)
+        return height | tilt | obj
 
     def soft_termination(self, S, O, f, tz=.02, tt=.04):
         robot_fail = self.human.soft_termination(S, f, tz, tt)
