@@ -50,6 +50,24 @@ class TrackingEnvironment(unittest.TestCase):
 
 
 class TrackingTest(TrackingEnvironment):
+    def test_actor_profile_exports_teacher_identity_and_rejects_arbitrary_strings(self):
+        from hoi.v1.privileged import BASE_PROFILE, TEACHER_PROFILE
+        plan, rows, evaluation = inputs()
+        field = "training/actor_observation_profile"
+        for profile in (BASE_PROFILE, TEACHER_PROFILE):
+            with self.subTest(profile=profile):
+                plan["config"]["actor_observation_profile"] = profile
+                payload = build_payload(plan, rows, evaluation)
+                self.assertEqual(payload["config"][field], profile)
+                self.assertNotIn(SECRET, json.dumps(payload))
+        plan["config"]["actor_observation_profile"] = SECRET
+        payload = build_payload(plan, rows, evaluation)
+        self.assertNotIn(field, payload["config"])
+        payload["config"][field] = SECRET
+        with patch.dict("sys.modules", {"wandb": None}):
+            with self.assertRaisesRegex(ValueError, "whitelist"):
+                send_online(payload, ".")
+
     def test_region_counts_events_and_impulses_include_expected_feet(self):
         plan, rows, evaluation = inputs()
         for value in (plan, rows[0], evaluation):

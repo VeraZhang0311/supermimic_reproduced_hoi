@@ -116,6 +116,7 @@ def source_identity():
         selected.extend((root / folder).rglob("*.py"))
     selected.extend((root / "configs").glob("hoi_v1*.json"))
     selected.extend((root / "cluster").glob("hoi_v1*.sh"))
+    selected.extend((root / "cluster").glob("hoi_teacher*.sh"))
     files = {path.relative_to(root).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
              for path in sorted(selected)}
     return {"files": files, "content_sha256": json_identity(files)}

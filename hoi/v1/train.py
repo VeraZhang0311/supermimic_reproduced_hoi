@@ -194,6 +194,8 @@ def main(argv=None):
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--native-evidence", type=Path)
     parser.add_argument("--device", default="cuda:0")
+    from .workers import add_collector_arguments, collector_device_list, startup_concurrency
+    add_collector_arguments(parser)
     parser.add_argument("--robot-mjcf")
     parser.add_argument("--max-processes", type=int)
     parser.add_argument("--eval-bundle", type=Path, help="complete protected_eval (curated) or canonical HOI80 bundle for every 5000-iteration frozen evaluation")
@@ -211,6 +213,8 @@ def main(argv=None):
     from supermimic.physics import add_physics_arguments, resolve_arguments
     add_physics_arguments(parser)
     args, launcher = parser.parse_known_args(argv)
+    collector_devices = collector_device_list(args.device, args.collector_devices)
+    startup_concurrency(args.worker_startup_concurrency, 1)
     config, deviations = read_config(args.config)
     checkpoint, checkpoint_sha = read_checkpoint(args.resume) if args.resume else (None, None)
     if checkpoint is not None:
@@ -276,6 +280,7 @@ def main(argv=None):
                          for shape, dtype in FIELDS.values())
     plan["resource_proposal"] = {"required_static_groups": len(required_assets), "num_envs": config.num_envs,
                                  "replay_bytes": per_transition * config.buffer_steps * config.num_envs,
+                                 "collector_devices": collector_devices, "worker_startup_concurrency": args.worker_startup_concurrency,
                                  "full_gpu_memory_and_throughput_validated": False,
                                  "cache_and_source_bytes_rechecked_on_load_bundle": True}
     write_json(output / "plan.json", plan)
@@ -345,7 +350,8 @@ def main(argv=None):
                           "sha256": checkpoint_sha, "origin": checkpoint["initialization"]}
     write_json(output / "initialization.json", initialization)
     specs = allocate_workers(bundle, motion, config.num_envs)
-    resources = resource_preflight(specs, device=args.device, max_processes=args.max_processes)
+    resources = resource_preflight(specs, device=args.device, max_processes=args.max_processes,
+                                   collector_devices=args.collector_devices, worker_startup_concurrency=args.worker_startup_concurrency)
     resources["replay_bytes"] = sum(t.numel() * t.element_size() for t in replay.data.values())
     write_json(output / "resources.json", resources)
     worker_config = {"bundle": str(args.bundle.resolve()), "output": str(output / "workers"), "physics": physics,
@@ -353,7 +359,8 @@ def main(argv=None):
                      "robot_mjcf": args.robot_mjcf,
                      "seed": config.seed,
                      "device": args.device, "gamma": config.gamma, "launcher_args": launcher,
-                     "max_processes": args.max_processes}
+                     "max_processes": args.max_processes, "collector_devices": args.collector_devices,
+                     "worker_startup_concurrency": args.worker_startup_concurrency}
     evaluation_callback = None
     if args.eval_bundle:
         import os

@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 import json
 import multiprocessing as mp
+import re
 from pathlib import Path
 import time
 import traceback
@@ -62,17 +63,88 @@ def allocate_workers(bundle, motion, num_envs=4096):
     return specs
 
 
-def resource_preflight(specs, *, device, max_processes=None):
+def collector_device_list(device, collector_devices=None):
+    """Explicit indices refer to the job's existing CUDA_VISIBLE_DEVICES order."""
+    if collector_devices is None:
+        return [str(device)]
+    if not isinstance(collector_devices, (list, tuple)) or not collector_devices:
+        raise ValueError("collector devices must be a nonempty CUDA device list")
+    result = []
+    for value in collector_devices:
+        if not isinstance(value, str) or not re.fullmatch(r"cuda:[0-9]+", value):
+            raise ValueError("collector devices require explicit cuda:N indices")
+        result.append("cuda:" + str(int(value.split(":")[1])))
+    if len(set(result)) != len(result):
+        raise ValueError("collector devices must be unique")
+    return result
+
+
+def assign_worker_devices(specs, *, device, collector_devices=None):
+    """Assign whole workers round-robin without changing spec/order/quotas."""
+    devices = collector_device_list(device, collector_devices)
+    if len({s.asset_id for s in specs}) != len(specs):
+        raise ValueError("fixed workers must have unique asset IDs")
+    return [devices[index % len(devices)] for index in range(len(specs))]
+
+
+def startup_concurrency(value, count):
+    if value is None:
+        return count
+    if type(value) is not int or value < 1:
+        raise ValueError("worker startup concurrency must be a positive integer")
+    return min(value, count)
+
+
+def isolate_worker_cuda(device, *, environ=None, cuda=None):
+    """Mask to one assigned GPU before any CUDA/Warp/IsaacLab initialization.
+
+    The configured index is local to the parent job. Preserve its Slurm UUID,
+    MIG UUID, or numeric visibility token; the isolated child uses cuda:0.
+    """
+    import os
+    environ = os.environ if environ is None else environ
+    cuda = torch.cuda if cuda is None else cuda
+    if not re.fullmatch(r"cuda:[0-9]+", str(device)):
+        raise ValueError("native collector requires an explicit cuda:N device")
+    if cuda.is_initialized():
+        raise RuntimeError("worker GPU isolation must precede CUDA initialization")
+    index = int(str(device).split(":")[1])
+    visible = environ.get("CUDA_VISIBLE_DEVICES")
+    if visible is None:
+        token = str(index)
+    else:
+        tokens = [token.strip() for token in visible.split(",")]
+        if not all(tokens) or index >= len(tokens) or tokens[index] == "-1":
+            raise ValueError("collector device is outside inherited CUDA_VISIBLE_DEVICES")
+        token = tokens[index]
+    environ["CUDA_VISIBLE_DEVICES"] = token
+    cuda.set_device(0)
+    return "cuda:0", token
+
+
+def add_collector_arguments(parser):
+    parser.add_argument("--collector-devices", nargs="+", help="Job-local cuda:N GPUs for whole asset workers; default is --device")
+    parser.add_argument("--worker-startup-concurrency", type=int, help="Maximum workers initializing together; ready workers stay running")
+
+
+def resource_preflight(specs, *, device, max_processes=None, collector_devices=None, worker_startup_concurrency=None):
     if not specs or any(s.num_envs < 1 for s in specs):
         raise ValueError("each fixed geometry worker requires at least one environment")
     if max_processes is not None and len(specs) > max_processes:
         raise ValueError(f"{len(specs)} required fixed-geometry processes exceed explicit process capacity {max_processes}; "
                          "use a separately declared resource experiment; no groups were omitted")
+    devices = assign_worker_devices(specs, device=device, collector_devices=collector_devices)
+    initializing = startup_concurrency(worker_startup_concurrency, len(specs))
     result = {"groups": len(specs), "num_envs": sum(s.num_envs for s in specs),
               "workers": [asdict(s) for s in specs], "process_model": "spawn; one SimulationContext per process",
               "transport": "CPU tensor IPC; central learner owns actor inference", "device": str(device),
               "gpu_memory_budget_validated": False,
-              "native_throughput_validated": False}
+              "native_throughput_validated": False,
+              "collector_devices": collector_device_list(device, collector_devices),
+              "worker_device_assignment": [{"asset_id": spec.asset_id, "num_envs": spec.num_envs, "device": assigned}
+                                           for spec, assigned in zip(specs, devices)],
+              "worker_startup_concurrency": initializing,
+              "worker_device_isolation": "one inherited visibility token per child; local cuda:0"}
     if str(device).startswith("cuda"):
         free, total = torch.cuda.mem_get_info(device)
         result.update(gpu_free_bytes=free, gpu_total_bytes=total)
@@ -110,7 +182,10 @@ def _worker_main(connection, spec, config):
     env = None
     try:
         import argparse
+        import gc
         import os
+        assigned_device = config.get("device", "cuda:0")
+        device, visible_token = isolate_worker_cuda(assigned_device)
         from supermimic.physics import PhysicsSettings
         PhysicsSettings(**config["physics"]).export()
         worker_seed = int(config.get("seed", 0)) + 100003 * spec.asset_id
@@ -127,10 +202,10 @@ def _worker_main(connection, spec, config):
         from .native import HOITrackingSim, make_hoi_sim
         import warp as wp
         wp.init()
+        wp.set_device(device)
         parser = argparse.ArgumentParser()
         add_launcher_args(parser)
         args = parser.parse_args(config.get("launcher_args", []))
-        device = config.get("device", "cuda:0")
         kin = G1Kinematics(device, mjcf_path=config.get("robot_mjcf"))
         bank, shapes, bundle = load_bundle(config["bundle"], kin, device=device, require_train=config.get("require_train", True),
                                           asset_filter=[spec.asset_id])
@@ -144,10 +219,17 @@ def _worker_main(connection, spec, config):
             env = HOITrackingSim(cfg, spec.num_envs, bank, mdp, asset, output, gamma=config.get("gamma", .99),
                                  eval_mode=config.get("eval_mode", False), reset_noise=config.get("reset_noise", True),
                                  robot_asset=bundle["native_robot_asset"])
+            # Bundle validation has completed. env retains its native robot binding,
+            # shapes retains the asset registry, and bank retains selected motion.
+            # Do not keep the full partition header alive for every worker tick.
+            del bundle
             recipe, compiled = env.export_compiled_geometry(output / "compiled_geometry")
             env.verify_compiled_geometry(compiled, compiled_hands=recipe["hands"])
+            del recipe, compiled
+            gc.collect()
             initial = {"physics": env.physics_report, "contact": env.contacts.manifest(), "spec": asdict(spec),
-                       "seed": worker_seed, "startup_timeout_seconds": config.get("startup_timeout", 1800),
+                       "seed": worker_seed, "assigned_device": assigned_device, "local_device": device,
+                       "cuda_visible_device_token": visible_token, "startup_timeout_seconds": config.get("startup_timeout", 1800),
                        "variant": config.get("variant", "hoi_v1")}
             (output / "native.json").write_text(json.dumps(initial, indent=2) + "\n", encoding="utf-8")
             connection.send(("ready", _cpu(_snapshot(env)), initial))
@@ -202,21 +284,30 @@ class WorkerGroup:
         self._processes, self._pipes = [], []
         context = mp.get_context("spawn")
         self._snapshots, self.native_reports = [], []
-        resource_preflight(self.specs, device=device, max_processes=config.get("max_processes"))
+        resource_preflight(self.specs, device=device, max_processes=config.get("max_processes"),
+                           collector_devices=config.get("collector_devices"),
+                           worker_startup_concurrency=config.get("worker_startup_concurrency"))
+        self.worker_devices = assign_worker_devices(self.specs, device=config.get("device", device),
+                                                    collector_devices=config.get("collector_devices"))
+        limit = startup_concurrency(config.get("worker_startup_concurrency"), len(self.specs))
         try:
-            for spec in self.specs:
-                parent, child = context.Pipe()
-                process = context.Process(target=_worker_main, args=(child, spec, config), name=f"hoi-asset-{spec.asset_id}")
-                process.start()
-                child.close()
-                self._pipes.append(parent)
-                self._processes.append(process)
-            for i in range(len(self.specs)):
-                message = self._receive(i, timeout=self.startup_timeout)
-                if message[0] != "ready":
-                    raise RuntimeError("worker did not publish its initialized joint reset")
-                self._snapshots.append(message[1])
-                self.native_reports.append(message[2])
+            for first in range(0, len(self.specs), limit):
+                end = min(first + limit, len(self.specs))
+                for i in range(first, end):
+                    spec = self.specs[i]
+                    parent, child = context.Pipe()
+                    child_config = {**config, "device": self.worker_devices[i]}
+                    process = context.Process(target=_worker_main, args=(child, spec, child_config), name=f"hoi-asset-{spec.asset_id}")
+                    process.start()
+                    child.close()
+                    self._pipes.append(parent)
+                    self._processes.append(process)
+                for i in range(first, end):
+                    message = self._receive(i, timeout=self.startup_timeout)
+                    if message[0] != "ready":
+                        raise RuntimeError("worker did not publish its initialized joint reset")
+                    self._snapshots.append(message[1])
+                    self.native_reports.append(message[2])
         except BaseException:
             self.close(force=True)
             raise

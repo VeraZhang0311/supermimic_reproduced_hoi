@@ -413,3 +413,40 @@ GPU原生物理，也没有修改冻结source10、原资产、数据或划分。
 
 本次完整CPU回归453项：451通过、2项因可选pxr/Windows symlink权限跳过；历史HOI边界6项全部通过。
 定向20项也全部通过；日志与验证范围保存在ignored termination_review_01。提交前队列为空。
+
+
+## superteacher 启动与资源部署（2026-11-01）
+
+用户已授权开始完整privileged teacher训练，W&B新项目为superteacher，entity沿用
+tianzizh-university-of-pennsylvania；API已创建并读回PRIVATE权限。使用新run UUID，
+不续接旧实验；仅上传既有白名单配置和指标。白名单现包括显式actor_observation_profile。
+
+启动检查发现train的273个静态资产原来各占一个常驻仿真进程、全部落在同一GPU。
+379项逐资产原生验收没有验证273进程并发。独立三worker容量作业1488549成功结束，
+source_01保持真实资产和正式每资产环境配额：asset266/2env约380MiB、asset31/4env约
+384MiB、asset209/375env约2688MiB GPU内存，均完成12个真实控制步、0优化更新。
+这是三个样本，不构成完整训练容量验收；不能外推为已通过全部273组。
+
+为保留完整数据和4096总环境，新增显式--collector-devices cuda:N列表，与中央learner
+的--device分开。每个完整WorkerSpec按原顺序轮转到collector卡；资产、环境配额、seed、
+IPC拼接次序及同步控制步不变。child在CUDA/Warp初始化前隔离到所分配的Slurm可见卡，
+记录实际visibility token，内部使用cuda:0。可选--worker-startup-concurrency只节流初始化，
+不会轮换/删除已ready的资产。初始化后释放不再使用的完整bundle/导出临时对象并做一次GC，
+不修改数据验证、几何、物理或任何训练数值。
+
+resource_probe现接正式teacher config和--from-scratch，配置同样的39-body oracle；
+旧init-checkpoint入口保留。critic target使用与训练一致的分块前向，全行及顺序保留。
+资源检查从真实Replay.sample_starts候选中分层保留每资产至少1行，再填满4096，以免小配额
+资产在一次随机抽样中缺席造成假失败；每行history/horizon仍验证，最多32轮，缺数据就失败。
+这只用于资源覆盖检查，正式Learner/Replay的采样不变；报告明确production_sampling_changed=false。
+
+专用cluster/hoi_teacher_train.sbatch.sh要求全新PROBE_DIR/RUN_DIR和冻结source SHA，
+先运行完整273组、正式batch/H32/replay的资源与反传检查（0优化更新），身份/配置/资产覆盖
+全部一致且passed后才调用正式train --from-scratch。GPU数、队列、CPU/RAM和时限由本次
+独立提交显式指定，不能以减少数据或batch绕过容量检查。该资源检查不是WM学习质量门。
+评估使用独立hoi_teacher_evaluate.sbatch.sh，完整1545条protected_eval，保留5000轮调度，
+单GPU逐资产、OMP/MKL=3与既有allocator合同。两个launcher也纳入source_identity。
+500轮WM-only、20000总轮次及其余科学配置不变；实际提交/运行状态保存在ignored启动回执，
+资源预检运行不能表述为正式训练已经开始。
+
+启动部署实现的完整CPU回归472项：470通过、2项环境限制跳过；历史HOI边界6项通过。

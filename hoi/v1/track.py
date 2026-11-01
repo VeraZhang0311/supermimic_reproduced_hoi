@@ -21,6 +21,7 @@ import uuid
 from .config import TrainConfig, fresh_directory, write_json
 from .contacts import CHANNELS, LABEL_SCHEMA
 from .variants import VARIANTS
+from .privileged import BASE_PROFILE, TEACHER_PROFILE
 
 ENTITY = "tianzizh-university-of-pennsylvania"
 PROJECT = "SuperMimic_Upstream_Reproduction"
@@ -122,6 +123,8 @@ def _configuration(plan, evaluation):
             out["training/experiment_kind"] = value
         elif key == "variant" and value in VARIANTS:
             out["training/variant"] = value
+        elif key == "actor_observation_profile" and value in (BASE_PROFILE, TEACHER_PROFILE):
+            out["training/actor_observation_profile"] = value
     quality_gate = _nested(plan, "policy_update_schedule", "wm_quality_gate_enabled")
     if type(quality_gate) is bool:
         out["training/wm_quality_gate_enabled"] = quality_gate
@@ -252,6 +255,7 @@ def _validate_payload(payload):
     enum_fields = {"method": ("HOI_v1_full_reference",), "tracking_schema": ("hoi_v1_curated_tracking_1",),
                    "training/amp": ("none", "bf16"), "training/experiment_kind": ("formal", "smoke"),
                    "training/variant": VARIANTS, "evaluation/variant": VARIANTS,
+                   "training/actor_observation_profile": (BASE_PROFILE, TEACHER_PROFILE),
                    "contact/label_schema": (LABEL_SCHEMA,), "contact/channel_count": (len(CHANNELS),),
                    "evaluation/partition": ("train", "protected_eval", "eval80", "test40", "validation", "regression", "test")}
     numeric_fields = {"training/" + key for key, value in TrainConfig().to_dict().items() if type(value) in (int, float, bool)}

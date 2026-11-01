@@ -6,7 +6,7 @@ policy gate is bypassed, and subset inputs are explicitly resource fixtures.
 from __future__ import annotations
 
 import argparse
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 import json
 import os
 from pathlib import Path
@@ -36,6 +36,47 @@ class ProbeConfig:
         if type(self.collect_steps) is not int or self.collect_steps < 10:
             raise ValueError("collect at least ten real ticks for episode history")
         return self
+
+
+def read_probe_config(path=None, *, seed=None):
+    """Use the formal loader, preserving the existing full-size resource profile."""
+    from .train import read_config
+    config, changed = read_config(path)
+    if changed:
+        raise ValueError("resource probe preserves production numerical settings: " + str(sorted(changed)))
+    if config.variant != "hoi_v1":
+        raise ValueError("production resource probe measures the full hoi_v1 variant")
+    if seed is not None:
+        config = replace(config, seed=seed).validate()
+    return config
+
+
+def build_probe_models(config, mdp, bundle, device):
+    """Mirror train.main's feature configuration before constructing the actor."""
+    from .networks import Policy, WorldModel, Critic
+    from .privileged import TEACHER_PROFILE, configure_teacher
+    from .variants import geometry_input_enabled
+    if config.actor_observation_profile == TEACHER_PROFILE:
+        configure_teacher(mdp, bundle, device)
+    return [model(geometry_input_enabled=geometry_input_enabled(config.variant),
+                  **({"actor_observation_profile": config.actor_observation_profile} if model is Policy else {})).to(device)
+            for model in (Policy, WorldModel, Critic)]
+
+
+def initialize_probe_models(models, *, from_scratch=False, init_checkpoint=None, physics,
+                            legacy_physics=None, allow_physics_change=False):
+    """Fresh initialization never reads or migrates a checkpoint."""
+    if bool(from_scratch) == (init_checkpoint is not None):
+        raise ValueError("choose exactly one of --from-scratch or --init-checkpoint")
+    if from_scratch:
+        return {"mode": "explicit_from_scratch"}
+    from .train import read_checkpoint
+    from .checkpoint import migrate_legacy
+    old, digest = read_checkpoint(init_checkpoint)
+    initialization = migrate_legacy(old, *models, physics=physics, legacy_physics=legacy_physics,
+                                    allow_physics_change=allow_physics_change)
+    initialization.update(path=str(Path(init_checkpoint).resolve()), sha256=digest)
+    return initialization
 
 
 def initialize_cuda_memory_counters(device, *, cuda=None):
@@ -82,6 +123,58 @@ def validate_real_start_mix(start, history, motion, *, expected_assets, batch_si
             "reference_only_states": False, "all_static_groups_present": True}
 
 
+def stratified_real_starts(replay, batch_size, motion, *, expected_assets, horizon, max_attempts=32):
+    """Resource coverage only: retain real aligned rows, at least one per asset.
+
+    Every candidate comes from the unchanged production Replay.sample_starts.
+    The first candidate batch supplies the remaining rows. No reference-only
+    states or synthetic histories are introduced, and the final batch stays B.
+    """
+    expected = list(expected_assets)
+    if (type(batch_size) is not int or batch_size < 1 or type(max_attempts) is not int or max_attempts < 1
+            or not expected or len(set(expected)) != len(expected) or batch_size < len(expected)):
+        raise ValueError("resource start coverage requires unique assets, sufficient batch size and bounded positive attempts")
+    expected_set = set(expected)
+    remaining = set(expected)
+    starts, histories = [], []
+    baseline_start = baseline_history = None
+    candidates = 0
+    for attempt in range(max_attempts):
+        start, history = replay.sample_starts(batch_size, 10, horizon=horizon, motion=motion)
+        observed = set(start["asset_id"].detach().cpu().tolist())
+        if not observed.issubset(expected_set):
+            raise ValueError("resource replay candidate contains unexpected assets")
+        validate_real_start_mix(start, history, motion, expected_assets=observed,
+                                batch_size=batch_size, horizon=horizon)
+        candidates += batch_size
+        if baseline_start is None:
+            baseline_start, baseline_history = start, history
+        selected = []
+        for asset in expected:
+            if asset in remaining and asset in observed:
+                selected.append((start["asset_id"] == asset).nonzero().flatten()[0])
+                remaining.remove(asset)
+        if selected:
+            ids = torch.stack(selected)
+            starts.append({key: value[ids] for key, value in start.items()})
+            histories.append({key: value[ids] for key, value in history.items()})
+        if not remaining:
+            fill = batch_size - len(expected)
+            combine = lambda parts, baseline: {key: torch.cat([piece[key] for piece in parts] + [baseline[key][:fill]])
+                                               for key in baseline}
+            selected_start = combine(starts, baseline_start)
+            selected_history = combine(histories, baseline_history)
+            validate_real_start_mix(selected_start, selected_history, motion, expected_assets=expected,
+                                    batch_size=batch_size, horizon=horizon)
+            return selected_start, selected_history, {
+                "sampling": "resource_only_stratified_real_replay_starts_with_replacement",
+                "production_sampling_changed": False, "minimum_rows_per_asset": 1,
+                "final_batch_size": batch_size, "candidate_real_starts": candidates,
+                "selection_attempts": attempt + 1, "max_selection_attempts": max_attempts}
+    raise ValueError(f"insufficient real replay asset coverage after {max_attempts} bounded attempts; "
+                     f"missing asset IDs: {sorted(remaining)}; no synthetic starts were used")
+
+
 def full_active_wm_windows(replay, batch_size, window, *, max_attempts=32):
     """Select real, complete fit windows so resets cannot understate WM memory."""
     pieces, remaining, candidates = [], batch_size, 0
@@ -102,11 +195,18 @@ def full_active_wm_windows(replay, batch_size, window, *, max_attempts=32):
     raise ValueError("insufficient complete real WM windows; cannot claim the full-batch memory graph")
 
 
+def critic_target_values(critic, arguments, *, horizon, batch, critic_minibatches):
+    """Same complete, ordered target evaluation as Learner.critic_update."""
+    target_batch = (horizon * batch + critic_minibatches - 1) // critic_minibatches
+    return torch.cat([critic(*(feature[offset:offset + target_batch] for feature in arguments))
+                      for offset in range(0, (horizon + 1) * batch, target_batch)]).reshape(horizon + 1, batch)
+
+
 def summarize_gpu_samples(samples, process_ids, parent_pid):
-    """Filter physical UUIDs using the actual CUDA-owning parent process."""
+    """Include every owned collector GPU, excluding unrelated devices/jobs."""
     owned = set(map(str, process_ids))
     assigned = {row[2] for sample in samples for row in sample.get("processes", [])
-                if len(row) == 3 and row[0] == str(parent_pid)}
+                if len(row) == 3 and row[0] in owned}
     filtered, peaks, external_peaks = [], {}, {}
     for sample in samples:
         processes = [row for row in sample.get("processes", []) if len(row) == 3 and row[2] in assigned]
@@ -124,7 +224,8 @@ def summarize_gpu_samples(samples, process_ids, parent_pid):
             for uuid, value in target.items():
                 result[uuid] = max(result.get(uuid, 0), value)
         filtered.append(item)
-    return {"assigned_device_uuids": sorted(assigned), "assigned_device_uuid_verified": len(assigned) == 1,
+    return {"assigned_device_uuids": sorted(assigned), "assigned_device_uuid_verified": bool(assigned) and any(
+                row[0] == str(parent_pid) for sample in samples for row in sample.get("processes", []) if len(row) == 3),
             "samples": filtered, "owned_process_sampled_peak_MiB_by_gpu_uuid": peaks,
             "external_process_sampled_peak_MiB_by_gpu_uuid": external_peaks,
             "has_other_job_processes_on_assigned_device": bool(external_peaks)}
@@ -164,13 +265,18 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bundle", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--init-checkpoint", type=Path, required=True)
+    parser.add_argument("--config", type=Path, help="Same JSON training configuration as hoi.v1.train")
+    initialization = parser.add_mutually_exclusive_group(required=True)
+    initialization.add_argument("--init-checkpoint", type=Path)
+    initialization.add_argument("--from-scratch", action="store_true")
     parser.add_argument("--allow-subset-resource-fixture", action="store_true")
     parser.add_argument("--expected-groups", type=int, default=8)
     parser.add_argument("--collect-steps", type=int, default=12)
     parser.add_argument("--device", default="cuda:0")
+    from .workers import add_collector_arguments, collector_device_list, startup_concurrency
+    add_collector_arguments(parser)
     parser.add_argument("--robot-mjcf")
-    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--seed", type=int, default=None, help="Explicit override; otherwise use --config seed")
     parser.add_argument("--worker-cpu-threads", type=int, default=3)
     parser.add_argument("--legacy-hand-collision", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--legacy-self-collision", action=argparse.BooleanOptionalAction, default=None)
@@ -178,14 +284,17 @@ def main(argv=None):
     from supermimic.physics import add_physics_arguments, resolve_arguments
     add_physics_arguments(parser)
     args, launcher = parser.parse_known_args(argv)
+    collector_devices = collector_device_list(args.device, args.collector_devices)
+    startup_concurrency(args.worker_startup_concurrency, 1)
     probe = ProbeConfig(expected_groups=args.expected_groups, collect_steps=args.collect_steps).validate()
-    if args.seed < 0 or args.worker_cpu_threads < 1:
+    if (args.seed is not None and args.seed < 0) or args.worker_cpu_threads < 1:
         parser.error("seed must be nonnegative and CPU threads positive")
+    config = read_probe_config(args.config, seed=args.seed)
     settings, _ = resolve_arguments(args)
     physics = asdict(settings)
     if not (settings.hand_collision and settings.self_collision):
         parser.error("v1 resource validation requires hand ON/self ON")
-    from .config import TrainConfig, bundle_identity, fresh_directory, source_identity, write_json
+    from .config import bundle_identity, fresh_directory, source_identity, write_json
     from .evaluate import _read_bundle_header
     header = _read_bundle_header(args.bundle)
     if header["partition"] != "train":
@@ -195,10 +304,12 @@ def main(argv=None):
         raise ValueError("subset bundle requires explicit --allow-subset-resource-fixture")
     output = fresh_directory(args.output)
     report = {"scope": "subset_resource_fixture" if subset else "full_training_bundle_resource_validation",
-              "probe": asdict(probe), "physics": physics, "source_identity": source_identity(),
+              "probe": asdict(probe), "production_config": config.to_dict(),
+              "physics": physics, "source_identity": source_identity(),
               "data_identity": bundle_identity(header), "optimizer_steps": 0, "formal_training_started": False,
               "policy_gate_bypassed": False, "wm_gate_validated": False,
-              "worker_cpu_threads": args.worker_cpu_threads, "phases": [], "passed": False}
+              "worker_cpu_threads": args.worker_cpu_threads, "collector_devices": collector_devices,
+              "worker_startup_concurrency": args.worker_startup_concurrency, "phases": [], "passed": False}
     write_json(output / "request.json", report)
     workers = None
     started = time.monotonic()
@@ -221,38 +332,28 @@ def main(argv=None):
             raise ValueError("full native resource probe needs the prepared Linux CUDA runtime")
         os.environ["OMP_NUM_THREADS"] = os.environ["MKL_NUM_THREADS"] = str(args.worker_cpu_threads)
         torch.set_num_threads(args.worker_cpu_threads)
-        torch.manual_seed(args.seed)
+        torch.manual_seed(config.seed)
         torch.backends.cuda.matmul.allow_tf32 = torch.backends.cudnn.allow_tf32 = True
         import supermimic.networks as legacy_networks
-        legacy_networks.AMP_DTYPE = torch.bfloat16
+        legacy_networks.AMP_DTYPE = torch.bfloat16 if config.amp == "bf16" else None
         from supermimic.kinematics import G1Kinematics
         from supermimic.robot_metadata import default_joint_pos_list
         from .prepare import load_bundle
         from .mdp import HOIMDP
-        from .networks import Policy, WorldModel, Critic, frozen_parameters
+        from .networks import frozen_parameters
         from .buffer import ReplayBuffer
         from .learner import Learner
-        from .checkpoint import migrate_legacy
         from .workers import allocate_workers, WorkerGroup, resource_preflight
-        from .train import read_checkpoint
-        config = TrainConfig(seed=args.seed).validate()
-        if getattr(config, "variant", "hoi_v1") != "hoi_v1":
-            raise ValueError("production resource probe measures the full hoi_v1 variant")
-        assert (config.num_envs, config.buffer_steps, config.pi_batch, config.horizon) == (4096, 1000, 4096, 32)
-        report["production_config"] = config.to_dict()
         with sampler:
             initialize_cuda_memory_counters(args.device)
             kin = G1Kinematics(args.device, mjcf_path=args.robot_mjcf)
             bank, shapes, bundle = load_bundle(args.bundle, kin, device=args.device)
             mdp = HOIMDP(kin, bank, torch.tensor(default_joint_pos_list(), device=args.device), shapes)
-            models = [model().to(args.device) for model in (Policy, WorldModel, Critic)]
-            old, digest = read_checkpoint(args.init_checkpoint)
+            models = build_probe_models(config, mdp, bundle, args.device)
             declared = {"hand_collision": args.legacy_hand_collision, "self_collision": args.legacy_self_collision}
-            initialization = migrate_legacy(old, *models, physics=physics, legacy_physics=declared,
-                                            allow_physics_change=args.allow_initialization_physics_change)
-            initialization.update(path=str(args.init_checkpoint.resolve()), sha256=digest)
-            report["initialization"] = initialization
-            del old
+            report["initialization"] = initialize_probe_models(models, from_scratch=args.from_scratch,
+                init_checkpoint=args.init_checkpoint, physics=physics, legacy_physics=declared,
+                allow_physics_change=args.allow_initialization_physics_change)
             phase("models_and_references")
             replay = ReplayBuffer(probe.buffer_steps, probe.num_envs, args.device)
             learner = Learner(*models, bank, mdp, shapes, replay, config)
@@ -264,10 +365,12 @@ def main(argv=None):
             specs = allocate_workers(bundle, bank, probe.num_envs)
             if len(specs) != probe.expected_groups:
                 raise ValueError(f"expected {probe.expected_groups} static groups, found {len(specs)}")
-            report["resources"] = resource_preflight(specs, device=args.device)
+            report["resources"] = resource_preflight(specs, device=args.device, collector_devices=args.collector_devices,
+                                                       worker_startup_concurrency=args.worker_startup_concurrency)
             worker_config = {"bundle": str(args.bundle.resolve()), "output": str(output / "workers"),
-                             "physics": physics, "robot_mjcf": args.robot_mjcf, "seed": args.seed,
-                             "device": args.device, "gamma": config.gamma, "launcher_args": launcher}
+                             "physics": physics, "robot_mjcf": args.robot_mjcf, "seed": config.seed,
+                             "device": args.device, "gamma": config.gamma, "launcher_args": launcher,
+                             "collector_devices": args.collector_devices, "worker_startup_concurrency": args.worker_startup_concurrency}
             workers = WorkerGroup(specs, worker_config, device=args.device)
             report["native_workers"] = workers.native_reports
             report["process_ids"] = [os.getpid()] + [p.pid for p in workers._processes]
@@ -299,9 +402,11 @@ def main(argv=None):
             del window, predicted_s, predicted_o, logits, losses, wm_gradients
             learner.wm.zero_grad(set_to_none=True)
             learner.critic.zero_grad(set_to_none=True)
-            start, history = replay.sample_starts(probe.pi_batch, 10, horizon=probe.horizon, motion=bank)
+            start, history, start_selection = stratified_real_starts(replay, probe.pi_batch, bank,
+                expected_assets=[s.asset_id for s in specs], horizon=probe.horizon)
             report["real_start_mix"] = validate_real_start_mix(start, history, bank,
                 expected_assets=[s.asset_id for s in specs], batch_size=probe.pi_batch, horizon=probe.horizon)
+            report["real_start_mix"].update(start_selection)
             for model in models:
                 model.zero_grad(set_to_none=True)
             backward_started = time.monotonic()
@@ -338,7 +443,8 @@ def main(argv=None):
                                                 expand(start["xi_o"]), expand(start["asset_id"]),
                                          expand(start["support_pose_xyzw"]), expand(start["support_present"]))
                 learner.critic.update_normalizers(*arguments[:-1])
-                values = learner.critic(*arguments).reshape(probe.horizon + 1, probe.pi_batch)
+                values = critic_target_values(learner.critic, arguments, horizon=probe.horizon,
+                                              batch=probe.pi_batch, critic_minibatches=config.critic_minibatches)
                 target, targets = values[-1], []
                 for tick in range(probe.horizon - 1, -1, -1):
                     target = trajectory["reward"][tick].detach() + config.gamma * (1 - trajectory["failure"][tick].detach()) * (
@@ -347,7 +453,9 @@ def main(argv=None):
                 targets = torch.stack(targets[::-1]).flatten()
                 inputs = tuple(x[:probe.horizon * probe.pi_batch].detach() for x in arguments)
             phase("production_full_critic_target_values", rows=(probe.horizon + 1) * probe.pi_batch,
-                  full_pointcloud_batch=True, actor_trajectory_retained=True)
+                  full_pointcloud_batch=False, all_rows_preserved=True,
+                  target_batch=(probe.horizon * probe.pi_batch + config.critic_minibatches - 1) // config.critic_minibatches,
+                  actor_trajectory_retained=True)
             size = probe.horizon * probe.pi_batch
             ids = torch.randperm(size, device=args.device).tensor_split(config.critic_minibatches)[0]
             predicted_value = learner.critic(*(feature[ids] for feature in inputs))
@@ -366,7 +474,7 @@ def main(argv=None):
             report["limitations"] = ["No optimizer step, convergence claim, or formal training",
                 "Adam moments are fully reserved, but optimizer.step foreach scratch tensors and kernels were not executed",
                 "One full-size WM batch and one full-size critic minibatch measured; this is not full-iteration throughput",
-                "Real replay starts are sampled with replacement; this is capacity validation, not independent interaction coverage",
+                "Real replay starts are resource-stratified for every asset, with replacement; production sampling is unchanged",
                 "A subset resource fixture does not establish full-dataset readiness"]
     except BaseException as exc:
         report["error"] = {"type": type(exc).__name__, "message": str(exc), "traceback": traceback.format_exc()}
@@ -379,7 +487,7 @@ def main(argv=None):
             "nvidia_smi_interval_seconds": 1., "sampled_peak_is_lower_bound": True,
             "parent_allocator_peaks_are_exact": True, "adam_two_moment_tensors_reserved_for_every_parameter": True,
             "torch_mem_get_info_includes_other_processes_on_assigned_gpu": True,
-            "nvidia_smi_uuid_binding": "actual parent PID compute-apps physical GPU UUID; unrelated GPUs filtered"}
+            "nvidia_smi_uuid_binding": "actual owned parent/worker PID compute-apps GPU UUIDs; unrelated GPUs filtered"}
         report["elapsed_seconds"] = time.monotonic() - started
         write_json(output / "report.json", report)
     print(json.dumps({"passed": report["passed"], "report": str(output / "report.json")}, allow_nan=False))
