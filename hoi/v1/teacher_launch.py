@@ -34,9 +34,13 @@ def validate_probe(report, *, source, config, data_identity, device, collector_d
     if report.get("probe", {}).get("expected_groups") != 273:
         raise ValueError("teacher resource probe must cover all 273 train assets")
     resources = report.get("resources", {})
+    # This generic launcher starts the original one-asset-per-process collector.
+    # A packed experiment may need far less memory; accepting its report here
+    # would authorize a different, unmeasured deployment at training startup.
     for key, expected in (("groups", 273), ("num_envs", config.num_envs), ("device", device),
+                          ("assets_per_process", 1), ("processes", 273),
                           ("collector_devices", collector_devices), ("worker_startup_concurrency", min(startup, 273))):
-        if resources.get(key) != expected:
+        if resources.get(key) != expected or type(resources.get(key)) is not type(expected):
             raise ValueError(f"teacher resource allocation mismatch: {key}")
     if report.get("real_start_mix", {}).get("all_static_groups_present") is not True:
         raise ValueError("teacher resource probe did not exercise every asset in real replay")

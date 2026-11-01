@@ -464,3 +464,39 @@ RUN_DIR=train_01；申请已验证兼容的al-l40s-0上5张L40S（learner 1、co
 https://app.forge.coreweave.com/tianzizh-university-of-pennsylvania/superteacher。
 提交回执保存在ignored data/superteacher_20261101_01/training_submission.json；实际运行状态
 以Slurm和该独立目录的日志为准，本文提交状态不代表后续运行结果。
+
+
+## 多资产共进程资源实验（hoi/younameit）
+
+原superteacher作业1488620保持排队及冻结source_02不变。新分支显式
+--assets-per-process K，把相邻完整资产WorkerSpec打包到同一spawn进程；默认K=1
+保留原入口。每资产仍常驻独立scene/model/solver、局部motion bank、bin_G/bin_w_avg，
+quota/全局行序/seed规则不变，不轮换或删掉资产。每个asset独立保存CPU及本CUDA设备
+RNG，构造、step/autoreset、显式reset期间切换，退出恢复调用者状态。
+
+当前Newton MuJoCo-Warp多world要求同构拓扑，各资产hull数不同，不能直接使用一个
+异构batched solver。本实验共享Python/CUDA运行时，同时保留每资产独立solver。
+IsaacLab没有公开的多个活动SimulationContext接口；本仓simulation_slot.py集中管理
+串行active-context lease和官方use_stage scope，11个已审计runtime文件SHA不匹配就拒绝。
+严格kitless/headless、单线程、同device/physics，无render/camera/builder hooks/reset回调；
+每slot独立USD stage，所有native操作在对应lease内，最后整个pool shutdown才clear。
+这属于针对固定runtime的适配，不能泛称官方支持任意多个SimulationContext。
+
+packed_probe先用4资产小面板进行原方式A/A重跑和A/B共进程逐字段精确对照，包含
+真实双桌、复杂垃圾桶、足球及最小quota资产，固定open-loop action、真实autoreset及
+显式reset，0optimizer。小面板通过不能替代全273资产容量结论。后续完整resource_probe
+保留actor batch4096/H32/WM batch/window/replay深度1000，只允许显式
+--probe-num-envs 2048作为用户授权的独立部署对照；其report scope和差异记录与默认
+4096 readiness区分，不能被原启动器误接为4096通过证据。原数据/划分/物理/奖励/PD
+与训练日程均未改，是否节省内存/显存与吞吐以真实GPU报告为准。
+
+同进程内还显式复用完整只读ShapeAssetBank；每资产仍独立motion/FK/bin状态。
+每次load仍验证bundle、native/source/reference及静态geometry/hands文件SHA；仅省掉
+重复的静态反序列化和registry分配，并检查内存中原geometry/physical tensor是否被意外写入。
+collector-only probe用已绑定clip长度计算精确outgoing bin数，再调用原allocate_workers，
+避免父进程额外构建一份无用的全量CPU motion/FK；每child仍加载完整所分配数据并核对实际bins。
+
+CPU最终完整回归536项：534通过、2项环境限制跳过；历史边界6项通过。GPU新版数值对照作业1488639，独立实验根目录
+/mnt/projects/ll/tianzizh/hoi_packed_collectors_20261101_01，source_02/parity_02。
+旧诊断1488637因父进程重复全量CPU加载被新版替代并主动停止，回执保留；不是训练取消。
+原训练1488620保留。当前尚未得到packed数值对齐及完整273组容量结论，不据此减少原作业资源。

@@ -398,8 +398,18 @@ def read_curated_bundle_header(path):
     return bundle
 
 
-def load_curated_bundle(path, kin, device='cpu', require_train=True, asset_filter=None, verify_source=True, retain_source_reference=None):
-    from hoi.v1.prepare import _bound_load, native_robot_asset_binding
+def load_curated_bundle(path, kin, device='cpu', require_train=True, asset_filter=None, verify_source=True, retain_source_reference=None, shared_shapes=None):
+    """Load local motion data with optional process-local static registry reuse.
+
+    Pass a prior returned shapes object only for the same bundle/device/FK.
+    Its geometry, hands, physical metadata and derived tensors must remain
+    read-only; query's lazy SDF cache may grow. No global cache is maintained.
+    Every call retains header, source, reference and native identity checks,
+    and rehashes all static cache files even when skipping deserialization.
+    Asset filtering affects motion frames/bins only, never the full registry.
+    """
+    from hoi.v1.prepare import (_bound_load, native_robot_asset_binding,
+                                _bind_shared_shapes, _validate_shared_shapes)
     from hoi.v1.geometry import ShapeAssetBank, tensor_sha256
     from hoi.v1.motion import TrainingMotionBank
     from .curated import _resolved
@@ -416,6 +426,8 @@ def load_curated_bundle(path, kin, device='cpu', require_train=True, asset_filte
         raise ValueError('curated reference URDF changed')
     if 'robot_fk' in bundle and (not hasattr(kin,'mjcf_path') or sha(kin.mjcf_path)!=bundle['robot_fk']['mjcf_sha256']):
         raise ValueError('curated robot/runtime FK mismatch')
+    if shared_shapes is not None:
+        _validate_shared_shapes(shared_shapes,bundle,kin,device)
     clips,global_frames,offset=[],[],0
     selected=None if asset_filter is None else set(int(x) for x in asset_filter)
     for entry in bundle['clips']:
@@ -457,10 +469,24 @@ def load_curated_bundle(path, kin, device='cpu', require_train=True, asset_filte
             verified_native.add(native_key)
         cache_key=(asset['geometry_cache']['path'],asset['geometry_cache']['sha256'])
         if cache_key not in loaded_geometry:
-            loaded_geometry[cache_key]=_bound_load(asset['geometry_cache'])
+            if shared_shapes is not None:
+                if sha(cache_key[0]) != cache_key[1]:
+                    raise ValueError(f'cache SHA256 mismatch: {cache_key[0]}')
+                loaded_geometry[cache_key]=None
+            else:
+                loaded_geometry[cache_key]=_bound_load(asset['geometry_cache'])
+        if shared_shapes is not None:
+            continue  # Same bound file bytes and unchanged, already validated tensors.
         geometry=loaded_geometry[cache_key]
         if geometry['metadata']['collision_hash']!=asset['collision_hash'] or tensor_sha256(geometry['points'])!=geometry['metadata']['point_hash']:
             raise ValueError('curated geometry cache mismatch')
         geometries.append(geometry)
-    shapes=ShapeAssetBank(bundle['assets'],geometries,_bound_load(bundle['hands']['geometry_cache']),device)
+    if shared_shapes is not None:
+        hand_cache=bundle['hands']['geometry_cache']
+        if sha(hand_cache['path']) != hand_cache['sha256']:
+            raise ValueError(f"cache SHA256 mismatch: {hand_cache['path']}")
+        shapes=shared_shapes
+    else:
+        shapes=ShapeAssetBank(bundle['assets'],geometries,_bound_load(bundle['hands']['geometry_cache']),device)
+        _bind_shared_shapes(shapes,bundle,kin,device)
     return bank,shapes,bundle

@@ -23,6 +23,7 @@ class TeacherLaunchTests(unittest.TestCase):
                   "collector_devices": ["cuda:1", "cuda:2"], "worker_startup_concurrency": 2,
                   "probe": {"expected_groups": 273}, "real_start_mix": {"all_static_groups_present": True},
                   "resources": {"groups": 273, "num_envs": 4096, "device": "cuda:0",
+                                "assets_per_process": 1, "processes": 273,
                                 "collector_devices": ["cuda:1", "cuda:2"], "worker_startup_concurrency": 2}}
         args = dict(source=source, config=config, data_identity=identity, device="cuda:0",
                     collector_devices=["cuda:1", "cuda:2"], startup=2)
@@ -57,6 +58,28 @@ class TeacherLaunchTests(unittest.TestCase):
             self.assertEqual(verify_source(identity["content_sha256"]), identity)
             with self.assertRaisesRegex(ValueError, "source identity changed"):
                 verify_source("0" * 64)
+
+    def test_generic_launcher_rejects_packed_or_undeclared_process_topology(self):
+        report, args = self.fixture()
+        for changes in ({"assets_per_process": 8, "processes": 35},
+                        {"assets_per_process": 273, "processes": 1},
+                        {"assets_per_process": 2}, {"processes": 272},
+                        {"assets_per_process": True}, {"processes": 273.0}):
+            changed = deepcopy(report)
+            changed["resources"].update(changes)
+            with self.subTest(changes=changes), self.assertRaisesRegex(ValueError, "allocation mismatch"):
+                validate_probe(changed, **args)
+        for key in ("assets_per_process", "processes"):
+            changed = deepcopy(report)
+            del changed["resources"][key]
+            with self.subTest(missing=key), self.assertRaisesRegex(ValueError, "allocation mismatch"):
+                validate_probe(changed, **args)
+
+    def test_2048_resource_comparison_cannot_authorize_generic_training(self):
+        report, args = self.fixture()
+        report["scope"] = "full_training_bundle_resource_comparison"
+        with self.assertRaisesRegex(ValueError, "mismatch: scope"):
+            validate_probe(report, **args)
 
     def test_launchers_parse_as_bash_without_submitting_any_jobs(self):
         git_bash = Path("C:/Program Files/Git/bin/bash.exe")

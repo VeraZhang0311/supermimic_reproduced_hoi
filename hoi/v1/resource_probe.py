@@ -1,7 +1,9 @@
-"""Measure the unchanged 4096-environment v1 resource profile without training.
+"""Measure the full v1 resource profile without training.
 
 Native collection and actor backward are real. No optimizer is stepped, no WM
 policy gate is bypassed, and subset inputs are explicitly resource fixtures.
+The explicit 2048-environment comparison changes only collector/replay width;
+all training batches, replay depth and imagination horizon remain full size.
 """
 from __future__ import annotations
 
@@ -28,7 +30,9 @@ class ProbeConfig:
     collect_steps: int = 12
 
     def validate(self):
-        for key, expected in (("num_envs", 4096), ("buffer_steps", 1000), ("pi_batch", 4096), ("horizon", 32)):
+        if type(self.num_envs) is not int or self.num_envs not in (2048, 4096):
+            raise ValueError("resource probe supports only 4096 environments or the explicit 2048-environment comparison")
+        for key, expected in (("buffer_steps", 1000), ("pi_batch", 4096), ("horizon", 32)):
             if type(getattr(self, key)) is not int or getattr(self, key) != expected:
                 raise ValueError(f"resource readiness probe preserves {key}={expected}; no silent reduction")
         if type(self.expected_groups) is not int or self.expected_groups < 1:
@@ -36,6 +40,19 @@ class ProbeConfig:
         if type(self.collect_steps) is not int or self.collect_steps < 10:
             raise ValueError("collect at least ten real ticks for episode history")
         return self
+
+
+def deployment_comparison(probe, config):
+    """Describe the permitted resource-only override without mutating training."""
+    probe.validate()
+    if config.num_envs != 4096:
+        raise ValueError("resource comparison requires the unchanged 4096-environment production config")
+    return {"resource_only": True,
+            "production_num_envs": config.num_envs, "measured_num_envs": probe.num_envs,
+            "explicit_overrides": {} if probe.num_envs == config.num_envs else {"num_envs": probe.num_envs},
+            "production_readiness_compatible": probe.num_envs == config.num_envs,
+            "data_selection_changed": False, "training_batches_changed": False,
+            "replay_depth_changed": False, "imagination_horizon_changed": False}
 
 
 def read_probe_config(path=None, *, seed=None):
@@ -272,6 +289,8 @@ def main(argv=None):
     parser.add_argument("--allow-subset-resource-fixture", action="store_true")
     parser.add_argument("--expected-groups", type=int, default=8)
     parser.add_argument("--collect-steps", type=int, default=12)
+    parser.add_argument("--probe-num-envs", type=int, choices=(2048, 4096), default=4096,
+                        help="Resource-only collector/replay width; batches, horizon and complete asset coverage stay unchanged")
     parser.add_argument("--device", default="cuda:0")
     from .workers import add_collector_arguments, collector_device_list, startup_concurrency
     add_collector_arguments(parser)
@@ -286,10 +305,12 @@ def main(argv=None):
     args, launcher = parser.parse_known_args(argv)
     collector_devices = collector_device_list(args.device, args.collector_devices)
     startup_concurrency(args.worker_startup_concurrency, 1)
-    probe = ProbeConfig(expected_groups=args.expected_groups, collect_steps=args.collect_steps).validate()
+    probe = ProbeConfig(num_envs=args.probe_num_envs, expected_groups=args.expected_groups,
+                        collect_steps=args.collect_steps).validate()
     if (args.seed is not None and args.seed < 0) or args.worker_cpu_threads < 1:
         parser.error("seed must be nonnegative and CPU threads positive")
     config = read_probe_config(args.config, seed=args.seed)
+    comparison = deployment_comparison(probe, config)
     settings, _ = resolve_arguments(args)
     physics = asdict(settings)
     if not (settings.hand_collision and settings.self_collision):
@@ -303,17 +324,22 @@ def main(argv=None):
     if subset and not args.allow_subset_resource_fixture:
         raise ValueError("subset bundle requires explicit --allow-subset-resource-fixture")
     output = fresh_directory(args.output)
-    report = {"scope": "subset_resource_fixture" if subset else "full_training_bundle_resource_validation",
+    full_scope = ("full_training_bundle_resource_validation" if comparison["production_readiness_compatible"]
+                  else "full_training_bundle_resource_comparison")
+    report = {"scope": "subset_resource_fixture" if subset else full_scope,
               "probe": asdict(probe), "production_config": config.to_dict(),
+              "deployment_comparison": comparison,
               "physics": physics, "source_identity": source_identity(),
               "data_identity": bundle_identity(header), "optimizer_steps": 0, "formal_training_started": False,
               "policy_gate_bypassed": False, "wm_gate_validated": False,
               "worker_cpu_threads": args.worker_cpu_threads, "collector_devices": collector_devices,
-              "worker_startup_concurrency": args.worker_startup_concurrency, "phases": [], "passed": False}
+              "worker_startup_concurrency": args.worker_startup_concurrency, "assets_per_process": args.assets_per_process, "phases": [], "passed": False}
     write_json(output / "request.json", report)
     workers = None
     started = time.monotonic()
     sampler = _GpuSampler()
+    from .host_memory import HostMemorySampler
+    host_memory = HostMemorySampler(os.getpid())
 
     def phase(name, **values):
         torch.cuda.synchronize(args.device)
@@ -344,7 +370,7 @@ def main(argv=None):
         from .buffer import ReplayBuffer
         from .learner import Learner
         from .workers import allocate_workers, WorkerGroup, resource_preflight
-        with sampler:
+        with sampler, host_memory:
             initialize_cuda_memory_counters(args.device)
             kin = G1Kinematics(args.device, mjcf_path=args.robot_mjcf)
             bank, shapes, bundle = load_bundle(args.bundle, kin, device=args.device)
@@ -366,11 +392,11 @@ def main(argv=None):
             if len(specs) != probe.expected_groups:
                 raise ValueError(f"expected {probe.expected_groups} static groups, found {len(specs)}")
             report["resources"] = resource_preflight(specs, device=args.device, collector_devices=args.collector_devices,
-                                                       worker_startup_concurrency=args.worker_startup_concurrency)
+                                                       worker_startup_concurrency=args.worker_startup_concurrency, assets_per_process=args.assets_per_process)
             worker_config = {"bundle": str(args.bundle.resolve()), "output": str(output / "workers"),
                              "physics": physics, "robot_mjcf": args.robot_mjcf, "seed": config.seed,
                              "device": args.device, "gamma": config.gamma, "launcher_args": launcher,
-                             "collector_devices": args.collector_devices, "worker_startup_concurrency": args.worker_startup_concurrency}
+                             "collector_devices": args.collector_devices, "worker_startup_concurrency": args.worker_startup_concurrency, "assets_per_process": args.assets_per_process}
             workers = WorkerGroup(specs, worker_config, device=args.device)
             report["native_workers"] = workers.native_reports
             report["process_ids"] = [os.getpid()] + [p.pid for p in workers._processes]
@@ -477,12 +503,16 @@ def main(argv=None):
                 "Real replay starts are resource-stratified for every asset, with replacement; production sampling is unchanged",
                 "A subset resource fixture does not establish full-dataset readiness"]
     except BaseException as exc:
+        report["passed"] = False
         report["error"] = {"type": type(exc).__name__, "message": str(exc), "traceback": traceback.format_exc()}
         raise
     finally:
         if workers is not None:
             workers.close()
-        report["nvidia_smi"] = summarize_gpu_samples(sampler.samples, report.get("process_ids", [os.getpid()]), os.getpid())
+        from .packed_probe import summarize_collector_gpu_samples
+        report["nvidia_smi"] = summarize_collector_gpu_samples(
+            sampler.samples, report.get("process_ids", [os.getpid()]), os.getpid(), collector_devices)
+        report["host_memory"] = host_memory.summary()
         report["memory_measurement"] = {"global_samples_include_separate_simulator_processes": True,
             "nvidia_smi_interval_seconds": 1., "sampled_peak_is_lower_bound": True,
             "parent_allocator_peaks_are_exact": True, "adam_two_moment_tensors_reserved_for_every_parameter": True,

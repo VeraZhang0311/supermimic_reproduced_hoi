@@ -106,6 +106,57 @@ def _bound_load(record):
     return torch.load(io.BytesIO(raw), weights_only=True, map_location="cpu")
 
 
+def _shape_binding(bundle, kin, device):
+    """Value identity: separately constructed equivalent FK objects may share."""
+    structure = {}
+    for name in ("body_names", "parent", "joint_idx", "tracked_idx", "num_bodies",
+                 "axes", "off_p", "off_R", "q_lo", "q_hi"):
+        value = getattr(kin, name, None)
+        structure[name] = tensor_sha256(value) if isinstance(value, torch.Tensor) else value
+    if hasattr(kin, "mjcf_path"):
+        structure["mjcf_sha256"] = sha256_file(kin.mjcf_path)
+    return (bundle["bundle_content_sha256"], str(torch.device(device)),
+            type(kin).__module__, type(kin).__qualname__, _digest_json(structure))
+
+
+def _shape_signature(shapes):
+    """Detect accidental writes without copying/hashing large geometry tensors.
+
+    Public geometry tensors and metadata are read-only by contract. Tensor
+    versions catch normal in-place writes; this is not an adversarial memory
+    integrity boundary (e.g. writes through Tensor.data). The query-only lazy
+    _grid_cache is deliberately excluded: populating it is valid memoization.
+    """
+    def state(value):
+        if isinstance(value, torch.Tensor):
+            try:
+                version = value._version
+            except RuntimeError:  # Inference tensors have no version counter.
+                version = tensor_sha256(value)
+            return ["tensor", id(value), version, list(value.shape),
+                    str(value.dtype), str(value.device)]
+        if isinstance(value, dict):
+            return {str(key): state(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [state(item) for item in value]
+        return value
+    return _digest_json(state([shapes.assets, shapes.geometries, shapes.hands,
+                               shapes._points, shapes._bbox, shapes._contexts,
+                               shapes.device]))
+
+
+def _bind_shared_shapes(shapes, bundle, kin, device):
+    shapes._curated_share_binding = _shape_binding(bundle, kin, device)
+    shapes._curated_share_signature = _shape_signature(shapes)
+
+
+def _validate_shared_shapes(shapes, bundle, kin, device):
+    if not isinstance(shapes, ShapeAssetBank) or getattr(shapes, "_curated_share_binding", None) != _shape_binding(bundle, kin, device):
+        raise ValueError("shared shapes require the same curated bundle, device and FK identity")
+    if getattr(shapes, "_curated_share_signature", None) != _shape_signature(shapes):
+        raise ValueError("shared shapes read-only geometry or metadata was modified")
+
+
 def _resolve(path, root):
     value = Path(path)
     return value if value.is_absolute() else root / value
@@ -539,12 +590,21 @@ def prepare_bundle(manifest_path, recipes_path, output, kin, *, partition="train
 
 
 def load_bundle(path, kin, device="cpu", require_train=True, asset_filter=None, verify_source=True,
-                retain_source_reference=None):
+                retain_source_reference=None, shared_shapes=None):
+    """Load independent motion data, optionally reusing curated static shapes.
+
+    Packed collectors may pass the previous call's shapes in the same process.
+    Only shapes are shared; motion frames, references and bins remain local.
+    See load_curated_bundle for the read-only and input validation contract.
+    The default still constructs a fresh registry on every call.
+    """
     path = Path(path)
     bundle = json.loads(path.read_text(encoding="utf-8"))
     from hoi.data.curated_bundle import CURATED_BUNDLE_SCHEMA, load_curated_bundle
     if bundle.get("schema_version") == CURATED_BUNDLE_SCHEMA:
-        return load_curated_bundle(path, kin, device, require_train, asset_filter, verify_source, retain_source_reference)
+        return load_curated_bundle(path, kin, device, require_train, asset_filter, verify_source, retain_source_reference, shared_shapes)
+    if shared_shapes is not None:
+        raise ValueError("shared shapes are supported only for curated bundles")
     digest = bundle.pop("bundle_content_sha256", None)
     if bundle.get("schema_version") != BUNDLE_SCHEMA or digest != _digest_json(bundle):
         raise ValueError("bundle schema/content hash mismatch")

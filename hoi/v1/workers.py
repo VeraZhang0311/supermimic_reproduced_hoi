@@ -87,6 +87,15 @@ def assign_worker_devices(specs, *, device, collector_devices=None):
     return [devices[index % len(devices)] for index in range(len(specs))]
 
 
+def pack_worker_specs(specs, assets_per_process=1):
+    """Contiguous complete asset groups; never change quotas or row order."""
+    if type(assets_per_process) is not int or assets_per_process < 1:
+        raise ValueError("assets_per_process must be a positive integer")
+    if not specs or len({s.asset_id for s in specs}) != len(specs):
+        raise ValueError("packing requires nonempty unique asset groups")
+    return [tuple(specs[i:i + assets_per_process]) for i in range(0, len(specs), assets_per_process)]
+
+
 def startup_concurrency(value, count):
     if value is None:
         return count
@@ -123,20 +132,24 @@ def isolate_worker_cuda(device, *, environ=None, cuda=None):
 
 
 def add_collector_arguments(parser):
+    parser.add_argument("--assets-per-process", type=int, default=1, help="Whole independent asset solvers per process; default preserves one asset per process")
     parser.add_argument("--collector-devices", nargs="+", help="Job-local cuda:N GPUs for whole asset workers; default is --device")
     parser.add_argument("--worker-startup-concurrency", type=int, help="Maximum workers initializing together; ready workers stay running")
 
 
-def resource_preflight(specs, *, device, max_processes=None, collector_devices=None, worker_startup_concurrency=None):
+def resource_preflight(specs, *, device, max_processes=None, collector_devices=None, worker_startup_concurrency=None, assets_per_process=1):
     if not specs or any(s.num_envs < 1 for s in specs):
         raise ValueError("each fixed geometry worker requires at least one environment")
-    if max_processes is not None and len(specs) > max_processes:
-        raise ValueError(f"{len(specs)} required fixed-geometry processes exceed explicit process capacity {max_processes}; "
+    packs = pack_worker_specs(specs, assets_per_process)
+    if max_processes is not None and len(packs) > max_processes:
+        raise ValueError(f"{len(packs)} required fixed-geometry processes exceed explicit process capacity {max_processes}; "
                          "use a separately declared resource experiment; no groups were omitted")
-    devices = assign_worker_devices(specs, device=device, collector_devices=collector_devices)
-    initializing = startup_concurrency(worker_startup_concurrency, len(specs))
+    available = collector_device_list(device, collector_devices)
+    devices = [available[i % len(available)] for i, pack in enumerate(packs) for _ in pack]
+    initializing = startup_concurrency(worker_startup_concurrency, len(packs))
     result = {"groups": len(specs), "num_envs": sum(s.num_envs for s in specs),
-              "workers": [asdict(s) for s in specs], "process_model": "spawn; one SimulationContext per process",
+              "workers": [asdict(s) for s in specs], "process_model": ("spawn; one SimulationContext per process" if assets_per_process == 1 else "spawn; serial active-context leases; independent per-asset solver and RNG"),
+              "processes": len(packs), "assets_per_process": assets_per_process,
               "transport": "CPU tensor IPC; central learner owns actor inference", "device": str(device),
               "gpu_memory_budget_validated": False,
               "native_throughput_validated": False,
@@ -277,6 +290,15 @@ def _cat(values, device):
 
 class WorkerGroup:
     """Synchronous vector collector. Actor inference stays in the caller."""
+    def __new__(cls, specs, config, device="cuda:0", timeout=300):
+        packing = config.get("assets_per_process", 1)
+        if type(packing) is not int or packing < 1:
+            raise ValueError("assets_per_process must be a positive integer")
+        if packing != 1:
+            from .packed_workers import PackedWorkerGroup
+            return PackedWorkerGroup(specs, config, device=device, timeout=timeout)
+        return super().__new__(cls)
+
     def __init__(self, specs, config, device="cuda:0", timeout=300):
         self.specs, self.device, self.timeout = list(specs), device, timeout
         self.startup_timeout = config.get("startup_timeout", 1800)

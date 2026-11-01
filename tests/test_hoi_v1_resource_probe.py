@@ -9,7 +9,7 @@ import unittest
 
 import torch
 
-from hoi.v1.resource_probe import stratified_real_starts, read_probe_config, build_probe_models, initialize_probe_models, ProbeConfig, validate_real_start_mix, full_active_wm_windows, summarize_gpu_samples, initialize_cuda_memory_counters
+from hoi.v1.resource_probe import stratified_real_starts, read_probe_config, build_probe_models, initialize_probe_models, ProbeConfig, deployment_comparison, validate_real_start_mix, full_active_wm_windows, summarize_gpu_samples, initialize_cuda_memory_counters
 
 
 def fixture():
@@ -194,6 +194,69 @@ class ResourceProbeTest(unittest.TestCase):
                            ("collect_steps", 9), ("expected_groups", 0)):
             with self.subTest(key=key), self.assertRaises(ValueError):
                 replace(ProbeConfig(), **{key: value}).validate()
+
+    def test_2048_comparison_changes_only_collector_and_replay_width(self):
+        config = read_probe_config()
+        original = config.to_dict()
+        for count in (2048, 4096):
+            probe = ProbeConfig(num_envs=count, expected_groups=273).validate()
+            report = deployment_comparison(probe, config)
+            self.assertEqual((probe.buffer_steps, probe.pi_batch, probe.horizon), (1000, 4096, 32))
+            self.assertEqual(report["explicit_overrides"], {"num_envs": 2048} if count == 2048 else {})
+            self.assertEqual(report["production_readiness_compatible"], count == 4096)
+            self.assertEqual(report["measured_num_envs"], count)
+            self.assertEqual(report["production_num_envs"], 4096)
+            for key in ("data_selection_changed", "training_batches_changed", "replay_depth_changed",
+                        "imagination_horizon_changed"):
+                self.assertFalse(report[key])
+            self.assertEqual(config.to_dict(), original)
+        for count in (1024, 2048.0, True):
+            with self.assertRaises(ValueError):
+                ProbeConfig(num_envs=count).validate()
+        with self.assertRaisesRegex(ValueError, "unchanged 4096"):
+            deployment_comparison(ProbeConfig(num_envs=2048), replace(config, num_envs=2048))
+
+    def test_both_environment_counts_keep_every_one_of_273_assets(self):
+        from hoi.v1.workers import allocate_workers
+        assets = [{"asset_id": index, "object_asset": str(index), "exact_scale": 1.,
+                   "collision_hash": str(index), "physical_profile": {}} for index in range(273)]
+        motion = SimpleNamespace(bin_asset=torch.arange(273).repeat_interleave(torch.arange(1, 274)))
+        original = json.dumps(assets, sort_keys=True)
+        for count in (2048, 4096):
+            probe = ProbeConfig(num_envs=count, expected_groups=273).validate()
+            specs = allocate_workers({"assets": assets}, motion, probe.num_envs)
+            self.assertEqual([spec.asset_id for spec in specs], list(range(273)))
+            self.assertEqual(sum(spec.num_envs for spec in specs), count)
+            self.assertTrue(all(spec.num_envs > 0 for spec in specs))
+            self.assertEqual([spec.train_bins for spec in specs], list(range(1, 274)))
+            self.assertEqual(json.dumps(assets, sort_keys=True), original)
+
+    def test_2048_collectors_still_measure_full_4096_imagination_batch(self):
+        probe = ProbeConfig(num_envs=2048, expected_groups=273).validate()
+        asset_ids = torch.arange(273).repeat_interleave(100)
+        motion = SimpleNamespace(asset_ids=asset_ids, clip_id=asset_ids,
+                                 clip_end=torch.arange(273) * 100 + 99)
+        class Replay:
+            # Fixture models 2048 environment streams; replacement sampling
+            # supplies the unchanged 4096 actor rows, including every asset.
+            N = probe.num_envs
+            def sample_starts(self, batch, hist, *, horizon, motion):
+                assert (self.N, batch, hist, horizon) == (2048, 4096, 10, 32)
+                ids = torch.arange(batch) % 273
+                start = {"asset_id": ids, "f": ids * 100 + 40}
+                history = {"asset_id": ids[:, None].expand(batch, 10).clone(),
+                           "f": start["f"][:, None] - torch.arange(9, -1, -1)}
+                for key in ("s", "o", "a_prev", "xi", "xi_o"):
+                    start[key] = torch.arange(batch).float()[:, None]
+                    history[key] = start[key][:, None].expand(batch, 10, 1).clone()
+                return start, history
+        start, history, report = stratified_real_starts(Replay(), probe.pi_batch, motion,
+            expected_assets=list(range(273)), horizon=probe.horizon)
+        self.assertEqual(start["f"].shape, (4096,))
+        self.assertEqual(history["f"].shape, (4096, 10))
+        self.assertEqual(set(start["asset_id"].tolist()), set(range(273)))
+        self.assertEqual(report["final_batch_size"], 4096)
+        self.assertFalse(report["production_sampling_changed"])
 
     def test_real_multi_asset_history_and_prefix_padding(self):
         start, history, motion = fixture()

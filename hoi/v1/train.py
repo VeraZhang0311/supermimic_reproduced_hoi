@@ -280,7 +280,7 @@ def main(argv=None):
                          for shape, dtype in FIELDS.values())
     plan["resource_proposal"] = {"required_static_groups": len(required_assets), "num_envs": config.num_envs,
                                  "replay_bytes": per_transition * config.buffer_steps * config.num_envs,
-                                 "collector_devices": collector_devices, "worker_startup_concurrency": args.worker_startup_concurrency,
+                                 "collector_devices": collector_devices, "worker_startup_concurrency": args.worker_startup_concurrency, "assets_per_process": args.assets_per_process,
                                  "full_gpu_memory_and_throughput_validated": False,
                                  "cache_and_source_bytes_rechecked_on_load_bundle": True}
     write_json(output / "plan.json", plan)
@@ -351,7 +351,7 @@ def main(argv=None):
     write_json(output / "initialization.json", initialization)
     specs = allocate_workers(bundle, motion, config.num_envs)
     resources = resource_preflight(specs, device=args.device, max_processes=args.max_processes,
-                                   collector_devices=args.collector_devices, worker_startup_concurrency=args.worker_startup_concurrency)
+                                   collector_devices=args.collector_devices, worker_startup_concurrency=args.worker_startup_concurrency, assets_per_process=args.assets_per_process)
     resources["replay_bytes"] = sum(t.numel() * t.element_size() for t in replay.data.values())
     write_json(output / "resources.json", resources)
     worker_config = {"bundle": str(args.bundle.resolve()), "output": str(output / "workers"), "physics": physics,
@@ -360,7 +360,7 @@ def main(argv=None):
                      "seed": config.seed,
                      "device": args.device, "gamma": config.gamma, "launcher_args": launcher,
                      "max_processes": args.max_processes, "collector_devices": args.collector_devices,
-                     "worker_startup_concurrency": args.worker_startup_concurrency}
+                     "worker_startup_concurrency": args.worker_startup_concurrency, "assets_per_process": args.assets_per_process}
     evaluation_callback = None
     if args.eval_bundle:
         import os
