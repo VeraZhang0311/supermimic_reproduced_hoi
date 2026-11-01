@@ -581,3 +581,15 @@ reference/models与replay/Adam预留，随后在独立worker初始化结果的CP
 接收处报RuntimeError: received 0 items of ancdata；不是完成真实采集/反传后的容量通过。
 该错误本身不能证明OOM，也未取得原父进程FD上限/占用证据来断言句柄耗尽。冻结source_02、
 失败报告与日志均保留，原作业未被取消或改写；它按原启动器约定在预检失败后退出。
+
+1488911中的4096组已有结果：full_capacity_4096_03/report.json记录passed=false、
+resource_measurement_complete=true、0optimizer。全部273资产/9个collector成功就绪；
+完成12个控制步（49152 transitions，约507 env-steps/s）及2048×8的WM backward，
+随后actor 4096×H32 imagination前向在WM PointNet处CUDA OOM，未完成actor/critic验收。
+失败前进程树PSS采样峰61.0865GiB；学习器卡23.34375GiB，两张采集卡分别10.4453和
+7.3691GiB。采样没有外部进程混入、没有采样错误；这些是失败前观测值，不是完整训练
+需要的最终峰值。学习器卡当时仅余202.25MiB，下一次256MiB分配失败。
+9个collector均收到closed ACK并exit 0，整组关闭61.45秒，无遗留进程和finalization错误。
+同作业按预定流程继续2048组；其结果尚未完成。两采集卡各自峰值之和17.8145GiB仅提供
+合并到一张卡的容量候选依据，尚无两卡部署验收；4096学习器需要更大显存或另行验证的
+等价实现优化，不能把当前3张A10报告称为训练容量通过。
