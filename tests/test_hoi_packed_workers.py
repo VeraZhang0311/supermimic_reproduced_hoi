@@ -1,6 +1,7 @@
 """CPU packing/IPC contracts; fake children never initialize a simulator."""
 from dataclasses import asdict
 import json
+import multiprocessing as mp
 from pathlib import Path
 from types import SimpleNamespace
 import tempfile
@@ -18,6 +19,15 @@ from hoi.v1.workers import WorkerGroup, WorkerSpec, _cat, pack_worker_specs, res
 
 def specs():
     return [WorkerSpec(a, n, n * 3, str(a)) for a, n in zip((2, 9, 14, 27, 59), (2, 1, 4, 3, 1))]
+
+
+def delayed_exit_child(pipe):
+    """Real CPU child: native-close ACK precedes interpreter exit."""
+    pipe.send(("ready",))
+    assert pipe.recv() == ("close",)
+    pipe.send(("closed",))
+    time.sleep(3.)
+    pipe.close()
 
 
 def snapshot(pack, frames=None):
@@ -257,6 +267,28 @@ class PackedWorkerTests(unittest.TestCase):
         self.assertTrue(all(process.exitcode == 0 for process in processes))
         self.assertFalse(any(event[0] in ("kill", "terminate") for event in events))
         self.assertEqual(group._processes, [])
+
+    def test_real_child_may_exit_more_than_two_seconds_after_closed_ack(self):
+        context = mp.get_context("spawn")
+        parent, child = context.Pipe()
+        process = context.Process(target=delayed_exit_child, args=(child,))
+        group = object.__new__(PackedWorkerGroup)
+        group._processes, group._pipes, group._child_pipes = [process], [parent], []
+        group.packs = [(None,) * 4]
+        try:
+            process.start()
+            child.close()
+            self.assertTrue(parent.poll(30.))
+            self.assertEqual(parent.recv(), ("ready",))
+            group.close()
+            self.assertEqual(process.exitcode, 0)
+            self.assertFalse(process.is_alive())
+        finally:
+            if process.is_alive():
+                process.kill()
+                process.join(timeout=5.)
+            parent.close()
+            child.close()
 
     def test_remote_shutdown_error_is_reported_and_other_processes_are_joined(self):
         group, processes, events = self.shutdown_fixture()

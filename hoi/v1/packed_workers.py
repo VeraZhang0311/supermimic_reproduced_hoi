@@ -195,6 +195,11 @@ def _packed_main(connection, specs, config):
                 audit_path.write_text(json.dumps(audit, indent=2))
         # Sent only after native environments, slots, audit, and launcher
         # context have all successfully finished. Exit code is also checked.
+        # Python/native object destruction and interpreter shutdown still run
+        # after this ACK. If they stall, preserve thread stacks in the job log
+        # before the parent's bounded exit grace expires.
+        import faulthandler
+        faulthandler.dump_traceback_later(10., repeat=True)
         connection.send(("closed",))
     except BaseException as exc:
         failure = exc
@@ -340,11 +345,16 @@ class PackedWorkerGroup:
         terminate and kill phases. All peers are attempted after any failure.
         """
         errors = []
+        acknowledged = set()
+        shutdown_started = time.monotonic()
         processes, pipes = list(self._processes), list(self._pipes)
         # Tests may shorten these bounds; production bounds are for the whole
         # group, not multiplied by the number of packed processes.
         ack_timeout = getattr(self, "shutdown_ack_timeout", shutdown_ack_budget(getattr(self, "packs", ())))
-        join_timeout = getattr(self, "shutdown_join_timeout", 2.)
+        # Native close ACK does not mean the OS process has exited. Permit
+        # bounded Python/CUDA teardown rather than killing a healthy child
+        # after only two seconds. This is separate from the ACK deadline.
+        join_timeout = getattr(self, "shutdown_join_timeout", shutdown_ack_budget(getattr(self, "packs", ())))
         terminate_timeout = getattr(self, "shutdown_terminate_timeout", 3.)
         kill_timeout = getattr(self, "shutdown_kill_timeout", 3.)
 
@@ -387,6 +397,7 @@ class PackedWorkerGroup:
                         if message[0] == "error":
                             raise RuntimeError("remote shutdown error:\n" + str(message[1]))
                         if message == ("closed",):
+                            acknowledged.add(index)
                             return
                         if message[0] not in ("step", "reset", "ready", "asset_ready"):
                             raise RuntimeError("unexpected shutdown response " + str(message[0]))
@@ -415,6 +426,18 @@ class PackedWorkerGroup:
             joins(started, join_timeout, "join")
 
         living = [index for index in started if alive(index)]
+        if not force:
+            for index in living:
+                details = {"exit_grace_seconds": join_timeout,
+                           "closed_ack_received": index in acknowledged,
+                           "elapsed_seconds": time.monotonic() - shutdown_started}
+                proc = Path("/proc") / str(processes[index].pid)
+                for field in ("status", "wchan"):
+                    try:
+                        details[field] = (proc / field).read_text()
+                    except OSError:
+                        pass  # Linux-only diagnostic; cleanup remains portable.
+                error(index, "process_exit_timeout", json.dumps(details))
         for index in living:
             try:
                 processes[index].terminate()
@@ -451,5 +474,11 @@ class PackedWorkerGroup:
         self._processes = [processes[index] for index in surviving]
         self._pipes = [pipes[index] for index in surviving if index < len(pipes)]
         self._child_pipes = []
+        print(json.dumps({"event": "packed_collector_shutdown", "force": force,
+            "elapsed_seconds": time.monotonic() - shutdown_started,
+            "ack_budget_seconds": ack_timeout, "exit_budget_seconds": join_timeout,
+            "workers": [{"pid": p.pid, "exitcode": p.exitcode,
+                         "closed_ack_received": i in acknowledged} for i, p in enumerate(processes)],
+            "errors": errors, "surviving_pids": [processes[index].pid for index in surviving]}), flush=True)
         if errors:
             raise CollectorShutdownError(errors, [processes[index].pid for index in surviving])

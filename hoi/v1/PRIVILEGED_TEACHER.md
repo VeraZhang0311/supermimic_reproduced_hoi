@@ -555,3 +555,15 @@ bash-n通过。重测作业1488867已启动，仍为dj-a40-0上3张A10/30CPU/96G
 先在isolation_02复核真实关闭ACK及四资产逐字节隔离，成功后依次测完整273资产的
 full_capacity_4096_02、full_capacity_2048_02，汇总为full_capacity_summary_02.json。
 所有阶段0optimizer，不接正式train；本段记录提交状态，最终结果以独立报告为准。
+
+1488867最终FAILED 1:0，运行9分39秒：四资产8env完成12步并发送closed ACK，但父进程
+只等待2秒实际退出，随后主动terminate，child exit=-15。完整4096/2048容量阶段均未开始，
+没有这两组峰值。小面板采样PSS峰7916786688 bytes、GPU峰1796MiB，不含learner，不能
+外推全量卡数；退出失败证据保存在isolation_02/collection/report.json。原训练1488620未动。
+
+source_06把ACK后的实际进程退出等待单独扩为30–180秒（32资产pack为79秒），仍须
+closed ACK及exit code 0，不忽略强杀。若退出超过10秒，child输出线程栈；超时强杀前
+另记PID、ACK状态、等待时长、Linux status/wchan，最终日志保存每个child的退出码。
+只调整退出阶段，未改物理、数据或模型计算。57项相关CPU检查通过，最终18项退出回归
+再次通过，其中真实spawn子进程ACK后等待3秒再exit 0，验证不再被旧2秒窗口误杀。
+真实GPU退出修复仍需独立预检通过，才能继续全量容量结论。
