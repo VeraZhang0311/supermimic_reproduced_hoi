@@ -163,6 +163,11 @@ def run_collection(specs, config, *, steps, output, parity):
                 try:
                     if workers is not None:
                         workers.close()
+                        if config.get("audit_isolation"):
+                            audits = [json.loads(path.read_text()) for path in sorted((output / "workers").glob("isolation_*.json"))]
+                            report["isolation_audits"] = audits
+                            if len(audits) != report["processes"] or not all(a["passed"] and a["checks"] for a in audits):
+                                raise RuntimeError("native noninterference audit did not finish successfully")
                 except BaseException as exc:
                     report["shutdown_error"] = traceback.format_exc()
                     if failure is None:
@@ -191,7 +196,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bundle", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--mode", choices=("parity", "capacity"), required=True)
+    parser.add_argument("--mode", choices=("parity", "capacity", "smoke"), required=True)
     parser.add_argument("--asset-ids", type=int, nargs="+", default=[0, 59, 209, 266])
     parser.add_argument("--parity-envs-per-asset", type=int, default=8)
     parser.add_argument("--num-envs", type=int, choices=(2048, 4096), default=4096)
@@ -199,8 +204,11 @@ def main(argv=None):
     parser.add_argument("--collector-devices", nargs="+", default=["cuda:0"])
     parser.add_argument("--worker-startup-concurrency", type=int, default=1)
     parser.add_argument("--steps", type=int, default=64)
+    parser.add_argument("--audit-isolation", action="store_true", help="Diagnostic-only exact checks that inactive native buffers/RNG stay unchanged")
     parser.add_argument("--robot-mjcf")
     args = parser.parse_args(argv)
+    if args.audit_isolation and (args.mode == "capacity" or args.assets_per_process < 2):
+        parser.error("isolation audit is only for a multi-asset smoke/parity panel")
     args.output.mkdir(parents=True, exist_ok=False)
     report = {"mode": args.mode, "optimizer_steps": 0, "formal_training_started": False, "passed": False}
     try:
@@ -213,17 +221,18 @@ def main(argv=None):
             raise ValueError("collector resource experiment requires the complete training bundle")
         report.update(source=source_identity(), data_identity=bundle_identity(bundle),
                       requested_envs=args.num_envs, requested_steps=args.steps,
-                      scope="parity panel only" if args.mode == "parity" else "all training assets; collector only")
+                      scope="small diagnostic panel only" if args.mode in ("parity", "smoke") else "all training assets; collector only")
         specs = specs_from_header(bundle, args.num_envs)
         print(json.dumps({"phase": "allocation_ready", "groups": len(specs)}), flush=True)
         config = {"bundle": str(args.bundle), "physics": PhysicsSettings(hand_collision=True, self_collision=True).__dict__,
             "seed": 0, "device": "cuda:0", "gamma": .99, "launcher_args": [], "robot_mjcf": args.robot_mjcf,
             "collector_devices": args.collector_devices, "worker_startup_concurrency": args.worker_startup_concurrency,
-            "assets_per_process": args.assets_per_process}
-        if args.mode == "parity":
+            "assets_per_process": args.assets_per_process, "audit_isolation": args.audit_isolation}
+        if args.mode in ("parity", "smoke"):
             specs = [replace(s, num_envs=args.parity_envs_per_asset) for s in specs if s.asset_id in args.asset_ids]
             if {s.asset_id for s in specs} != set(args.asset_ids):
-                raise ValueError("parity panel asset missing from complete train bundle")
+                raise ValueError("diagnostic panel asset missing from complete train bundle")
+        if args.mode == "parity":
             first, baseline = run_collection(specs, {**config, "assets_per_process": 1}, steps=args.steps,
                                                output=args.output / "baseline", parity=True)
             report["baseline"] = baseline
@@ -243,7 +252,7 @@ def main(argv=None):
                           packed_exact=True, passed=True)
         else:
             _, measured = run_collection(specs, config, steps=args.steps, output=args.output / "collection", parity=False)
-            report.update(collection=measured, passed=True, scope="all training assets; collector only, no learner graph")
+            report.update(collection=measured, passed=True, scope=("small panel integration/isolation only" if args.mode == "smoke" else "all training assets; collector only, no learner graph"))
     except BaseException:
         report["error"] = traceback.format_exc()
         raise

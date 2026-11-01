@@ -500,3 +500,25 @@ CPU最终完整回归536项：534通过、2项环境限制跳过；历史边界6
 /mnt/projects/ll/tianzizh/hoi_packed_collectors_20261101_01，source_02/parity_02。
 旧诊断1488637因父进程重复全量CPU加载被新版替代并主动停止，回执保留；不是训练取消。
 原训练1488620保留。当前尚未得到packed数值对齐及完整273组容量结论，不据此减少原作业资源。
+
+
+GPU集成smoke1488653已COMPLETED 0:0：asset266（无桌）和asset0（双桌）各2env，
+同一个进程完成12步、显式reset和整池shutdown；context/model/state/solver对象身份独立，
+原物理与确定性配置未改。采集GPU采样峰948MiB、含父进程PSS峰6.44GiB，仅是两资产样本。
+
+生产模式A/A对照1488639未达到逐位一致，尚未运行A/B：初态/动作/xi完全相同，但旧架构
+两次运行的asset209首步物体位置相差0.379mm、角速度0.356rad/s；64步内有接触标签差异，
+asset266末段发生一次高度终止分歧。native资产/几何/质量/摩擦读回证据相同，但没有完整
+solver隐状态证据来归因。当前Newton模式是not_guaranteed；接触/约束分配中存在atomic
+操作，不能因此宣称本次差异已被完全解释，也不以删除字段/放宽阈值判通过。
+
+新增显式--audit-isolation小面板诊断：构建、step或reset一个asset前后，对其他未激活asset
+的真实Newton/MJW数组（含contact/efc）、episode/bin状态及保存的RNG做原始字节SHA；
+要求完全不变，保留NaN payload，不用对象id代替内容证据。仅smoke/parity小面板开启，
+正式train/resource默认关闭，物理参数、确定性模式和接触/终止阈值均不改变。
+
+全273资产4096/2048容量作业1488771已提交到已通过native物理验收的dj-a40-0（实际A10），
+3GPU/30CPU/96GiB，source_03；仅执行资源采集与完整batch反传，0optimizer，不能凭其
+容量通过就替换原teacher训练。A/A及隔离验收边界与容量测量分开记录。
+
+非干扰诊断实现后的完整CPU回归545项：543通过、2项环境限制跳过。真实缓冲区隔离GPU验收待完成；CPU替身测试不冒充物理证据。

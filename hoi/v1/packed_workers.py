@@ -20,6 +20,7 @@ from .workers import (_cat, _cpu, _snapshot, collector_device_list, geometry_gro
 
 def _packed_main(connection, specs, config):
     slots = None
+    audit = audit_path = None
     try:
         import argparse
         import gc
@@ -46,9 +47,43 @@ def _packed_main(connection, specs, config):
         cfg = make_hoi_sim(device, args)
         records, reports, snapshots = [], [], []
         shared_shapes = None
+        auditing = bool(config.get("audit_isolation", False))
+        if auditing:
+            if not 2 <= len(specs) <= 4:
+                raise ValueError("native isolation audit requires two to four assets per process")
+            from .native_isolation import capture_native_fingerprint, assert_native_unchanged
+            audit_path = Path(config["output"]) / f"isolation_{specs[0].asset_id:04d}.json"
+            audit_path.parent.mkdir(parents=True, exist_ok=True)
+            audit = {"schema": "hoi_packed_native_noninterference_v1", "checks": [], "passed": False,
+                     "physics_configuration_changed": False, "optimizer_steps": 0}
+            with audit_path.open("x") as stream:
+                json.dump(audit, stream, indent=2)
+
+        def capture_inactive(active_id):
+            if not auditing:
+                return {}
+            result = {}
+            for other_spec, other_slot, other_rng, other_env, _ in records:
+                if other_spec.asset_id != active_id:
+                    with other_slot.activate():
+                        result[other_spec.asset_id] = capture_native_fingerprint(other_env, other_rng)
+            return result
+
+        def verify_inactive(before, active_id, operation):
+            if not auditing:
+                return
+            after = capture_inactive(active_id)
+            for asset_id, previous in before.items():
+                count = assert_native_unchanged(previous, after[asset_id],
+                    label=f"{operation} asset {active_id} must not alter inactive asset {asset_id}")
+                audit["checks"].append({"operation": operation, "active_asset": active_id,
+                                       "inactive_asset": asset_id, "comparison": count})
+            audit_path.write_text(json.dumps(audit, indent=2))
+
         with launch_simulation(cfg, args), torch.no_grad():
             slots = SimulationSlots(cfg)
             for spec in specs:
+                inactive = capture_inactive(spec.asset_id)
                 rng = AssetRNG(asset_seed(config.get("seed", 0), spec.asset_id), device)
                 output = Path(config["output"]) / f"worker_{spec.asset_id:04d}"
                 output.mkdir(parents=True, exist_ok=False)
@@ -84,6 +119,7 @@ def _packed_main(connection, specs, config):
                             "pid": os.getpid(), "slot_runtime": slots.runtime_report}
                 report["slot_identity"] = slot.identity_report
                 (output / "native.json").write_text(json.dumps(report, indent=2) + "\n")
+                verify_inactive(inactive, spec.asset_id, "construct")
                 records.append((spec, slot, rng, env, bank))
                 reports.append(report)
                 snapshots.append(snapshot)
@@ -100,16 +136,19 @@ def _packed_main(connection, specs, config):
                 if message[0] == "step":
                     actions = message[1].split([s.num_envs for s in specs])
                     for (spec, slot, rng, env, bank), action in zip(records, actions):
+                        inactive = capture_inactive(spec.asset_id)
                         with slot.activate(), rng.activate():
                             tr = env.step(action.to(device=device, dtype=torch.float32))
                             if hasattr(bank, "global_frame_index"):
                                 tr["f"] = bank.global_frame_index[tr["f"]]
                             transitions.append(_cpu(tr))
                             snapshots.append(_cpu(_snapshot(env)))
+                        verify_inactive(inactive, spec.asset_id, "step")
                     connection.send(("step", _cat(transitions, "cpu"), _cat(snapshots, "cpu")))
                 elif message[0] == "reset":
                     pieces = message[1].split([s.num_envs for s in specs])
                     for (spec, slot, rng, env, bank), global_f in zip(records, pieces):
+                        inactive = capture_inactive(spec.asset_id)
                         with slot.activate(), rng.activate():
                             global_f = global_f.to(device=device, dtype=torch.long)
                             mapping = bank.global_frame_index
@@ -118,6 +157,7 @@ def _packed_main(connection, specs, config):
                                 raise ValueError("reset frame does not belong to this packed asset")
                             env.reset(torch.arange(spec.num_envs, device=device), frames)
                             snapshots.append(_cpu(_snapshot(env)))
+                        verify_inactive(inactive, spec.asset_id, "reset")
                     connection.send(("reset", _cat(snapshots, "cpu")))
                 else:
                     raise ValueError(f"Unknown packed worker command {message[0]}")
@@ -126,7 +166,13 @@ def _packed_main(connection, specs, config):
                     env.close()
             slots.close()
             slots = None
+            if auditing:
+                audit["passed"] = True
+                audit_path.write_text(json.dumps(audit, indent=2))
     except BaseException:
+        if audit is not None:
+            audit["error"] = traceback.format_exc()
+            audit_path.write_text(json.dumps(audit, indent=2))
         try:
             connection.send(("error", traceback.format_exc()))
         except (OSError, EOFError):
