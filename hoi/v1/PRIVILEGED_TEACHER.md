@@ -326,10 +326,18 @@ canonical字节哈希、文件/物理/repair/split等所有校验保持不变，
 完整GPU结果仍待收集；上述CPU结果不替代原生物理通过证据。
 
 source10的完整原生验收计划已生成并通过CPU规划检查（作业1486683，COMPLETED 0:0），
-`full_native_batch_02/plan.json`覆盖273个train与106个protected_eval资产任务，共379项。
-首批8项真实GPU验收已提交为数组1486694，最多4卡并行，每项4CPU/32GiB、2小时上限；
-当前仍在运行或排队，尚未完成全量GPU验收。每项保持8环境、64控制步、31个pair探针，
-并检查CUDA网络输入、真实保存状态、渲染及场景reset合同。提交成功或CPU规划通过均不等于
-原生物理通过；剩余任务须核验实际成功回执后另建调度，不能重复运行旧的待提交脚本。
-最新计划、首批选择和提交回执保存在ignored `data/curated_contact16_20261031/native_acceptance/`，
-恢复入口为其中的 `operation_status.json` 与 `shutdown_recovery_20261031.json`。未启动训练。
+full_native_batch_02/plan.json覆盖273个train与106个protected_eval资产任务，共379项。
+首批8项真实GPU验收（数组1486694）全部COMPLETED 0:0，原生成功回执齐全。
+独立复核64个保存环境、2446个片段和7338个reset采样点：桌面位姿/速度误差均为0，
+额外物理步数为0，scene26复算最大误差2.384e-7；8张真实env0图已查看。
+这些结果只覆盖首批8个分区/资产任务，不能据此宣布全379项通过或完成tracking评估。
+
+CPU作业1486786严格重验首批8项成功回执后生成剩余371项新调度；
+GPU数组1486788正在执行，93个槽位、每槽最多4项、最多4卡并发，每槽4CPU/32GiB、
+2小时上限。每项仍保持8环境、64控制步、31个pair探针、CUDA输入、保存状态、
+渲染及terminal scene reset检查。成功任务不重复执行；最终仍须全量收集和实际图像QA。
+单片段对照确认一处carry双桌重叠来自原始发布坐标；soccer地下桌的presence不能当作
+屏幕可见双桌覆盖。来源特殊外形核对和图像范围说明保存在独立QA回执中。
+
+最新计划、提交、清理和QA回执保存在ignored data/curated_contact16_20261031/native_acceptance/，
+恢复入口为其中的operation_status.json与shutdown_recovery_20261031.json。未启动训练。
