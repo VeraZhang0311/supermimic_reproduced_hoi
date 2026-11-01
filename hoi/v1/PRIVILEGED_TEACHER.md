@@ -352,3 +352,18 @@ CPU汇总1486825与保存状态渲染1486831均COMPLETED 0:0。两个分区的�
 QA工具的ULTRA类别预期8是实例/类别计数混用：实际8个资产ID全部存在，
 对应largebox、plasticbox、smallbox、suitcase四类，并非漏验四个资产。
 完整机器回执在ignored native_acceptance/full_native_final_machine_01中。未启动训练。
+
+2026-11-01视觉复核补充：46张原始PNG已逐张查看并核对文件SHA；用户也报告除三处
+询问外其余43张未发现问题。asset257为GRAIL鱼形木椅，asset193为GRAIL球舱椅，
+均属sitting。asset67椅脚周围的不规则薄片已确认存在于来源visible-surface网格，
+并非新增桌面或阴影；其语义未标注，作为来源几何质量问题保留，未擅自清除或无条件放行。
+单视角遮挡仍限制对坐姿/接触的判断；逐图观察和来源网格证据见ignored
+native_acceptance/final_visual_review_01/。机器验收成功不等同于来源资产完全无缺陷。
+
+左右踢球补图数组1488395的train/protected_eval两项均COMPLETED 0:0。
+独立tools/hoi_native_task_visual.py调用冻结source10，按脚部有效正标注选取参考时刻，
+每分区保持8环境、64零动作控制步及原pair/support校准，保存首次真实积分后的状态。
+四张新增图覆盖两个分区的case2_kick_left/case3_kick_right，图像SHA、任务/片段/帧
+身份及零物理/零FK离线渲染均已核对。右踢图中双臂展开、球位于两脚附近，单帧不证明
+完成右向踢球；四张图已供用户复核，尚未收到用户反馈。原379项结果、数据划分和source10
+未变；selector三项针对性测试通过。补图不运行训练，不作为训练策略成功率证据。
