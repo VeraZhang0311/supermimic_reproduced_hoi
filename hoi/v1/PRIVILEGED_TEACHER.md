@@ -521,4 +521,37 @@ solver隐状态证据来归因。当前Newton模式是not_guaranteed；接触/�
 3GPU/30CPU/96GiB，source_03；仅执行资源采集与完整batch反传，0optimizer，不能凭其
 容量通过就替换原teacher训练。A/A及隔离验收边界与容量测量分开记录。
 
-非干扰诊断实现后的完整CPU回归545项：543通过、2项环境限制跳过。真实缓冲区隔离GPU验收待完成；CPU替身测试不冒充物理证据。
+非干扰诊断实现后的完整CPU回归545项：543通过、2项环境限制跳过。
+
+真实缓冲区隔离作业1488820已COMPLETED 0:0（source_04）：asset0/59/209/266各2env，
+共一个collector、12步。162次非激活资产前后比较全部逐字节不变：构造6次、reset12次、
+step144次，包含实际Newton/MJW contact/efc、episode/bin与保存的RNG；原物理和确定性
+配置不变。报告isolation_01/collection/workers/isolation_0000.json于整池shutdown后通过。
+这个开启诊断的小面板GPU采样峰1826MiB、含父进程PSS峰7.25GiB，不能代表全量资源
+或无诊断开销的吞吐，也不能替代尚未获得的生产轨迹A/B等价结论。
+
+复核发现source_03的resource_probe最终GPU汇总调用参数顺序错误，会在写report前报错。
+因此主动停止零优化容量诊断1488771，保留冻结源码、24份已导出native报告及两个已完成
+的模型/replay预留阶段；capacity_submission_01/superseded.json记录原因。该次没有完成
+全量采集/反传，不宣称通过或给出完整峰值。原训练1488620保持排队、未取消或修改。
+
+报告接线修复为显式关键字参数，分别检查所有collector与learner至少有一次有效非负
+显存数值；N/A或只有PID/UUID不再算测量完整。GPU/主机采样缺失、关闭或汇总异常均
+使passed=false，仍保存报告，保留最初计算异常。packed进程正常退出须在native环境、
+slots与launcher完全退出后发送closed ACK，并以exit code 0结束；父进程排空在途消息。
+失败启动会尝试回收全部已创建进程，terminate后仍存活则kill；最后仍活的handle保留并
+报告，清理错误不能替换最初错误。正常ACK等待为整个group共享的有界期限，32资产pack
+为79秒。默认单资产WorkerGroup以及物理、RNG与实际step计算未改。
+
+容量实验完整分配1000×N replay、所有reference与native资产、每参数两份Adam moment
+等量预留，并测量完整尺寸的WM/actor/critic反传。只收集12个真实tick、测一个WM batch
+和一个critic minibatch，不覆盖长期接触峰值、连续训练稳态、真实Adam.step临时内存、
+填满replay后的fallback扫描、checkpoint及评估并发。主机PSS和进程GPU占用每秒采样是
+峰值下界；后续部署须留余量，不能按测得数字贴边配置或声称已完成长期训练容量验收。
+
+上述报告/退出路径修复后完整CPU回归563项：561通过、2项环境限制跳过，新增提交脚本
+bash-n通过。重测作业1488867已启动，仍为dj-a40-0上3张A10/30CPU/96GiB，冻结source_05
+（归档SHA256 75346ebe0b3dda4246937c869ed82f4f8d39313df74e34d340c22cb12b6dd348）。
+先在isolation_02复核真实关闭ACK及四资产逐字节隔离，成功后依次测完整273资产的
+full_capacity_4096_02、full_capacity_2048_02，汇总为full_capacity_summary_02.json。
+所有阶段0optimizer，不接正式train；本段记录提交状态，最终结果以独立报告为准。

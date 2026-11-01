@@ -1,15 +1,17 @@
 """Capacity checks must preserve production sizes and use real aligned inputs."""
 from dataclasses import replace
+from contextlib import ExitStack
 from types import SimpleNamespace
 from pathlib import Path
 import json
+import os
 import tempfile
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 import unittest
 
 import torch
 
-from hoi.v1.resource_probe import stratified_real_starts, read_probe_config, build_probe_models, initialize_probe_models, ProbeConfig, deployment_comparison, validate_real_start_mix, full_active_wm_windows, summarize_gpu_samples, initialize_cuda_memory_counters
+from hoi.v1.resource_probe import stratified_real_starts, read_probe_config, build_probe_models, initialize_probe_models, ProbeConfig, deployment_comparison, validate_real_start_mix, full_active_wm_windows, summarize_gpu_samples, initialize_cuda_memory_counters, finalize_resource_report
 
 
 def fixture():
@@ -318,6 +320,127 @@ class ResourceProbeTest(unittest.TestCase):
         self.assertEqual(report["external_process_sampled_peak_MiB_by_gpu_uuid"], {"GPU-owned": 100})
         self.assertEqual(len(report["samples"][0]["assigned_gpus"]), 1)
         self.assertTrue(report["has_other_job_processes_on_assigned_device"])
+
+    def test_full_resource_report_requires_learner_and_collector_gpu_samples(self):
+        for rows, host_complete, expected in (
+            ([["10", "1000", "GPU-A"], ["11", "500", "GPU-A"]], True, True),
+            ([["11", "500", "GPU-A"]], True, False),
+            ([["10", "1000", "GPU-A"]], True, False),
+            ([["10", "1000", "GPU-A"], ["11", "500", "GPU-A"]], False, False),
+        ):
+            with self.subTest(rows=rows, host_complete=host_complete):
+                report = {"passed": True, "process_ids": [10, 11]}
+                host = MagicMock()
+                host.summary.return_value = {"measurement_complete": host_complete}
+                finalize_resource_report(report, workers=None,
+                    sampler=SimpleNamespace(samples=[{"elapsed_seconds": 1., "processes": rows}]),
+                    host_memory=host, collector_devices=["cuda:0"], parent_pid=10)
+                self.assertEqual(report["passed"], expected)
+                self.assertEqual(report["resource_measurement_complete"], expected)
+                self.assertEqual(report["nvidia_smi"]["collector_pids"], [11])
+                self.assertTrue(report["nvidia_smi"]["learner_gpu_required"])
+
+    def test_finalize_resource_report_retains_all_cleanup_failures(self):
+        worker, host = MagicMock(), MagicMock()
+        worker.close.side_effect = OSError("close failure")
+        host.summary.side_effect = ValueError("host summary failure")
+        report = {"passed": True, "process_ids": [10, 11], "error": {"message": "original"}}
+        with patch("hoi.v1.packed_probe.summarize_collector_gpu_samples", side_effect=ValueError("gpu summary failure")) as summarize:
+            finalize_resource_report(report, workers=worker, sampler=SimpleNamespace(samples=[]),
+                                     host_memory=host, collector_devices=["cuda:0"], parent_pid=10)
+        summarize.assert_called_once_with(samples=[], collector_pids=[11], collector_devices=["cuda:0"], parent_pid=10)
+        self.assertEqual(report["error"]["message"], "original")
+        self.assertFalse(report["passed"])
+        self.assertEqual([entry["operation"] for entry in report["finalization_errors"]],
+                         ["workers.close", "summarize_gpu_samples", "summarize_host_memory"])
+
+    def test_learner_requires_its_own_valid_memory_measurement(self):
+        for value, expected in (("N/A", False), ("nan", False), ("inf", False),
+                                ("-1", False), ("0", True), ("1024", True)):
+            with self.subTest(memory=value):
+                report = {"passed": True, "process_ids": [10, 11]}
+                host = MagicMock(); host.summary.return_value = {"measurement_complete": True}
+                finalize_resource_report(report, workers=None,
+                    sampler=SimpleNamespace(samples=[{"elapsed_seconds": 1., "processes": [
+                        ["10", value, "GPU-A"], ["11", "500", "GPU-B"]]}]),
+                    host_memory=host, collector_devices=["cuda:1"], parent_pid=10)
+                self.assertTrue(report["nvidia_smi"]["learner_gpu_observed"])
+                self.assertEqual(report["nvidia_smi"]["learner_memory_observed"], expected)
+                self.assertEqual(report["passed"], expected)
+
+    def test_learner_later_numeric_sample_recovers_unavailable_memory(self):
+        report = {"passed": True, "process_ids": [10, 11]}
+        host = MagicMock(); host.summary.return_value = {"measurement_complete": True}
+        samples = [{"elapsed_seconds": 1., "processes": [["10", "N/A", "GPU-A"], ["11", "500", "GPU-B"]]},
+                   {"elapsed_seconds": 2., "processes": [["10", "1024", "GPU-A"], ["11", "600", "GPU-B"]]}]
+        finalize_resource_report(report, workers=None, sampler=SimpleNamespace(samples=samples),
+                                 host_memory=host, collector_devices=["cuda:1"], parent_pid=10)
+        self.assertTrue(report["passed"])
+        self.assertEqual(report["nvidia_smi"]["owned_process_sampled_peak_MiB_by_gpu_uuid"],
+                         {"GPU-A": 1024, "GPU-B": 600})
+
+    def test_main_finally_writes_report_and_preserves_collection_error_despite_cleanup_errors(self):
+        """Exercise main's actual finally after a constructed worker fails."""
+        from hoi.v1.resource_probe import main
+        from hoi.v1.packed_probe import summarize_collector_gpu_samples
+        worker, learner, host, gpu = (MagicMock() for _ in range(4))
+        child_pid, parent_pid = 999999, os.getpid()
+        worker._processes = [SimpleNamespace(pid=child_pid)]
+        worker.native_reports = []
+        worker.close.side_effect = OSError("secondary close failure")
+        original = RuntimeError("primary collection failure")
+        learner.action.side_effect = original
+        host.summary.return_value = {"measurement_complete": True}
+        gpu.samples = [{"elapsed_seconds": 1., "processes": [
+            [str(parent_pid), "1000", "GPU-fixture"], [str(child_pid), "500", "GPU-fixture"]]}]
+        replay = SimpleNamespace(data={"fixture": torch.zeros(1)})
+        real_tensor = torch.tensor
+
+        def cpu_tensor(*args, **kwargs):
+            return real_tensor(*args, **{**kwargs, "device": "cpu"})
+
+        for summary_fails in (False, True):
+            with self.subTest(summary_fails=summary_fails), tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
+                output = Path(directory) / "probe"
+                replacements = {
+                    "hoi.v1.evaluate._read_bundle_header": {"partition": "train", "scope": {"is_subset": False}},
+                    "hoi.v1.config.bundle_identity": {}, "hoi.v1.config.source_identity": {},
+                    "hoi.v1.resource_probe._GpuSampler": gpu,
+                    "hoi.v1.host_memory.HostMemorySampler": host,
+                    "hoi.v1.resource_probe.initialize_cuda_memory_counters": None,
+                    "supermimic.kinematics.G1Kinematics": MagicMock(),
+                    "hoi.v1.prepare.load_bundle": (MagicMock(), MagicMock(), {}),
+                    "hoi.v1.mdp.HOIMDP": MagicMock(),
+                    "hoi.v1.resource_probe.build_probe_models": [],
+                    "hoi.v1.buffer.ReplayBuffer": replay,
+                    "hoi.v1.learner.Learner": learner,
+                    "hoi.v1.workers.allocate_workers": [SimpleNamespace(asset_id=0)],
+                    "hoi.v1.workers.resource_preflight": {},
+                    "hoi.v1.workers.WorkerGroup": worker,
+                    "torch.cuda.is_available": True, "torch.cuda.mem_get_info": (1000, 2000),
+                    "torch.cuda.synchronize": None, "torch.cuda.memory_allocated": 0,
+                    "torch.cuda.memory_reserved": 0, "torch.cuda.max_memory_allocated": 0,
+                    "torch.cuda.max_memory_reserved": 0, "torch.manual_seed": None,
+                    "torch.set_num_threads": None,
+                }
+                for target, value in replacements.items():
+                    stack.enter_context(patch(target, return_value=value))
+                stack.enter_context(patch("torch.tensor", side_effect=cpu_tensor))
+                stack.enter_context(patch("supermimic.networks.AMP_DTYPE"))
+                summarize = stack.enter_context(patch("hoi.v1.packed_probe.summarize_collector_gpu_samples",
+                    side_effect=ValueError("secondary gpu summary failure") if summary_fails else summarize_collector_gpu_samples))
+                with self.assertRaises(RuntimeError) as caught:
+                    main(["--bundle", "fixture.json", "--output", str(output), "--from-scratch",
+                          "--expected-groups", "1", "--device", "cuda:0"])
+                self.assertIs(caught.exception, original)
+                summarize.assert_called_once_with(samples=gpu.samples, collector_pids=[child_pid],
+                                                  collector_devices=["cuda:0"], parent_pid=parent_pid)
+                saved = json.loads((output / "report.json").read_text(encoding="utf-8"))
+                self.assertFalse(saved["passed"])
+                self.assertEqual(saved["error"]["message"], "primary collection failure")
+                operations = [entry["operation"] for entry in saved["finalization_errors"]]
+                self.assertIn("workers.close", operations)
+                self.assertEqual("summarize_gpu_samples" in operations, summary_fails)
 
 
 if __name__ == "__main__":

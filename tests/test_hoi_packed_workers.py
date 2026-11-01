@@ -1,12 +1,18 @@
 """CPU packing/IPC contracts; fake children never initialize a simulator."""
 from dataclasses import asdict
+import json
+from pathlib import Path
 from types import SimpleNamespace
+import tempfile
+import threading
+import time
 import unittest
 from unittest.mock import patch
 
 import torch
 
-from hoi.v1.packed_workers import PackedWorkerGroup
+from hoi.v1.packed_workers import (PackedWorkerGroup, CollectorShutdownError, _add_failure_note,
+                                   _record_audit_failure, shutdown_ack_budget)
 from hoi.v1.workers import WorkerGroup, WorkerSpec, _cat, pack_worker_specs, resource_preflight
 
 
@@ -25,6 +31,8 @@ class FakePipe:
 
     def send(self, message):
         self.sent.append(message)
+        if message == ("close",):
+            self.messages.append(("closed",))
 
     def poll(self, timeout):
         self.polls.append(timeout)
@@ -49,9 +57,34 @@ class FakeContext:
     def Process(self, *, target, args, name):
         index = len(self.jobs)
         self.jobs.append((target, args, name))
-        return SimpleNamespace(start=lambda: self.events.append(("start", index)),
-                               join=lambda **kw: self.events.append(("join", index)),
-                               is_alive=lambda: False)
+        return FakeProcess(index, self.events)
+
+
+class FakeProcess:
+    def __init__(self, index, events):
+        self.index, self.events = index, events
+        self.pid = self.exitcode = None
+        self.alive = False
+        self.ignore_terminate = self.ignore_kill = self.ignore_join = False
+        self.join_error = None
+    def start(self):
+        self.pid, self.alive = 1000 + self.index, True
+        self.events.append(("start", self.index))
+    def join(self, **kwargs):
+        self.events.append(("join", self.index))
+        if self.join_error:
+            raise self.join_error
+        if self.alive and not self.ignore_join:
+            self.alive, self.exitcode = False, 0
+    def is_alive(self): return self.alive
+    def terminate(self):
+        self.events.append(("terminate", self.index))
+        if not self.ignore_terminate:
+            self.alive, self.exitcode = False, -15
+    def kill(self):
+        self.events.append(("kill", self.index))
+        if not self.ignore_kill:
+            self.alive, self.exitcode = False, -9
 
 
 def fake_receive(context, *, optional_all=False):
@@ -198,9 +231,146 @@ class PackedWorkerTests(unittest.TestCase):
             with self.assertRaisesRegex(TimeoutError, "fixture startup timeout"):
                 WorkerGroup(specs(), {"assets_per_process": 2, "worker_startup_concurrency": 2}, device="cpu")
         self.assertEqual(len(context.jobs), 2)
-        self.assertTrue(all(p.closed and p.sent[-1] == ("close",) for p in context.parents))
+        self.assertTrue(all(p.closed and not p.sent for p in context.parents))
         self.assertIn(("join", 0), context.events)
         self.assertIn(("join", 1), context.events)
+
+    def shutdown_fixture(self, count=2):
+        group = object.__new__(PackedWorkerGroup)
+        events = []
+        processes = [FakeProcess(i, events) for i in range(count)]
+        for process in processes:
+            process.start()
+        group._processes = processes.copy()
+        group._pipes = [FakePipe() for _ in processes]
+        group._child_pipes = []
+        group.shutdown_ack_timeout = .03
+        group.shutdown_join_timeout = group.shutdown_terminate_timeout = group.shutdown_kill_timeout = .01
+        return group, processes, events
+
+    def test_normal_shutdown_drains_pending_step_then_requires_ack_and_zero_exit(self):
+        group, processes, events = self.shutdown_fixture()
+        group._pipes[0].messages.append(("step", {"f": torch.tensor([1])}, {}))
+        pipes = group._pipes.copy()
+        group.close()
+        self.assertTrue(all(pipe.closed and not pipe.messages for pipe in pipes))
+        self.assertTrue(all(process.exitcode == 0 for process in processes))
+        self.assertFalse(any(event[0] in ("kill", "terminate") for event in events))
+        self.assertEqual(group._processes, [])
+
+    def test_remote_shutdown_error_is_reported_and_other_processes_are_joined(self):
+        group, processes, events = self.shutdown_fixture()
+        group._pipes[0].messages.append(("error", "ORIGINAL native slot shutdown error"))
+        pipes = group._pipes.copy()
+        with self.assertRaisesRegex(CollectorShutdownError, "ORIGINAL native slot shutdown error") as caught:
+            group.close()
+        self.assertEqual(caught.exception.details[0]["worker"], 0)
+        self.assertIn(("join", 1), events)
+        self.assertTrue(all(pipe.closed for pipe in pipes))
+        self.assertEqual(group._processes, [])
+
+    def test_missing_ack_and_late_nonzero_exit_cannot_pass(self):
+        group, processes, _ = self.shutdown_fixture()
+        group._pipes[0].send = lambda message: None
+        processes[1].alive, processes[1].exitcode = False, 1
+        with self.assertRaises(CollectorShutdownError) as caught:
+            group.close()
+        self.assertEqual({error["operation"] for error in caught.exception.details}, {"closed_ack", "exitcode"})
+        self.assertTrue(all(not process.alive for process in processes))
+
+    def test_force_escalates_to_kill_and_retains_any_survivor_handles(self):
+        group, processes, events = self.shutdown_fixture()
+        for process in processes:
+            process.ignore_join = process.ignore_terminate = True
+        processes[1].ignore_kill = True
+        with self.assertRaises(CollectorShutdownError) as caught:
+            group.close(force=True)
+        self.assertFalse(processes[0].alive)
+        self.assertTrue(processes[1].alive)
+        self.assertEqual(group._processes, [processes[1]])
+        self.assertEqual(caught.exception.surviving_pids, [1001])
+        self.assertIn(("kill", 0), events)
+        self.assertIn(("kill", 1), events)
+        processes[1].ignore_kill = False
+        group.close(force=True)
+        self.assertEqual(group._processes, [])
+
+    def test_startup_original_error_survives_cleanup_failure_and_every_peer_is_attempted(self):
+        context = FakeContext()
+        created = []
+        original_factory = context.Process
+        def process_factory(**kwargs):
+            process = original_factory(**kwargs)
+            if not created:
+                process.join_error = OSError("secondary cleanup join error")
+            created.append(process)
+            return process
+        context.Process = process_factory
+        with patch("hoi.v1.packed_workers.mp.get_context", return_value=context), \
+             patch.object(PackedWorkerGroup, "_receive", side_effect=TimeoutError("ORIGINAL startup timeout")):
+            with self.assertRaisesRegex(TimeoutError, "ORIGINAL startup timeout") as caught:
+                WorkerGroup(specs(), {"assets_per_process": 2, "worker_startup_concurrency": 2}, device="cpu")
+        self.assertTrue(any("secondary cleanup join error" in note for note in caught.exception.__notes__))
+        self.assertTrue(caught.exception.collector_cleanup_errors)
+        self.assertIn(("terminate", 1), context.events)
+        self.assertIn(("join", 1), context.events)
+        self.assertTrue(all(not process.alive for process in created))
+        self.assertTrue(all(pipe.closed for pipe in context.parents))
+
+    def test_started_process_is_registered_before_child_pipe_close_can_fail(self):
+        context = FakeContext()
+        original_pipe = context.Pipe
+        def pipe_factory():
+            parent, child = original_pipe()
+            def fail(): raise OSError("child pipe close failure")
+            child.close = fail
+            return parent, child
+        context.Pipe = pipe_factory
+        with patch("hoi.v1.packed_workers.mp.get_context", return_value=context):
+            with self.assertRaisesRegex(OSError, "child pipe close failure") as caught:
+                WorkerGroup(specs(), {"assets_per_process": 2}, device="cpu")
+        self.assertIn(("terminate", 0), context.events)
+        self.assertIn(("join", 0), context.events)
+        self.assertTrue(context.parents[0].closed)
+        self.assertIn("cleanup also failed", caught.exception.__notes__[0])
+
+    def test_blocked_pipe_io_is_bounded_and_peers_are_still_cleaned(self):
+        group, processes, events = self.shutdown_fixture()
+        release = threading.Event()
+        group._pipes[0].send = lambda message: release.wait(10.)
+        started = time.monotonic()
+        try:
+            with self.assertRaisesRegex(CollectorShutdownError, "IPC timed out"):
+                group.close()
+        finally:
+            release.set()
+        self.assertLess(time.monotonic() - started, 2.)
+        self.assertTrue(all(not process.alive for process in processes))
+        self.assertIn(("join", 1), events)
+
+    def test_failure_note_fallback_never_replaces_error(self):
+        class OldError(Exception):
+            add_note = None
+        original = OldError("root cause")
+        _add_failure_note(original, "cleanup evidence")
+        self.assertEqual(str(original), "root cause")
+        self.assertEqual(original.__notes__, ["cleanup evidence"])
+
+    def test_shutdown_grace_scales_with_largest_pack_and_is_globally_bounded(self):
+        self.assertEqual(shutdown_ack_budget([(1,)]), 30.)
+        self.assertEqual(shutdown_ack_budget([tuple(range(32))] * 9), 79.)
+        self.assertEqual(shutdown_ack_budget([tuple(range(273))]), 180.)
+
+    def test_late_launcher_or_ack_error_invalidates_previously_passed_audit(self):
+        audit = {"passed": True, "checks": [{"unchanged": True}]}
+        original = RuntimeError("late launcher cleanup failure")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "audit.json"
+            _record_audit_failure(audit, path, "ORIGINAL traceback", original)
+            report = json.loads(path.read_text())
+        self.assertFalse(report["passed"])
+        self.assertEqual(report["error"], "ORIGINAL traceback")
+        self.assertEqual(report["checks"], [{"unchanged": True}])
 
 
 if __name__ == "__main__":

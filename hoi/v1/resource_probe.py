@@ -278,6 +278,63 @@ class _GpuSampler:
         self.thread.join(timeout=11)
 
 
+def finalize_resource_report(report, *, workers, sampler, host_memory, collector_devices, parent_pid):
+    """Keep collection failures primary while completing the resource evidence.
+
+    The caller writes the resulting report even if shutdown or a summarizer
+    fails. A learner CUDA allocation and every collector must be observed.
+    """
+    errors = report.setdefault("finalization_errors", [])
+
+    def record_error(operation, exc):
+        errors.append({"operation": operation, "type": type(exc).__name__,
+                       "message": str(exc), "traceback": traceback.format_exc()})
+
+    try:
+        if workers is not None:
+            workers.close()
+    except BaseException as exc:
+        record_error("workers.close", exc)
+
+    process_ids = report.get("process_ids", [parent_pid])
+    collector_pids = [pid for pid in process_ids if str(pid) != str(parent_pid)]
+    try:
+        from .packed_probe import summarize_collector_gpu_samples, valid_gpu_memory_value
+        report["nvidia_smi"] = summarize_collector_gpu_samples(
+            samples=sampler.samples, collector_pids=collector_pids,
+            collector_devices=collector_devices, parent_pid=parent_pid)
+        learner_seen = any(len(row) == 3 and row[0] == str(parent_pid)
+                           for sample in sampler.samples for row in sample.get("processes", []))
+        learner_measured = any(len(row) == 3 and row[0] == str(parent_pid) and valid_gpu_memory_value(row[1])
+                               for sample in sampler.samples for row in sample.get("processes", []))
+        report["nvidia_smi"]["learner_gpu_required"] = True
+        report["nvidia_smi"]["learner_gpu_observed"] = learner_seen
+        report["nvidia_smi"]["learner_memory_observed"] = learner_measured
+        report["nvidia_smi"]["measurement_complete"] = (
+            report["nvidia_smi"]["measurement_complete"] and learner_measured)
+    except BaseException as exc:
+        record_error("summarize_gpu_samples", exc)
+        report["nvidia_smi"] = {"measurement_complete": False, "learner_gpu_required": True,
+                                "summary_unavailable": True}
+
+    try:
+        report["host_memory"] = host_memory.summary()
+    except BaseException as exc:
+        record_error("summarize_host_memory", exc)
+        report["host_memory"] = {"measurement_complete": False, "summary_unavailable": True}
+
+    report["resource_measurement_complete"] = (
+        report["host_memory"].get("measurement_complete") is True
+        and report["nvidia_smi"].get("measurement_complete") is True)
+    report["passed"] = (report.get("passed") is True and not errors
+                        and report["resource_measurement_complete"])
+    report["memory_measurement"] = {"global_samples_include_separate_simulator_processes": True,
+        "nvidia_smi_interval_seconds": 1., "sampled_peak_is_lower_bound": True,
+        "parent_allocator_peaks_are_exact": True, "adam_two_moment_tensors_reserved_for_every_parameter": True,
+        "torch_mem_get_info_includes_other_processes_on_assigned_gpu": True,
+        "nvidia_smi_uuid_binding": "actual owned parent/worker PID compute-apps GPU UUIDs; unrelated GPUs filtered"}
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bundle", type=Path, required=True)
@@ -507,19 +564,12 @@ def main(argv=None):
         report["error"] = {"type": type(exc).__name__, "message": str(exc), "traceback": traceback.format_exc()}
         raise
     finally:
-        if workers is not None:
-            workers.close()
-        from .packed_probe import summarize_collector_gpu_samples
-        report["nvidia_smi"] = summarize_collector_gpu_samples(
-            sampler.samples, report.get("process_ids", [os.getpid()]), os.getpid(), collector_devices)
-        report["host_memory"] = host_memory.summary()
-        report["memory_measurement"] = {"global_samples_include_separate_simulator_processes": True,
-            "nvidia_smi_interval_seconds": 1., "sampled_peak_is_lower_bound": True,
-            "parent_allocator_peaks_are_exact": True, "adam_two_moment_tensors_reserved_for_every_parameter": True,
-            "torch_mem_get_info_includes_other_processes_on_assigned_gpu": True,
-            "nvidia_smi_uuid_binding": "actual owned parent/worker PID compute-apps GPU UUIDs; unrelated GPUs filtered"}
+        finalize_resource_report(report, workers=workers, sampler=sampler, host_memory=host_memory,
+                                 collector_devices=collector_devices, parent_pid=os.getpid())
         report["elapsed_seconds"] = time.monotonic() - started
         write_json(output / "report.json", report)
+    if not report["passed"]:
+        raise RuntimeError("resource probe cleanup or memory measurement was incomplete; see report.json")
     print(json.dumps({"passed": report["passed"], "report": str(output / "report.json")}, allow_nan=False))
 
 

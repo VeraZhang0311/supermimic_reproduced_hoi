@@ -10,6 +10,8 @@ from dataclasses import asdict
 import json
 import multiprocessing as mp
 from pathlib import Path
+import threading
+import time
 import traceback
 
 import torch
@@ -18,9 +20,31 @@ from .workers import (_cat, _cpu, _snapshot, collector_device_list, geometry_gro
                       isolate_worker_cuda, pack_worker_specs, resource_preflight, startup_concurrency)
 
 
+def _add_failure_note(error, note):
+    """Cleanup evidence must never replace the original failure, even pre-3.11."""
+    try:
+        add_note = getattr(error, "add_note", None)
+        if callable(add_note):
+            add_note(note)
+        else:
+            error.__notes__ = [*getattr(error, "__notes__", ()), note]
+    except BaseException:
+        pass
+
+
+def _record_audit_failure(audit, path, original, error):
+    audit["passed"] = False
+    audit["error"] = original
+    try:
+        path.write_text(json.dumps(audit, indent=2))
+    except BaseException as audit_error:
+        _add_failure_note(error, "Writing isolation failure evidence also failed: " + repr(audit_error))
+
+
 def _packed_main(connection, specs, config):
     slots = None
     audit = audit_path = None
+    failure = None
     try:
         import argparse
         import gc
@@ -169,21 +193,48 @@ def _packed_main(connection, specs, config):
             if auditing:
                 audit["passed"] = True
                 audit_path.write_text(json.dumps(audit, indent=2))
-    except BaseException:
+        # Sent only after native environments, slots, audit, and launcher
+        # context have all successfully finished. Exit code is also checked.
+        connection.send(("closed",))
+    except BaseException as exc:
+        failure = exc
+        original = traceback.format_exc()
         if audit is not None:
-            audit["error"] = traceback.format_exc()
-            audit_path.write_text(json.dumps(audit, indent=2))
+            _record_audit_failure(audit, audit_path, original, exc)
         try:
-            connection.send(("error", traceback.format_exc()))
+            connection.send(("error", original + "\n" + "\n".join(getattr(exc, "__notes__", ()))))
         except (OSError, EOFError):
             pass
+        raise  # Nonzero child exit remains evidence even if its error pipe is unavailable.
     finally:
         if slots is not None:
             try:
                 slots.close()
-            except BaseException:
-                pass  # Original error was already delivered; process owns teardown.
-        connection.close()
+            except BaseException as cleanup_error:
+                if failure is not None:
+                    _add_failure_note(failure, "Native slot cleanup also failed: " + repr(cleanup_error))
+                else:
+                    raise
+        try:
+            connection.close()
+        except OSError as cleanup_error:
+            if failure is not None:
+                _add_failure_note(failure, "Closing worker pipe also failed: " + repr(cleanup_error))
+            else:
+                raise
+
+
+class CollectorShutdownError(RuntimeError):
+    def __init__(self, details, surviving_pids):
+        self.details, self.surviving_pids = details, surviving_pids
+        super().__init__("packed collector shutdown failed: " + json.dumps(
+            {"errors": details, "surviving_pids": surviving_pids}, sort_keys=True))
+
+
+def shutdown_ack_budget(packs):
+    """Whole-group grace for serial native teardown within the largest pack."""
+    maximum = max((len(pack) for pack in packs), default=1)
+    return min(180., max(30., 2 * maximum + 15.))
 
 
 class PackedWorkerGroup:
@@ -193,6 +244,7 @@ class PackedWorkerGroup:
         self.packs = pack_worker_specs(self.specs, config.get("assets_per_process", 1))
         self.N = sum(s.num_envs for s in specs)
         self._processes, self._pipes, self._snapshots, self.native_reports = [], [], [], []
+        self._child_pipes = []
         self.startup_timeout = config.get("startup_timeout", 1800)
         resource_preflight(self.specs, device=device, max_processes=config.get("max_processes"),
             collector_devices=config.get("collector_devices"),
@@ -207,21 +259,30 @@ class PackedWorkerGroup:
                 end = min(first + concurrency, len(self.packs))
                 for i in range(first, end):
                     parent, child = context.Pipe()
+                    self._pipes.append(parent)
+                    self._child_pipes.append(child)
                     process = context.Process(target=_packed_main,
                         args=(child, self.packs[i], {**config, "device": self.worker_devices[i]}),
                         name=f"hoi-assets-{self.packs[i][0].asset_id}-{self.packs[i][-1].asset_id}")
+                    # Register ownership before start/child.close can fail or
+                    # be interrupted, even though construction has not returned.
+                    self._processes.append(process)
                     process.start()
                     child.close()
-                    self._pipes.append(parent)
-                    self._processes.append(process)
+                    self._child_pipes[i] = None
                 for i in range(first, end):
                     message = self._receive(i, timeout=self.startup_timeout, initializing=True)
                     if message[0] != "ready":
                         raise RuntimeError("packed worker did not publish initialized reset")
                     self._snapshots.append(message[1])
                     self.native_reports.extend(message[2])
-        except BaseException:
-            self.close(force=True)
+        except BaseException as exc:
+            try:
+                self.close(force=True)
+            except BaseException as cleanup_error:
+                _add_failure_note(exc, "Collector startup cleanup also failed: " + str(cleanup_error))
+                exc.collector_cleanup_errors = getattr(cleanup_error, "details", [str(cleanup_error)])
+                exc.collector_live_processes = tuple(self._processes)
             raise
 
     def _receive(self, index, *, timeout=None, initializing=False):
@@ -271,6 +332,124 @@ class PackedWorkerGroup:
         return self.snapshot()
 
     def close(self, force=False):
-        # The baseline close implementation only owns pipes/processes.
-        from .workers import WorkerGroup
-        WorkerGroup.close(self, force=force)
+        """Bounded whole-group cleanup with ACK, escalation and survivor evidence.
+
+        Force cleanup is used before construction can return: it does not wait
+        for assets that are still building, and never sends on a blocked pipe.
+        Normal cleanup has one group-wide ACK deadline, then bounded join,
+        terminate and kill phases. All peers are attempted after any failure.
+        """
+        errors = []
+        processes, pipes = list(self._processes), list(self._pipes)
+        # Tests may shorten these bounds; production bounds are for the whole
+        # group, not multiplied by the number of packed processes.
+        ack_timeout = getattr(self, "shutdown_ack_timeout", shutdown_ack_budget(getattr(self, "packs", ())))
+        join_timeout = getattr(self, "shutdown_join_timeout", 2.)
+        terminate_timeout = getattr(self, "shutdown_terminate_timeout", 3.)
+        kill_timeout = getattr(self, "shutdown_kill_timeout", 3.)
+
+        def error(index, operation, exc):
+            process = processes[index] if index < len(processes) else None
+            errors.append({"worker": index, "pid": getattr(process, "pid", None),
+                           "process_name": getattr(process, "name", None),
+                           "operation": operation, "error": str(exc)})
+
+        def alive(index):
+            process = processes[index]
+            if process.pid is None:
+                return False
+            try:
+                return process.is_alive()
+            except BaseException as exc:
+                error(index, "is_alive", exc)
+                return True  # Unknown liveness never permits dropping ownership.
+
+        def joins(indices, timeout, operation):
+            deadline = time.monotonic() + timeout
+            for index in indices:
+                try:
+                    processes[index].join(timeout=max(0., deadline - time.monotonic()))
+                except BaseException as exc:
+                    error(index, operation, exc)
+
+        started = [index for index, process in enumerate(processes) if process.pid is not None]
+        if not force:
+            deadline = time.monotonic() + ack_timeout
+            receivers, ipc_errors = [], {}
+            def request_close(index, pipe):
+                try:
+                    pipe.send(("close",))
+                    while True:
+                        remaining = max(0., deadline - time.monotonic())
+                        if not pipe.poll(remaining):
+                            raise TimeoutError("no closed ACK before the group deadline")
+                        message = pipe.recv()
+                        if message[0] == "error":
+                            raise RuntimeError("remote shutdown error:\n" + str(message[1]))
+                        if message == ("closed",):
+                            return
+                        if message[0] not in ("step", "reset", "ready", "asset_ready"):
+                            raise RuntimeError("unexpected shutdown response " + str(message[0]))
+                        # An in-flight transition may precede the ACK. Drain
+                        # it so the child cannot block on a full result pipe.
+                        if time.monotonic() >= deadline:
+                            raise TimeoutError("closed ACK deadline expired while draining transitions")
+                except BaseException as exc:
+                    ipc_errors[index] = exc
+            for index, pipe in enumerate(pipes):
+                try:
+                    receiver = threading.Thread(target=request_close, args=(index, pipe), daemon=True)
+                    receiver.start()
+                    receivers.append((index, receiver))
+                except BaseException as exc:
+                    error(index, "closed_ack", exc)
+            for index, receiver in receivers:
+                try:
+                    receiver.join(timeout=max(0., deadline - time.monotonic()))
+                    if receiver.is_alive():
+                        error(index, "closed_ack", "IPC timed out before the group deadline")
+                    elif index in ipc_errors:
+                        error(index, "closed_ack", ipc_errors[index])
+                except BaseException as exc:
+                    error(index, "closed_ack", exc)
+            joins(started, join_timeout, "join")
+
+        living = [index for index in started if alive(index)]
+        for index in living:
+            try:
+                processes[index].terminate()
+            except BaseException as exc:
+                error(index, "terminate", exc)
+        joins(living, terminate_timeout, "join_after_terminate")
+        living = [index for index in living if alive(index)]
+        for index in living:
+            try:
+                processes[index].kill()
+            except BaseException as exc:
+                error(index, "kill", exc)
+        joins(living, kill_timeout, "join_after_kill")
+        surviving = [index for index in started if alive(index)]
+        for index in surviving:
+            error(index, "surviving_process", "still alive after terminate/kill; ownership retained")
+        if not force:
+            for index in started:
+                if index not in surviving and processes[index].exitcode != 0:
+                    error(index, "exitcode", processes[index].exitcode)
+
+        for index, pipe in enumerate(pipes):
+            try:
+                pipe.close()
+            except BaseException as exc:
+                error(index, "close_parent_pipe", exc)
+        for index, pipe in enumerate(getattr(self, "_child_pipes", ())):
+            if pipe is not None:
+                try:
+                    pipe.close()
+                except BaseException as exc:
+                    error(index, "close_child_pipe", exc)
+        # A caller can retry explicit force cleanup using retained live handles.
+        self._processes = [processes[index] for index in surviving]
+        self._pipes = [pipes[index] for index in surviving if index < len(pipes)]
+        self._child_pipes = []
+        if errors:
+            raise CollectorShutdownError(errors, [processes[index].pid for index in surviving])

@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import replace
 import json
+import math
 import os
 from pathlib import Path
 import time
@@ -77,12 +78,24 @@ def memory_snapshot(pids):
             "summed_gpu_MiB": sum(int(row[1]) for row in owned)}
 
 
+def valid_gpu_memory_value(value):
+    """Require finite, nonnegative MiB usable by the existing integer peak sum.
+
+    nvidia-smi's nounits CSV reports integer MiB. A PID/UUID with N/A memory
+    identifies a process but supplies no memory measurement.
+    """
+    try:
+        return not isinstance(value, bool) and math.isfinite(float(value)) and float(value) >= 0 and int(value) >= 0
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
 def summarize_collector_gpu_samples(samples, collector_pids, collector_devices, parent_pid):
     """Require every collector and assigned GPU; the CPU parent needs no GPU."""
     from .resource_probe import summarize_gpu_samples
     owned = set(map(str, collector_pids))
     report = summarize_gpu_samples(samples, [parent_pid, *collector_pids], parent_pid)
-    seen, uuids, errors = set(), set(), []
+    seen, measured, uuids, errors = set(), set(), set(), []
     for index, sample in enumerate(samples):
         for key, value in sample.items():
             if key.endswith("_error"):
@@ -93,11 +106,15 @@ def summarize_collector_gpu_samples(samples, collector_pids, collector_devices, 
             if len(row) == 3 and row[0] in owned:
                 seen.add(row[0])
                 uuids.add(row[2])
+                if valid_gpu_memory_value(row[1]):
+                    measured.add(row[0])
     expected = min(len(owned), len(set(collector_devices)))
     missing = sorted(map(int, owned - seen))
+    missing_memory = sorted(map(int, owned - measured))
     covered = bool(owned) and not missing and len(uuids) == expected
-    complete = covered and not errors and bool(report["owned_process_sampled_peak_MiB_by_gpu_uuid"])
+    complete = covered and not missing_memory and not errors and bool(report["owned_process_sampled_peak_MiB_by_gpu_uuid"])
     report.update(collector_pids=sorted(map(int, owned)), observed_collector_pids=sorted(map(int, seen)),
+                  measured_collector_pids=sorted(map(int, measured)), missing_collector_memory_pids=missing_memory,
                   missing_collector_pids=missing, expected_collector_gpu_count=expected,
                   observed_collector_gpu_count=len(uuids), observed_collector_gpu_uuids=sorted(uuids),
                   sampling_errors=errors, measurement_complete=complete,

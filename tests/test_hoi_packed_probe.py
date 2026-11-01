@@ -246,6 +246,36 @@ class PackedProbeTests(unittest.TestCase):
                     self.assertEqual(gpu["samples"][1]["gpus_error"], "query failed")
                     self.assertEqual(len(gpu["sampling_errors"]), 2)
 
+    def test_every_collector_needs_numeric_memory_not_only_pid_and_uuid(self):
+        for invalid in ("N/A", "nan", "inf", "-inf", "-1", "-0.5", "invalid"):
+            with self.subTest(invalid=invalid):
+                samples = [{"elapsed_seconds": 1., "processes": [
+                    ["20", "1000", "GPU-A"], ["21", "100", "GPU-A"], ["22", invalid, "GPU-B"]]}]
+                report = summarize_collector_gpu_samples(samples, [21, 22], ["cuda:0", "cuda:1"], 20)
+                self.assertTrue(report["assigned_device_uuid_verified"])
+                self.assertEqual(report["missing_collector_pids"], [])
+                self.assertEqual(report["measured_collector_pids"], [21])
+                self.assertEqual(report["missing_collector_memory_pids"], [22])
+                self.assertFalse(report["measurement_complete"])
+
+    def test_later_valid_zero_memory_counts_and_preserves_normal_peak_sums(self):
+        samples = [{"elapsed_seconds": 1., "processes": [
+            ["21", "100", "GPU-A"], ["22", "N/A", "GPU-B"]]},
+            {"elapsed_seconds": 2., "processes": [
+                ["21", "120", "GPU-A"], ["22", "0", "GPU-B"]]}]
+        report = summarize_collector_gpu_samples(samples, [21, 22], ["cuda:0", "cuda:1"], 20)
+        self.assertTrue(report["measurement_complete"])
+        self.assertEqual(report["measured_collector_pids"], [21, 22])
+        self.assertEqual(report["missing_collector_memory_pids"], [])
+        self.assertEqual(report["owned_process_sampled_peak_MiB_by_gpu_uuid"], {"GPU-A": 120, "GPU-B": 0})
+
+    def test_collection_with_only_unavailable_collector_memory_fails_closed(self):
+        _, error, report, _, _ = self.run_fixture(gpu_samples=[{
+            "elapsed_seconds": 1., "processes": [["999999", "N/A", "GPU-fixture"]]}])
+        self.assertIsInstance(error, RuntimeError)
+        self.assertFalse(report["passed"])
+        self.assertEqual(report["gpu_memory"]["missing_collector_memory_pids"], [999999])
+
 
 if __name__ == "__main__":
     unittest.main()
