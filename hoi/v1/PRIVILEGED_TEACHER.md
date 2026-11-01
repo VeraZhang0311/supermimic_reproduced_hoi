@@ -450,3 +450,17 @@ resource_probe现接正式teacher config和--from-scratch，配置同样的39-bo
 资源预检运行不能表述为正式训练已经开始。
 
 启动部署实现的完整CPU回归472项：470通过、2项环境限制跳过；历史HOI边界6项通过。
+
+两卡真实采集验收1488603已COMPLETED 0:0：asset266/2env和asset209/375env各运行12步，
+通过真实PID/GPU UUID确认分别位于两张卡；0优化更新。新初始化清理后，两worker的匿名
+内存分别约2.80和3.06GiB；这仍不是273组并发容量结论。
+
+正式启动流水线1488620于2026-11-01提交，冻结代码2754081/source_02，source content SHA
+为0b31d8eafa45b3a03514ff79e73ab3bb0e92faab6761474c12620178f95866a8。
+独立目录/mnt/projects/ll/tianzizh/superteacher_20261101_01，PROBE_DIR=full_capacity_01、
+RUN_DIR=train_01；申请已验证兼容的al-l40s-0上5张L40S（learner 1、collector 4）、
+96 CPU、980GiB RAM、7天。提交时PENDING(Resources)，尚无优化更新；容量检查通过后
+自动开始训练，失败则退出，不缩减数据/环境/batch/H。W&B项目地址为
+https://app.forge.coreweave.com/tianzizh-university-of-pennsylvania/superteacher。
+提交回执保存在ignored data/superteacher_20261101_01/training_submission.json；实际运行状态
+以Slurm和该独立目录的日志为准，本文提交状态不代表后续运行结果。

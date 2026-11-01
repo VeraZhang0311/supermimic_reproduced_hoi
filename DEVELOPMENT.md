@@ -8,7 +8,8 @@
 正负分别归一化奖励，并接通actor/critic输入及curated数据接口。用户确认按task/source
 group分层约10% protected_eval；缺失task保留unspecified。旧5通道checkpoint/bundle
 拒绝直接加载。新物体采用显式质量/摩擦约定及来源绑定，Omni桌面接入真实kinematic场景；
-未启动训练；完整资产原生验收仍是独立训练前步骤，进度与边界见teacher说明。
+完整资产逐项原生验收已完成。2026-11-01用户授权训练，superteacher作业1488620已提交；
+提交时等待资源，全量并发容量检查通过后自动从零训练。进度与边界见teacher说明。
 离线数据管线独立维护在 `D:/hoi_data_pipeline`；来源转换、50Hz expected-contact
 标注和标注 Slurm 作业使用该仓入口。本仓接入新数据仍需准备匹配的 bundle、真实接触
 记录及 native evidence。数据标注成功不等于机器人已可执行。
