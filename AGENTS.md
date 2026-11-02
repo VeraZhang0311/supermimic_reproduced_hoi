@@ -3,7 +3,7 @@
 ## 开发入口
 
 - 先读 `DEVELOPMENT.md`，再按需读 `notes/README.md`；默认目录 `D:/supermimic_reproduced_hoi`。
-- 本工作区开发分支 **`codex/hoi-compact-weighted-teacher`**，由用户授权从 `hoi/multi-asset-collectors` 的 `85d8c1e` 创建。当前任务是精简数据、独立坐下评估、16 类加权采集与零 optimizer 验收；用户明确先不启动训练。原始完整数据与旧实验保留。
+- 本工作区开发分支 **`codex/hoi-compact-weighted-teacher`**，由用户授权从 `hoi/multi-asset-collectors` 的 `85d8c1e` 创建。精简数据、独立坐下评估、16类加权采集及2×L40容量预检已通过。用户2026-11-02最新授权正式训练：完整数据/4096环境、2×L40，W&B项目superteacher，run名teacher_v1-<美东日期时间>；原始完整数据与旧实验保留。提交与启动事实必须从回执核对。
 - 继承分支的多资产共进程实现。旧作业1488620已在容量预检失败，冻结source_02保留。当前用户授权变更数据范围和采样比例，其他训练/物理参数保持；2048/4096仅作资源/配额对照。共享科学基线仍是 `codex/hoi-v1-no-quality-gate`；不自动切换其他 worktree，不重建已删除分支。
 - 特权 actor 使用显式配置 `configs/hoi_v1_privileged_teacher.json`；实现与验证边界见 `hoi/v1/PRIVILEGED_TEACHER.md`。独立离线标注代码位于 `D:/hoi_data_pipeline`，其几何意图标签不等于本仓真实 pair 冲量标签。
 - `main`仅保留初始fork复现代码供对照。旧分支历史已包含在当前分支中；不重建中间分支，除非用户要求。

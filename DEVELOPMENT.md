@@ -16,7 +16,12 @@ WM backward，但actor imagination前向CUDA OOM；完整结果见teacher说明�
 learner/collector显存采样峰32.0488/10.8242GiB，进程树PSS峰18.4300GiB，整作业batch
 MaxRSS 34.6634GiB。source_06/dataset_04及训练参数不变；未触发2048回退。
 入口 `cluster/hoi_compact_teacher_capacity.sbatch.sh`，报告在capacity_l40_01。
-0 optimizer step；支持采用2×L40完整数据配置，尚未验证optimizer临时开销与长期运行，不启动训练。
+容量测试0 optimizer step；支持采用2×L40完整数据配置，尚未验证optimizer临时开销与长期运行。
+用户随后明确授权正式训练：superteacher项目、teacher_v1-<美东日期时间>名称。
+新入口cluster/hoi_compact_teacher_train.sbatch.sh绑定通过的56资产packed报告与原参数；
+仅track.py增加显式HOI_WANDB_RUN_NAME，25项tracking测试及两个启动器语法检查通过。
+当前尚未提交：login1/login2均在SSH握手阶段Connection reset，待连接恢复后完成项目私有性
+核对、冻结训练源码和单次提交。不能把新授权或本地准备表述为已开始训练。
 
 以下记录继承的资源优化与teacher历史：原资源优化分支从teacher提交`0d1a11e`派生。
 原teacher排队作业1488620及冻结源码保持不动；新分支只做多资产共进程和4096/2048环境

@@ -328,6 +328,18 @@ def fake_sdk(*, fail_init=False):
 
 
 class LiveTrackingTest(TrackingEnvironment):
+    def test_explicit_training_run_name_preserves_fresh_run_and_privacy(self):
+        sdk, run, calls, environments = fake_sdk()
+        plan, _, _ = inputs()
+        name = "teacher_v1-20261102-150000-EST"
+        with tempfile.TemporaryDirectory() as temp, patch.dict("sys.modules", {"wandb": sdk}), \
+                patch.dict(os.environ, {"WANDB_SYNC": "1", "HOI_WANDB_RUN_NAME": name}):
+            with live_training(plan, Path(temp) / "tracking"):
+                pass
+        self.assertEqual(calls[0]["name"], name)
+        self.assertEqual(calls[0]["resume"], "never")
+        self.assertFalse(calls[0]["save_code"])
+
     def test_live_uses_one_fresh_run_finite_metrics_and_checkpoint_summary_only(self):
         sdk, run, calls, environments = fake_sdk()
         plan, rows, _ = inputs()

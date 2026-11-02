@@ -470,6 +470,9 @@ class LiveTrainingTracker:
     """One fresh training run, with only the existing curated metric boundary."""
     def __init__(self, plan, output):
         self.payload = build_payload(plan)
+        run_name = os.environ.get("HOI_WANDB_RUN_NAME", "HOI-v1-train-" + self.payload["run_id"][:8])
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,95}", run_name):
+            raise ValueError("HOI_WANDB_RUN_NAME must be a short explicit run label")
         self.output = fresh_directory(output)
         write_json(self.output / "payload.json", self.payload)
         self.last_step, self.finished, self.run = -1, False, None
@@ -481,7 +484,7 @@ class LiveTrainingTracker:
             from .tracking_bootstrap import tracking_sdk
             wandb = self._session.enter_context(tracking_sdk(self.base_url))
             self.run = wandb.init(entity=self.payload["entity"], project=self.payload["project"],
-                                  id=self.payload["run_id"], name="HOI-v1-train-" + self.payload["run_id"][:8],
+                                  id=self.payload["run_id"], name=run_name,
                                   job_type="hoi_v1_training", resume="never", mode="online", save_code=False,
                                   dir=str(self.output / "wandb_runtime"), settings=_privacy_settings(wandb, self.base_url),
                                   config=self.payload["config"])
