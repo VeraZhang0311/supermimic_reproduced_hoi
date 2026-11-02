@@ -722,4 +722,17 @@ RAM、3小时30分上限。复用同一source_06、dataset_04、native evidence�
 `e798b64a6ac6368f90cba77cbf09366c389af841d25a26243e09f593dfcffb9d`，仅改变卡型与独立输出
 capacity_l40_01。仍一张learner、一张collector，先4096，只有干净learner OOM才继续2048；
 训练参数和物理合同不变，0 optimizer step，无正式训练。提交回执在capacity_l40_01_submission。
-当前RUNNING不是容量通过；多teacher拆分尚未实施。
+最终1493079 **COMPLETED/exit 0，01:04:10**，capacity_l40_01/summary.json记录passed=true、
+passing_num_envs=4096、default_4096_passed=true。全部56资产、6537条训练片段与4096环境
+保持；128步实采524288条transition，完整WM backward、actor H32 imagination前向/反向、
+全量critic target及一个完整critic minibatch backward均通过，actor/critic梯度有限。
+源码身份未变，资源测量完整，无其他作业GPU进程混入，无finalization错误；未触发2048回退。
+
+L40资源采样峰：learner卡32818MiB（32.0488GiB），collector卡11084MiB（10.8242GiB），
+进程树PSS 18.4300GiB；整作业Slurm batch MaxRSS 34.6634GiB。PyTorch learner allocator
+精确峰值allocated 31.0995GiB、reserved 31.5410GiB，与含CUDA上下文等的nvidia-smi进程
+显存口径不同。采样峰仍是下界，不应当作长期训练绝对上限。
+该结果支持2×L40原完整数据配置，无须为通过本次容量预检拆成multi-teacher；尚未实施拆分。
+依然optimizer_steps=0、formal_training_started=false：Adam moments已预留，但optimizer.step
+临时开销、完整多次更新与长期稳定性未测，正式训练未启动。原始报告位于
+capacity_l40_01/envs_4096/report.json，原A10失败证据保留。

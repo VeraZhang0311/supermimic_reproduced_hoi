@@ -11,10 +11,12 @@
 128步实采524288条transition通过配额审计，原生证据继承和最终preflight均通过。
 正式训练未启动。完整learner容量预检1490289（2×A10）已FAILED：4096和2048均完成实采及
 WM backward，但actor imagination前向CUDA OOM；完整结果见teacher说明。
-用户随后授权先不拆multi-teacher，改用2×L40原配置重测。作业1493079于11月2日12:43 EST
-已RUNNING：一张learner卡、一张采集卡，16 CPU/64GiB RAM，source_06/dataset_04不变。
-入口 `cluster/hoi_compact_teacher_capacity.sbatch.sh`；仍先4096、仅干净learner OOM才试2048，
-0 optimizer step。新结果在capacity_l40_01，最终容量结论待报告，不启动正式训练。
+用户随后授权先不拆multi-teacher，改用2×L40原配置重测。作业1493079已COMPLETED/exit 0，
+01:04:10：4096环境完整实采、WM backward、actor H32 backward及critic检查全部通过。
+learner/collector显存采样峰32.0488/10.8242GiB，进程树PSS峰18.4300GiB，整作业batch
+MaxRSS 34.6634GiB。source_06/dataset_04及训练参数不变；未触发2048回退。
+入口 `cluster/hoi_compact_teacher_capacity.sbatch.sh`，报告在capacity_l40_01。
+0 optimizer step；支持采用2×L40完整数据配置，尚未验证optimizer临时开销与长期运行，不启动训练。
 
 以下记录继承的资源优化与teacher历史：原资源优化分支从teacher提交`0d1a11e`派生。
 原teacher排队作业1488620及冻结源码保持不动；新分支只做多资产共进程和4096/2048环境
