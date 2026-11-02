@@ -3,8 +3,8 @@
 ## 开发入口
 
 - 先读 `DEVELOPMENT.md`，再按需读 `notes/README.md`；默认目录 `D:/supermimic_reproduced_hoi`。
-- 本工作区开发分支 **`hoi/multi-asset-collectors`**，由用户授权从 `hoi/privileged_teacher` 的 `0d1a11e` 创建。
-- 本分支仅优化采集部署并做零optimizer资源验收；保留正在排队的原teacher作业1488620及冻结source_02，不修改、取消或替换。完整数据/训练参数不变；用户另允许2048环境资源对照和必要时按物体类别拆teacher，后者当前未实现。共享科学基线仍是 `codex/hoi-v1-no-quality-gate`；不自动切换其他 worktree，不重建已删除的 `hoi/zero_shot` 或 `hoi/v1.0`。
+- 本工作区开发分支 **`codex/hoi-compact-weighted-teacher`**，由用户授权从 `hoi/multi-asset-collectors` 的 `85d8c1e` 创建。当前任务是精简数据、独立坐下评估、16 类加权采集与零 optimizer 验收；用户明确先不启动训练。原始完整数据与旧实验保留。
+- 继承分支的多资产共进程实现。旧作业1488620已在容量预检失败，冻结source_02保留。当前用户授权变更数据范围和采样比例，其他训练/物理参数保持；2048/4096仅作资源/配额对照。共享科学基线仍是 `codex/hoi-v1-no-quality-gate`；不自动切换其他 worktree，不重建已删除分支。
 - 特权 actor 使用显式配置 `configs/hoi_v1_privileged_teacher.json`；实现与验证边界见 `hoi/v1/PRIVILEGED_TEACHER.md`。独立离线标注代码位于 `D:/hoi_data_pipeline`，其几何意图标签不等于本仓真实 pair 冲量标签。
 - `main`仅保留初始fork复现代码供对照。旧分支历史已包含在当前分支中；不重建中间分支，除非用户要求。
 - 修改、Git和检查命令显式指定本仓库workdir，先确认分支及已有改动。
@@ -44,6 +44,8 @@
 ## 评估与W&B
 
 - Curated数据用完整protected_eval（约10%按task/source group分层，已有保护不可进入train）；缺task保留unspecified。历史canonical HOI80继续保护。冻结checkpoint，0optimizer/normalizer更新、完整物理时长、不因失败重置截断。
+- Compact teacher 只由冻结父分区确定性派生：ULTRA curated 全保留；HOI 排除4类与ULTRA重叠物体；Omni保留carry桌面交互与全部soccer；GRAIL训练原ID 2/122/169/172/200、独立eval原ID35/48/87/124/199。不做轨迹增强，排除的eval仍由父分区保护。新密集asset ID必须附原ID映射。
+- 权重绑定在训练bundle：ULTRA每类6%、HOI九类各4%、Omni桌面15%、足球15%、GRAIL坐下10%。足球五task及五训练椅子内部均衡。配额核对实际transition起始帧，不能以reset抽签或合成样本替代；评估不加权、不抽样缩短。
 - T+1状态/reference，T action/obs/goal/control；保留时基/四元数。HOI-trained full-reference policy已有物体输入；历史zero-shot不得加物体policy观测来冒充旧协议。
 - 分开报告normalized return/作者终止、39body PHC、object pose及联合判据。PHC0.5m；object位置0.1m/角度30°持续0.3s为工程姿态判据，不等于抓取成功。
 - 新对照用独立私有W&B run，仅用户指定续训同实验时恢复原run。

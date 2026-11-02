@@ -456,6 +456,71 @@ def validate_evaluation_identity(training_bundle, evaluation_bundle):
     return True
 
 
+def aggregate_evaluation_cases(cases):
+    """The same per-clip aggregation for the full partition and named subsets."""
+    from hoi.run import aggregate
+    if not cases:
+        raise ValueError("cannot aggregate an empty evaluation")
+    values = aggregate(cases)
+    for key in ("human_normalized_return", "hoi_normalized_return", "hoi_reference_mask_normalized_return", "objective_normalized_return"):
+        values[key] = sum(case[key] for case in cases) / len(cases)
+    return values
+
+
+def grail_sitting_evaluation(bundle, training_bundle, cases):
+    """Derive the held-out sitting result from complete, identity-checked cases.
+
+    Case clip_id is the motion-bank index, whereas bundle clip_id is the frozen
+    source identifier. Membership comes exclusively from the validated bundle.
+    """
+    if not bundle.get("compact_selection") or bundle.get("partition") != "protected_eval":
+        return None
+    compact = bundle["compact_selection"]
+    if (training_bundle.get("partition") != "train" or
+            training_bundle.get("compact_selection", {}).get("split_content_sha256") != compact["split_content_sha256"]):
+        raise ValueError("independent sitting evaluation requires the paired compact train split")
+    clips = bundle["clips"]
+    indexed = {}
+    for case in cases:
+        index = case.get("clip_id")
+        if type(index) is not int or not 0 <= index < len(clips) or index in indexed:
+            raise ValueError("evaluation has duplicate or unknown clip indices")
+        clip = clips[index]
+        if (type(case.get("asset_id")) is not int or case["asset_id"] != clip["asset_id"]
+                or case.get("id") != clip["name"]):
+            raise ValueError("evaluation case identity differs from its frozen clip/asset")
+        indexed[index] = case
+    if set(indexed) != set(range(len(clips))):
+        raise ValueError("independent sitting metrics require every protected evaluation clip exactly once")
+    selected = [i for i, clip in enumerate(clips) if clip["dataset"] == "grail_sitting"]
+    if not selected:
+        raise ValueError("compact protected evaluation has no independent GRAIL sitting clips")
+    train_clips = training_bundle["clips"]
+    groups = {clips[i]["source_group"] for i in selected}
+    if groups & {c["source_group"] for c in train_clips}:
+        raise ValueError("GRAIL evaluation source group overlaps training")
+    assets = {a["asset_id"]: a for a in bundle["assets"]}
+    train_assets = {a["asset_id"]: a for a in training_bundle["assets"]}
+    chairs = sorted({clips[i]["asset_id"] for i in selected})
+    eval_native = {assets[i]["native_equivalence_sha256"] for i in chairs}
+    train_native = {train_assets[c["asset_id"]]["native_equivalence_sha256"] for c in train_clips}
+    if eval_native & train_native:
+        raise ValueError("GRAIL evaluation native chair overlaps training")
+    per_chair = []
+    for asset_id in chairs:
+        members = [i for i in selected if clips[i]["asset_id"] == asset_id]
+        per_chair.append({"asset_id": asset_id, "original_asset_id": assets[asset_id]["original_asset_id"],
+                          "source_group_count": len({clips[i]["source_group"] for i in members}),
+                          "aggregate": aggregate_evaluation_cases([indexed[i] for i in members])})
+    return {"schema": "hoi_grail_sitting_eval_v1", "dataset": "grail_sitting",
+            "mode": "held_out_chair_asset_and_source_group", "source_group_disjoint": True,
+            "native_asset_disjoint": True, "human_template_independence": "not_established_by_published_metadata",
+            "augmentation_count": 0, "chair_count": len(chairs), "source_group_count": len(groups),
+            "coverage_complete": True, "manifest_clip_ids": [clips[i]["clip_id"] for i in selected],
+            "evaluation_bundle_content_sha256": bundle["bundle_content_sha256"],
+            "aggregate": aggregate_evaluation_cases([indexed[i] for i in selected]), "per_chair": per_chair}
+
+
 def _validate_contact_contract(contact):
     from .networks import FEATURE_SCHEMA
     label = FEATURE_SCHEMA["actual_contact_label"]
@@ -542,10 +607,7 @@ def main(argv=None):
                 workers.close()
     if sha256_file(args.checkpoint) != checkpoint_sha:
         raise RuntimeError("checkpoint bytes changed during frozen evaluation")
-    from hoi.run import aggregate
-    aggregate_values = aggregate(results)
-    for key in ("human_normalized_return", "hoi_normalized_return", "hoi_reference_mask_normalized_return", "objective_normalized_return"):
-        aggregate_values[key] = sum(case[key] for case in results) / len(results)
+    aggregate_values = aggregate_evaluation_cases(results)
     report = {"protocol": "HOI v1 full-reference oracle-pose policy evaluation; full-duration physical evaluation",
               "contact_channels": list(CHANNELS), "contact_label_schema": LABEL_SCHEMA,
               "partition": bundle["partition"], "scope": bundle["scope"], "checkpoint_sha256": checkpoint_sha,
@@ -554,6 +616,9 @@ def main(argv=None):
               "aggregate": aggregate_values, "native": native, "optimizer_updates": 0, "normalization_updates": 0,
               "no_failure_reset": True, "physical_objects": True, "elapsed_seconds": time.monotonic() - started,
               "training_data_identity": identity, "evaluation_bundle_content_sha256": bundle["bundle_content_sha256"], **provenance}
+    sitting = grail_sitting_evaluation(bundle, training_bundle, results)
+    if sitting is not None:
+        report["grail_sitting_eval"] = sitting
     _verify_evaluation_source(provenance["evaluation_source_identity"])
     write_json(output / "evaluation.json", report)
     print(json.dumps({"evaluation": str(output / "evaluation.json"), "aggregate": report["aggregate"]}, allow_nan=False))

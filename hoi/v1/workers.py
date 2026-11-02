@@ -51,13 +51,20 @@ def allocate_workers(bundle, motion, num_envs=4096):
     if len(assets) > num_envs:
         raise ValueError(f"{len(assets)} fixed groups cannot each receive an environment from budget {num_envs}")
     weights = [counts[int(a["asset_id"])] for a in assets]
-    total = sum(weights)
-    residual = num_envs - len(assets)
-    exact = [residual * count / total for count in weights]
-    quota = [1 + int(x) for x in exact]
-    order = sorted(range(len(assets)), key=lambda i: (-(exact[i] - int(exact[i])), int(assets[i]["asset_id"])))
-    for i in order[:num_envs - sum(quota)]:
-        quota[i] += 1
+    if bundle.get("task_sampling") is not None:
+        from .task_sampling import weighted_asset_quotas
+        weighted = weighted_asset_quotas(bundle, num_envs)
+        if set(weighted) != {int(a["asset_id"]) for a in assets}:
+            raise ValueError("weighted clip population differs from allocated motion assets")
+        quota = [weighted[int(a["asset_id"])] for a in assets]
+    else:
+        total = sum(weights)
+        residual = num_envs - len(assets)
+        exact = [residual * count / total for count in weights]
+        quota = [1 + int(x) for x in exact]
+        order = sorted(range(len(assets)), key=lambda i: (-(exact[i] - int(exact[i])), int(assets[i]["asset_id"])))
+        for i in order[:num_envs - sum(quota)]:
+            quota[i] += 1
     specs = [WorkerSpec(int(a["asset_id"]), n, w, key) for a, n, w, key in zip(assets, quota, weights, keys)]
     assert sum(s.num_envs for s in specs) == num_envs
     return specs

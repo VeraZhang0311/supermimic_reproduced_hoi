@@ -116,18 +116,28 @@ class PackedProbeTests(unittest.TestCase):
                 compare_values(left, right)
 
     def run_fixture(self, *, constructor_error=None, step_error=None, close_error=None, parity=True,
-                    pids=(999999,), devices=("cuda:0",), gpu_samples=None):
+                    pids=(999999,), devices=("cuda:0",), gpu_samples=None, sampling_sources=None):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         output = Path(directory.name) / "probe"
         worker = MagicMock()
         worker.N = 2
-        worker._processes = [SimpleNamespace(pid=pid) for pid in pids]
+        worker._processes = [SimpleNamespace(pid=pid, exitcode=0) for pid in pids]
         worker.snapshot.return_value = {"f": torch.tensor([0, 0])}
         worker.step.return_value = {"s": torch.ones(2, 4)}
         worker.step.side_effect = step_error
         worker.close.side_effect = close_error
+        config = {"assets_per_process": 1, "collector_devices": list(devices)}
         with ExitStack() as stack:
+            if sampling_sources is not None:
+                config.update(sampling_audit=True, bundle=str(output.parent / "bundle.json"))
+                stack.enter_context(patch("hoi.v1.config.source_identity", side_effect=sampling_sources))
+                stack.enter_context(patch("hoi.v1.evaluate._read_bundle_header",
+                    return_value={"bundle_content_sha256": "a" * 64}))
+                stack.enter_context(patch("hoi.data.manifest.sha256_file", return_value="b" * 64))
+                audit = MagicMock()
+                audit.report.return_value = {"allocation_match": True, "completed_episodes": 1}
+                stack.enter_context(patch("hoi.v1.sampling_audit.ActualCollectionAudit", return_value=audit))
             stack.enter_context(patch("hoi.v1.packed_probe.time.monotonic", side_effect=count(1)))
             stack.enter_context(patch("hoi.v1.packed_probe.WorkerGroup", return_value=worker,
                                       side_effect=constructor_error))
@@ -142,7 +152,7 @@ class PackedProbeTests(unittest.TestCase):
                 stack.enter_context(patch("hoi.v1.resource_probe._GpuSampler", return_value=sampler))
             try:
                 result = run_collection([WorkerSpec(0, 2, 1, "fixture")],
-                                        {"assets_per_process": 1, "collector_devices": list(devices)},
+                                        config,
                                         steps=2, output=output, parity=parity)
                 error = None
             except BaseException as exc:
@@ -162,6 +172,25 @@ class PackedProbeTests(unittest.TestCase):
         self.assertTrue((output / "trace.pt").is_file())
         self.assertGreater(report["stepping_seconds"], 0)
         worker.close.assert_called_once()
+
+    def test_weighted_collection_records_unchanged_source_inside_bound_report(self):
+        source = {"files": {"hoi/v1/native.py": "a" * 64}, "content_sha256": "b" * 64}
+        _, error, report, _, _ = self.run_fixture(sampling_sources=[source, source])
+        self.assertIsNone(error)
+        self.assertTrue(report["passed"])
+        self.assertEqual(report["source_before"], source)
+        self.assertEqual(report["source_after"], source)
+        self.assertTrue(report["source_unchanged"])
+
+    def test_weighted_collection_source_change_or_final_read_failure_is_failed(self):
+        source = {"files": {"hoi/v1/native.py": "a" * 64}, "content_sha256": "b" * 64}
+        for after in ({**source, "content_sha256": "c" * 64}, OSError("source read failed")):
+            with self.subTest(after=after):
+                _, error, report, worker, _ = self.run_fixture(sampling_sources=[source, after])
+                self.assertIsNotNone(error)
+                self.assertFalse(report["passed"])
+                self.assertIn("source", report["source_error"])
+                worker.close.assert_called_once()
 
     def test_constructor_or_collection_failure_never_reports_passed(self):
         for errors in ({"constructor_error": RuntimeError("startup failed")},

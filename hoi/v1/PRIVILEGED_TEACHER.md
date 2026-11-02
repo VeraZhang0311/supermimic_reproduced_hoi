@@ -593,3 +593,59 @@ resource_measurement_complete=true、0optimizer。全部273资产/9个collector�
 同作业按预定流程继续2048组；其结果尚未完成。两采集卡各自峰值之和17.8145GiB仅提供
 合并到一张卡的容量候选依据，尚无两卡部署验收；4096学习器需要更大显存或另行验证的
 等价实现优化，不能把当前3张A10报告称为训练容量通过。
+
+## Compact teacher：冻结筛选与实际采集配比（2026-11-01）
+
+用户授权在 `codex/hoi-compact-weighted-teacher` 接入精简数据和加权采样，暂不启动训练。
+父数据、reference 缓存、native 资产、完整 protected_eval 均保留。新数据由
+`python -m hoi.data.compact_teacher materialize --train-bundle ... --eval-bundle ... --output NEW`
+确定性派生，所有被排除片段及原因写入 `excluded.jsonl`。
+
+| 来源 | train | protected_eval | 选择 |
+| --- | ---: | ---: | --- |
+| ULTRA | 2458 | 273 | 当前 curated 全部；不自动扩到原始4066条 |
+| HOI-Retarget | 2925 | 288 | 排除largebox、smallbox、plasticbox、suitcase |
+| OmniContact | 1105 | 474 | 全部box/case1_carry与五类soccer |
+| GRAIL | 49 | 50 | 训练/评估分别五把常见椅子 |
+| 合计 | 6537 | 1085 | 56个训练资产、55个eval资产、65个共享注册资产 |
+
+训练椅子原始ID为0002、0122、0169、0172、0200；评估椅子原始ID为0035、0048、0087、
+0124、0199。各有5个来源组，保留原分区，评估椅子不出现在训练中。该独立性指原始
+source_group与椅子身份；不能据此声称发布数据中潜在人类动作模板也完全独立。
+名称来自metadata，未新增视觉质量声明；不做轨迹增强。共享65资产重新密集编号，
+`original_asset_id`和`asset_id_map`保留老截图/物理证据映射。
+
+新manifest绑定两个完整父bundle的字节和内容SHA；读取时重建并核对精确筛选结果、
+资产、标签、几何与父分区身份。只有通过该验证才能接受reference缓存中原manifest的SHA，
+不改写缓存；新scope表示完整的新分区，父数据缩减关系另在compact_selection记录。
+原生证据用`hoi.data.compact_native_evidence`显式继承：原完整报告不改ID、不替换bundle哈希，
+按原身份重跑gate并映射到新资产，再绑定新bundle的零optimizer实际采集结果。
+
+训练bundle的`task_sampling`合同要求16类：ULTRA四类各6%，HOI九类各4%，桌面15%、
+足球15%、坐下10%。整数环境数用分层最大余数法分配，保留全部资产，2048/4096仅有
+离散配额取整误差。足球内部五task各约3%，坐下五椅子各约2%，使用固定环境槽位，
+不同episode长度或提前终止不改变类别transition比例。
+
+类内按来源组均衡，再按片段均衡；ULTRA跨尺寸共享来源组的条件概率由完整训练总体计算，
+不因worker只加载某资产而重新改变分母。片段内部保留原有自适应难度bin采样。
+来源组/片段的均衡是reset概率，不声称不同episode长度下逐帧数也均衡。Replay抽样及
+actor horizon筛选保持原实现，实际采集比例不等于每个learner minibatch比例。
+
+`sampling_actual_prefill.json`与`sampling_actual.json`按真实transition的起始`f`统计，
+核对每个vector tick的类别、子任务、资产及固定lane，另记reset/来源组/片段计数。
+偏离合同即报错；W&B只上传类别计数/比例，不上传动作或原始source group。
+评估仍遍历完整新protected_eval，0optimizer/normalizer更新，不按训练权重采样。
+最终 `evaluation.json` 另含 `grail_sitting_eval`，按manifest逐项核对全部评估成员后，
+单独汇总GRAIL及逐椅子指标，验证source group和native椅子身份与训练分离。
+W&B只上传其白名单聚合标量；不能把这个holdout解释为已证明人类动作模板独立。
+
+零训练GPU验收入口：`cluster/hoi_compact_teacher_verify.sbatch.sh`，实际随机小动作采集至少64步，
+须覆盖所有训练资产、自然episode边界、正确transition比例和正常collector退出；
+随后生成严格继承native gate并运行训练入口的`--preflight`，不会进入训练循环。
+采集验收不包含learner前反向图，不能当成完整训练显存容量通过。
+
+CPU验收：56模块608项，606通过、2项环境跳过（Windows symlink权限、可选pxr未安装），
+另补GRAIL独立评估相关58项测试通过。完整回归按模块独立进程执行：单进程discover曾在
+Windows native_snapshot_render出现0xC0000005，该模块隔离后7项全过；不将该异常隐去。
+累计采样报告使用原子更新，已覆盖连续多轮日志与结束时详细报告，避免exclusive写入冲突。
+本地验收明细留ignored `data/compact_teacher_20261101/`。GPU实际采集结果另行记录；未训练。

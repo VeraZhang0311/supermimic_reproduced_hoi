@@ -130,6 +130,18 @@ def run_collection(specs, config, *, steps, output, parity):
     report = {"assets_per_process": config["assets_per_process"], "asset_ids": [s.asset_id for s in specs],
         "environments": sum(s.num_envs for s in specs), "optimizer_steps": 0,
         "formal_training_started": False, "passed": False, "phase": "starting_collectors"}
+    sampling_audit = None
+    if config.get("sampling_audit"):
+        from .evaluate import _read_bundle_header
+        from .sampling_audit import ActualCollectionAudit
+        from .config import source_identity
+        from hoi.data.manifest import sha256_file
+        report["source_before"] = source_identity()
+        header = _read_bundle_header(config["bundle"])
+        sampling_audit = ActualCollectionAudit(header, specs)
+        report["bundle"] = {"path": str(Path(config["bundle"]).resolve()), "sha256": sha256_file(config["bundle"]),
+                            "bundle_content_sha256": header["bundle_content_sha256"]}
+        report["schema"] = "hoi_weighted_collection_probe_v1"
     write = lambda: (output / "progress.json").write_text(json.dumps(report, indent=2))
     write()
     workers, trace, error = None, [], None
@@ -155,15 +167,19 @@ def run_collection(specs, config, *, steps, output, parity):
                     action = .05 * torch.randn((workers.N, 29), generator=action_rng)
                     step_started = time.monotonic()
                     tr = workers.step(action)
+                    if sampling_audit is not None:
+                        sampling_audit.observe(tr)
                     stepping_seconds += time.monotonic() - step_started
                     snapshot = workers.snapshot()
                     if parity:
                         trace.append({"transition": tr, "snapshot": snapshot})
-                    if tick in (7, 19, 31):
+                    if tick in (7, 19, 31) and sampling_audit is None:
                         reset_snapshot = workers.reset(reset_frames)
                         if parity:
                             trace.append({"explicit_reset": reset_snapshot})
                     report.update(completed_ticks=tick + 1)
+                    if sampling_audit is not None:
+                        report["sampling"] = sampling_audit.report()
                     write()
                 report.update(steps=steps, collection_seconds=time.monotonic() - started,
                               memory_final=memory_snapshot(pids), stepping_seconds=stepping_seconds)
@@ -172,6 +188,10 @@ def run_collection(specs, config, *, steps, output, parity):
                 if parity:
                     torch.save(trace, output / "trace.pt")
                 report["phase"] = "shutdown"
+                if sampling_audit is not None:
+                    report["sampling"] = sampling_audit.report(detail=True)
+                    if not report["sampling"]["allocation_match"] or not report["sampling"]["completed_episodes"]:
+                        raise RuntimeError("weighted collection must verify actual proportions across natural episode boundaries")
                 write()
             except BaseException as exc:
                 failure = exc
@@ -179,7 +199,12 @@ def run_collection(specs, config, *, steps, output, parity):
             finally:
                 try:
                     if workers is not None:
+                        owned_processes = list(workers._processes)
                         workers.close()
+                        report["shutdown_passed"] = True
+                        report["collector_exit_codes"] = [p.exitcode for p in owned_processes]
+                        if any(code != 0 for code in report["collector_exit_codes"]):
+                            raise RuntimeError("collector exited unsuccessfully after close")
                         if config.get("audit_isolation"):
                             audits = [json.loads(path.read_text()) for path in sorted((output / "workers").glob("isolation_*.json"))]
                             report["isolation_audits"] = audits
@@ -194,6 +219,16 @@ def run_collection(specs, config, *, steps, output, parity):
         if failure is None:
             failure = exc
     finally:
+        if sampling_audit is not None:
+            try:
+                report["source_after"] = source_identity()
+                report["source_unchanged"] = report["source_after"] == report["source_before"]
+                if not report["source_unchanged"]:
+                    raise RuntimeError("source files changed during weighted native collection")
+            except Exception as exc:
+                report["source_error"] = traceback.format_exc()
+                if failure is None:
+                    failure = exc
         report["host_memory"] = host.summary()
         report["gpu_memory"] = summarize_collector_gpu_samples(
             gpu.samples, pids[1:], config.get("collector_devices") or [config.get("device", "cuda:0")], os.getpid())
@@ -222,10 +257,13 @@ def main(argv=None):
     parser.add_argument("--worker-startup-concurrency", type=int, default=1)
     parser.add_argument("--steps", type=int, default=64)
     parser.add_argument("--audit-isolation", action="store_true", help="Diagnostic-only exact checks that inactive native buffers/RNG stay unchanged")
+    parser.add_argument("--sampling-audit", action="store_true", help="Count actual weighted transitions across natural resets; capacity mode only, no learner/optimizer")
     parser.add_argument("--robot-mjcf")
     args = parser.parse_args(argv)
     if args.audit_isolation and (args.mode == "capacity" or args.assets_per_process < 2):
         parser.error("isolation audit is only for a multi-asset smoke/parity panel")
+    if args.sampling_audit and (args.mode != "capacity" or args.steps < 64):
+        parser.error("weighted sampling audit requires complete capacity mode and at least 64 real control ticks")
     args.output.mkdir(parents=True, exist_ok=False)
     report = {"mode": args.mode, "optimizer_steps": 0, "formal_training_started": False, "passed": False}
     try:
@@ -244,7 +282,8 @@ def main(argv=None):
         config = {"bundle": str(args.bundle), "physics": PhysicsSettings(hand_collision=True, self_collision=True).__dict__,
             "seed": 0, "device": "cuda:0", "gamma": .99, "launcher_args": [], "robot_mjcf": args.robot_mjcf,
             "collector_devices": args.collector_devices, "worker_startup_concurrency": args.worker_startup_concurrency,
-            "assets_per_process": args.assets_per_process, "audit_isolation": args.audit_isolation}
+            "assets_per_process": args.assets_per_process, "audit_isolation": args.audit_isolation,
+            "sampling_audit": args.sampling_audit}
         if args.mode in ("parity", "smoke"):
             specs = [replace(s, num_envs=args.parity_envs_per_asset) for s in specs if s.asset_id in args.asset_ids]
             if {s.asset_id for s in specs} != set(args.asset_ids):

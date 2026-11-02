@@ -103,6 +103,24 @@ class TrainingFlowTests(unittest.TestCase):
         self.assertEqual((workers.steps, workers.snapshot_calls, learner.buffer.size), (0,0,0))
         torch.testing.assert_close(count, learner.pi.obs_norm.count)
 
+    def test_sampling_receipt_survives_multiple_logs_and_final_detail(self):
+        from types import SimpleNamespace
+        learner = self.learner(iterations=2)
+        observed = []
+        learner.sampling_audit = SimpleNamespace(
+            observe=lambda value: observed.append(value["f"].clone()),
+            report=lambda detail=False: {"vector_steps": len(observed), "detail": detail})
+        workers = SyntheticWorkers(learner)
+        output, _ = self.run_loop(learner, workers, "sampling_receipts")
+        prefill = json.loads((output / "sampling_actual_prefill.json").read_text())
+        final = json.loads((output / "sampling_actual.json").read_text())
+        rows = [json.loads(line) for line in (output / "metrics.jsonl").read_text().splitlines()]
+        self.assertEqual(prefill["vector_steps"], 8)
+        self.assertEqual(final, {"vector_steps": workers.steps, "detail": True})
+        self.assertEqual(len(rows), 2)
+        self.assertLess(rows[0]["sampling_actual"]["vector_steps"], rows[1]["sampling_actual"]["vector_steps"])
+        self.assertFalse((output / "sampling_actual.json.tmp").exists())
+
     def test_prefill_wm_warmup_still_saves_complete_checkpoint(self):
         learner = self.learner()
         learner.config = replace(learner.config, wm_only_iters=500)

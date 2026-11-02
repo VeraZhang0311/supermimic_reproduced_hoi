@@ -295,6 +295,9 @@ def prepare_curated_bundle(split_path, recipes_path, output, kin, *, partition='
 
 def read_curated_bundle_header(path):
     bundle=load_json(path)
+    if 'compact_selection' in bundle:
+        from .compact_teacher import read_compact_bundle_header
+        return read_compact_bundle_header(path)
     payload={k:v for k,v in bundle.items() if k!='bundle_content_sha256'}
     if bundle.get('schema_version')!=CURATED_BUNDLE_SCHEMA or bundle.get('bundle_content_sha256')!=digest(payload):
         raise ValueError('curated bundle schema/content hash mismatch')
@@ -445,7 +448,10 @@ def load_curated_bundle(path, kin, device='cpu', require_train=True, asset_filte
         raw_supports=reference['source_scene_supports'];summary=entry['scene_supports']
         if not isinstance(raw_supports,list) or len(raw_supports) != summary['count'] or support_digest(raw_supports) != summary['source_sha256']:
             raise ValueError('curated scene-support cache differs from source binding')
-        if reference['metadata']['schema_version']!=REFERENCE_SCHEMA or len(reference['robot']['root_pos'])!=n or reference['provenance']['manifest_content_sha256']!=bundle['manifest']['content_sha256'] or reference['provenance']['source_motion_sha256']!=entry['labels_sha256']:
+        # A compact derivative may reuse an immutable parent cache only after
+        # read_curated_bundle_header authenticated the exact parent selection.
+        reference_manifest = bundle.get('compact_selection', {}).get('reference_manifest_content_sha256', bundle['manifest']['content_sha256'])
+        if reference['metadata']['schema_version']!=REFERENCE_SCHEMA or len(reference['robot']['root_pos'])!=n or reference['provenance']['manifest_content_sha256']!=reference_manifest or reference['provenance']['source_motion_sha256']!=entry['labels_sha256']:
             raise ValueError('curated reference cache identity mismatch')
         if contacts['metadata']['schema']!=EXPECTED_SCHEMA or contacts['metadata']['channels']!=list(CHANNELS):
             raise ValueError('curated contact cache schema mismatch')
@@ -453,7 +459,9 @@ def load_curated_bundle(path, kin, device='cpu', require_train=True, asset_filte
             raise ValueError('first reference state cannot describe a preceding interval')
         clips.append({**entry,'reference':reference,'scene_supports':raw_supports,'expected_contact':contacts['expected_contact'],'expected_valid':contacts['expected_valid']})
         global_frames.append(torch.arange(offset,offset+n,dtype=torch.long,device=device));offset+=n
-    bank=TrainingMotionBank(clips,kin,device,bundle['partition'],retain_source_reference=retain_source_reference)
+    sampling = bundle.get('task_sampling')
+    sampling_args = {'task_sampling': sampling, 'sampling_population': bundle['clips']} if sampling is not None else {}
+    bank=TrainingMotionBank(clips,kin,device,bundle['partition'],retain_source_reference=retain_source_reference,**sampling_args)
     bank.global_frame_index=torch.cat(global_frames)
     bank.scene_supports=[clip.get('scene_supports', []) for clip in clips]
     bank.bound_scene_supports=[clip['reference'].get('scene_supports', []) for clip in clips]

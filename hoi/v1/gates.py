@@ -187,6 +187,12 @@ def validate_native_evidence(report_or_path, *, expected_physics=None, required_
         return {"schema_version": "hoi_v1_native_gate_v2", "passed": False,
                 "blockers": ["no native evidence supplied"], "evidence_sha256": None, "asset_ids": [], "status": "blocked"}
     payload, digest = _read(report_or_path)
+    if isinstance(payload, dict) and payload.get("schema_version") == "hoi_compact_native_evidence_v1":
+        from hoi.data.compact_native_evidence import validate_compact_native_evidence
+        return validate_compact_native_evidence(report_or_path, expected_physics=expected_physics,
+                                               required_asset_ids=required_asset_ids,
+                                               expected_bundle_sha256=expected_bundle_sha256,
+                                               expected_asset_profiles=expected_asset_profiles)
     reports = payload if isinstance(payload, list) else payload.get("reports", [payload])
     blockers, assets = [], set()
     if not reports:

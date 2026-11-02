@@ -94,12 +94,17 @@ def bundle_identity(bundle):
         assets.append({key: asset[key] for key in (
             "asset_id", "object_asset", "exact_scale", "collision_hash", "native_asset_sha256", "physical_profile")})
         assets[-1]["geometry_sha256"] = asset["geometry_cache"]["sha256"]
-    return {"bundle_content_sha256": bundle["bundle_content_sha256"], "partition": bundle["partition"],
+    identity = {"bundle_content_sha256": bundle["bundle_content_sha256"], "partition": bundle["partition"],
             "manifest": bundle["manifest"], "timebase": bundle["timebase"],
             "recipes": bundle.get("recipes"), "robot_fk": bundle.get("robot_fk"),
             "native_robot_asset": bundle.get("native_robot_asset"),
             "reference_kinematics": bundle.get("reference_kinematics"), "assets": assets,
             "hands_geometry_sha256": bundle["hands"]["geometry_cache"]["sha256"]}
+    if bundle.get("task_sampling") is not None:
+        identity["task_sampling"] = bundle["task_sampling"]
+    if bundle.get("compact_selection") is not None:
+        identity["compact_selection"] = bundle["compact_selection"]
+    return identity
 
 
 def fresh_directory(path):

@@ -526,8 +526,32 @@ class HOITrackingSim:
                 config.robot.spawn.usd_path = str(robot_asset["path"])
             return config
 
+        task_sampler = None
+        if getattr(motion, "task_sampling", None) is not None and not eval_mode:
+            from .task_sampling import PersistentTaskSampler
+            task_sampler = PersistentTaskSampler(motion, asset_id, num_envs)
+
         class AssetTrackingSim(TrackingSim):
+            def reset(this, env_ids, frames=None):
+                # TrackingSim.__init__ invokes reset before returning. The
+                # closure is therefore initialized before construction, and
+                # supplies actual environment identities to sample_frames(n).
+                if task_sampler is not None and len(env_ids):
+                    if frames is not None:
+                        task_sampler.validate_frames(env_ids, frames)
+                    this._weighted_reset_env_ids = env_ids
+                    try:
+                        return super().reset(env_ids, frames)
+                    finally:
+                        this._weighted_reset_env_ids = None
+                return super().reset(env_ids, frames)
+
             def sample_frames(this, n):
+                if task_sampler is not None:
+                    env_ids = getattr(this, "_weighted_reset_env_ids", None)
+                    if env_ids is None or len(env_ids) != n:
+                        raise RuntimeError("weighted sampling requires explicit reset environment identities")
+                    return task_sampler.sample(this, env_ids)
                 m = this.motion
                 bins = compatible
                 soft = torch.softmax(-25 * this.bin_G[bins] / this.G_max, 0)
@@ -544,6 +568,7 @@ class HOITrackingSim:
 
         self.env = AssetTrackingSim(sim_cfg, num_envs, motion, mdp.human, gamma=gamma, eval_mode=eval_mode,
                                    max_episode_steps=max_episode_steps, reset_noise=reset_noise, scene_factory=scene_factory)
+        self.task_sampler = task_sampler
         self.device, self.N, self.motion, self.mdp = self.env.device, num_envs, motion, mdp
         self.asset = dict(asset)
         self.cooking_only = cooking_only

@@ -277,6 +277,9 @@ def write_split(selection, metadata_path, output, eval_fraction=.1, seed=2026103
 
 def read_split(path):
     value = load_json(path)
+    if value.get('schema') == 'hoi_compact_teacher_split_v1':
+        from .compact_teacher import read_compact_split
+        return read_compact_split(path)
     root = Path(path).resolve().parent
     def bound(name):
         candidate=Path(name)

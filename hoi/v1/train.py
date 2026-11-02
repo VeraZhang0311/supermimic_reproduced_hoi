@@ -26,6 +26,15 @@ def read_checkpoint(path):
     return torch.load(io.BytesIO(raw), map_location="cpu", weights_only=False), hashlib.sha256(raw).hexdigest()
 
 
+def write_sampling_snapshot(output, report):
+    """Atomically refresh this run's cumulative collection receipt."""
+    path = Path(output) / "sampling_actual.json"
+    temporary = path.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(report, ensure_ascii=False, sort_keys=True,
+                                    indent=2, allow_nan=False) + "\n", encoding="utf-8")
+    temporary.replace(path)
+
+
 def read_config(path=None):
     payload = json.loads(Path(path).read_text(encoding="utf-8")) if path else {}
     unknown = set(payload) - {field.name for field in fields(TrainConfig)}
@@ -54,6 +63,8 @@ def collect(learner, workers, steps):
                                                      minlength=learner.motion.num_bins)
         action = learner.action(snapshot)
         transition = workers.step(action)
+        if getattr(learner, "sampling_audit", None) is not None:
+            learner.sampling_audit.observe(transition)
         learner.observe(transition)
         values.append({"human_reward_normalized": float(transition["r_human"].mean()) / .1,
                        "hoi_reward_normalized": float(transition["r"].mean()) / .15,
@@ -82,6 +93,8 @@ def train_loop(learner, workers, output, *, physics, data_identity, initializati
     collect(learner, workers, config.warmup_steps)
     write_json(output / "prefill.json", {"vector_steps": config.warmup_steps, "sim_steps": learner.sim_steps,
                                         "fresh_replay": True, "bitwise_continuation": False})
+    if getattr(learner, "sampling_audit", None) is not None:
+        write_json(output / "sampling_actual_prefill.json", learner.sampling_audit.report())
     accumulator = 0.
     policy_updates = wm_updates = 0
     evaluation_dispatches = []
@@ -143,6 +156,9 @@ def train_loop(learner, workers, output, *, physics, data_identity, initializati
                           "fit_contact_positive": learner.contact_positive.tolist(),
                           "fit_contact_negative": learner.contact_negative.tolist(),
                           "contact_channels": list(CHANNELS), "contact_label_schema": LABEL_SCHEMA}
+                if getattr(learner, "sampling_audit", None) is not None:
+                    record["sampling_actual"] = learner.sampling_audit.report()
+                    write_sampling_snapshot(output, record["sampling_actual"])
                 metrics.write(json.dumps(record, allow_nan=False) + "\n")
                 print(json.dumps({key: record[key] for key in ("iteration", "sim_steps", "wm_updates", "policy_updates")}), flush=True)
                 if tracker is not None:
@@ -184,6 +200,8 @@ def train_loop(learner, workers, output, *, physics, data_identity, initializati
                                          "bin_clip": learner.motion.bin_clip.tolist(),
                                          "bin_asset": learner.motion.bin_asset.tolist(),
                                          "clip_names": learner.motion.names})
+    if getattr(learner, "sampling_audit", None) is not None:
+        write_sampling_snapshot(output, learner.sampling_audit.report(detail=True))
     return summary
 
 
@@ -283,6 +301,11 @@ def main(argv=None):
                                  "collector_devices": collector_devices, "worker_startup_concurrency": args.worker_startup_concurrency, "assets_per_process": args.assets_per_process,
                                  "full_gpu_memory_and_throughput_validated": False,
                                  "cache_and_source_bytes_rechecked_on_load_bundle": True}
+    if bundle.get("task_sampling") is not None:
+        from .packed_probe import specs_from_header
+        from .task_sampling import allocation_report
+        plan["task_sampling"] = bundle["task_sampling"]
+        plan["sampling_allocation"] = allocation_report(bundle, specs_from_header(bundle, config.num_envs))
     write_json(output / "plan.json", plan)
     if args.preflight:
         print(json.dumps(plan, allow_nan=False))
@@ -350,6 +373,9 @@ def main(argv=None):
                           "sha256": checkpoint_sha, "origin": checkpoint["initialization"]}
     write_json(output / "initialization.json", initialization)
     specs = allocate_workers(bundle, motion, config.num_envs)
+    if bundle.get("task_sampling") is not None:
+        from .sampling_audit import ActualCollectionAudit
+        learner.sampling_audit = ActualCollectionAudit(bundle, specs, device=args.device)
     resources = resource_preflight(specs, device=args.device, max_processes=args.max_processes,
                                    collector_devices=args.collector_devices, worker_startup_concurrency=args.worker_startup_concurrency, assets_per_process=args.assets_per_process)
     resources["replay_bytes"] = sum(t.numel() * t.element_size() for t in replay.data.values())

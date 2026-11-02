@@ -36,6 +36,8 @@ CASE_SCALARS = (
 )
 ERROR_GROUPS = ("body_position_m", "hand_position_m", "object_position_m", "object_orientation_deg",
                 "object_linear_velocity_mps", "object_angular_velocity_radps")
+EVALUATION_AGGREGATE_SCALARS = ("count", "phc_pass", "object_pose_pass", "body_and_object_pose_pass", "supermimic_n_failed",
+    "supermimic_norm_return", "human_normalized_return", "hoi_normalized_return", "hoi_reference_mask_normalized_return", "objective_normalized_return")
 
 
 def destination():
@@ -186,14 +188,37 @@ def _training_event(record):
         metrics["gate/policy_passed"] = record["policy_gate"]["passed"]
     if type(_nested(record, "wm_quality", "passed")) is bool:
         metrics["diagnostics/wm_quality_passed"] = record["wm_quality"]["passed"]
+    sampling = _mapping(record.get("sampling_actual"))
+    if sampling:
+        from .task_sampling import CATEGORY_PERCENT
+        for category in CATEGORY_PERCENT:
+            for field, label in (("category_fractions", "fraction"),
+                                 ("category_error_percentage_points", "error_percentage_points"),
+                                 ("category_counts", "transitions")):
+                _put(metrics, "sampling/" + category + "/" + label, _nested(sampling, field, category))
+        _put(metrics, "sampling/total_transitions", sampling.get("total_transitions"))
+        _put(metrics, "sampling/allocation_match", sampling.get("allocation_match"))
     return {"step": record["iteration"], "metrics": metrics}
 
 
 def _evaluation_summary(report):
     metrics = {}
-    for key in ("count", "phc_pass", "object_pose_pass", "body_and_object_pose_pass", "supermimic_n_failed",
-                "supermimic_norm_return", "human_normalized_return", "hoi_normalized_return", "hoi_reference_mask_normalized_return", "objective_normalized_return"):
+    for key in EVALUATION_AGGREGATE_SCALARS:
         _put(metrics, "evaluation/" + key, _nested(report, "aggregate", key))
+    sitting = _mapping(report.get("grail_sitting_eval"))
+    if sitting.get("schema") == "hoi_grail_sitting_eval_v1":
+        prefix = "evaluation/grail_sitting/"
+        for key in EVALUATION_AGGREGATE_SCALARS:
+            _put(metrics, prefix + key, _nested(sitting, "aggregate", key))
+        for key in ("chair_count", "source_group_count", "augmentation_count", "coverage_complete",
+                    "source_group_disjoint", "native_asset_disjoint"):
+            _put(metrics, prefix + key, sitting.get(key))
+        for chair in _rows(sitting.get("per_chair")):
+            asset_id = _mapping(chair).get("asset_id")
+            if type(asset_id) is not int or asset_id < 0:
+                continue
+            for key in EVALUATION_AGGREGATE_SCALARS:
+                _put(metrics, prefix + f"chair_{asset_id:04d}/" + key, _nested(chair, "aggregate", key))
     for key in ("checkpoint_iteration", "optimizer_updates", "normalization_updates", "no_failure_reset", "physical_objects", "elapsed_seconds"):
         _put(metrics, "evaluation/" + key, report.get(key))
     for index, case in enumerate(_rows(report.get("cases"))):
@@ -302,9 +327,15 @@ def _validate_payload(payload):
                      for key in ("onset_count", "release_count", "valid_adjacent_intervals"))
     case_keys.update("paired_reward_gap/" + horizon + "/" + key for horizon in ("1", "8", "32")
                      for key in ("sequence_count", "valid_intervals", "signed_reward_gap_mean", "absolute_reward_gap_mean", "reward_gap_rmse"))
+    sitting_keys = {"evaluation/grail_sitting/" + name for name in (
+        *EVALUATION_AGGREGATE_SCALARS, "chair_count", "source_group_count", "augmentation_count",
+        "coverage_complete", "source_group_disjoint", "native_asset_disjoint")}
     for key, value in payload["summary"].items():
         match = re.fullmatch(r"evaluation/case_\d{5,}/(.+)", key)
+        sitting_chair = re.fullmatch(r"evaluation/grail_sitting/chair_\d{4,}/(.+)", key)
         allowed = (key in {"evaluation/" + name for name in aggregate} or
+                   key in sitting_keys or
+                   (sitting_chair and sitting_chair.group(1) in EVALUATION_AGGREGATE_SCALARS) or
                    key in {"checkpoint/iteration", "checkpoint/wm_updates_this_run", "checkpoint/policy_updates_this_run", "run/completed"} or
                    (key.startswith("last/") and key[5:] in train_keys) or (match and match.group(1) in case_keys))
         if not allowed or not _number(value):

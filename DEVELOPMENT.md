@@ -1,6 +1,13 @@
 # SuperMimic HOI v1 开发入口
 
-本工作区为用户指定的资源优化分支 **`hoi/multi-asset-collectors`**，从teacher提交`0d1a11e`派生。
+本工作区当前分支 **`codex/hoi-compact-weighted-teacher`**，从资源优化分支
+`hoi/multi-asset-collectors` 的 `85d8c1e` 派生。用户授权精简数据、独立坐下评估和
+16 类 weighted sampling，并要求测试后 commit/push，**先不启动训练**。
+精简数据入口 `python -m hoi.data.compact_teacher`，采样合同 `hoi/v1/task_sampling.py`，
+实际 transition 审计 `hoi/v1/sampling_audit.py`，零训练验收脚本
+`cluster/hoi_compact_teacher_verify.sbatch.sh`。完整方案见 teacher 说明的 compact 小节。
+
+以下记录继承的资源优化与teacher历史：原资源优化分支从teacher提交`0d1a11e`派生。
 原teacher排队作业1488620及冻结源码保持不动；新分支只做多资产共进程和4096/2048环境
 资源对照，不启动另一个训练。teacher此前从整理后的 v1 基线
 `fd626e752686ef61b3e7e1b604f12412a9d5cd2b` 创建，不包含 v1.1/v1.2 感知改动。

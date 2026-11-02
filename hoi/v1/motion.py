@@ -13,7 +13,8 @@ from .contacts import CHANNELS
 
 
 class TrainingMotionBank(MotionLib):
-    def __init__(self, clips, kin, device="cpu", partition="train", retain_source_reference=None):
+    def __init__(self, clips, kin, device="cpu", partition="train", retain_source_reference=None,
+                 task_sampling=None, sampling_population=None):
         if partition not in ("train", "protected_eval", "eval80", "test40", "validation", "regression", "test"):
             raise ValueError("unknown reference partition")
         if not clips:
@@ -83,6 +84,8 @@ class TrainingMotionBank(MotionLib):
             last_bin = torch.nonzero(self.bin_clip == clip, as_tuple=False)[-1, 0]
             self.frame_bin[self.clip_end[clip]] = last_bin
         self.bin_asset = self.asset_ids[self.bin_start]
+        from .task_sampling import attach_sampling_metadata
+        attach_sampling_metadata(self, clips, task_sampling, sampling_population)
         if not all(bool(torch.isfinite(x).all()) for x in self.ref_arrays() + self.ref_object_arrays()):
             raise ValueError("non-finite reference")
 
