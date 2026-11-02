@@ -34,6 +34,16 @@ bundle=json.loads((Path(os.environ['COMPACT_DATASET'])/'bundle_train/bundle.json
 binding=bundle['robot_fk']
 path=Path(binding['mjcf_path'])
 assert hashlib.sha256(path.read_bytes()).hexdigest()==binding['mjcf_sha256']
+# Frozen source archives intentionally exclude raw data. Native palm QA still
+# reads these original meshes relative to the checkout; bind their directory
+# without copying or changing any source asset, then verify both exact bytes.
+local=Path(os.environ['SUPERMIMIC_ROOT'])/'data/g1_description'
+if not local.exists() and not local.is_symlink():
+    local.parent.mkdir(parents=True,exist_ok=True)
+    local.symlink_to(path.parent,target_is_directory=True)
+from hoi.hand_collision import HAND_SHA
+for side,expected in HAND_SHA.items():
+    assert hashlib.sha256((local/'meshes'/(side+'_rubber_hand.STL')).read_bytes()).hexdigest()==expected
 print(path)
 PY
 )"
