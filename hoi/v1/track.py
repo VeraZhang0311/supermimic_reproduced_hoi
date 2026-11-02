@@ -304,6 +304,11 @@ def _validate_payload(payload):
     train_keys.update("contact/" + sign + "/" + channel for sign in ("fit_positive", "fit_negative") for channel in CHANNELS)
     train_keys.add("gate/policy_passed")
     train_keys.add("diagnostics/wm_quality_passed")
+    from .task_sampling import CATEGORY_PERCENT
+    train_keys.update("sampling/" + category + "/" + field
+                      for category in CATEGORY_PERCENT
+                      for field in ("fraction", "error_percentage_points", "transitions"))
+    train_keys.update({"sampling/total_transitions", "sampling/allocation_match"})
     previous = -1
     for event in payload["events"]:
         if set(event) != {"step", "metrics"} or type(event["step"]) is not int or event["step"] <= previous:

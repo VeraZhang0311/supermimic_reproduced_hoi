@@ -50,6 +50,26 @@ class TrackingEnvironment(unittest.TestCase):
 
 
 class TrackingTest(TrackingEnvironment):
+    def test_actual_sampling_metrics_pass_send_whitelist_without_raw_groups(self):
+        from hoi.v1.track import _validate_payload
+        plan, rows, evaluation = inputs()
+        rows[0]["sampling_actual"] = {
+            "category_fractions": {"omnicontact/table": .15, SECRET: .85},
+            "category_error_percentage_points": {"omnicontact/table": 0.},
+            "category_counts": {"omnicontact/table": 150},
+            "total_transitions": 1000, "allocation_match": True,
+            "source_group_transition_counts": {SECRET: 1000}}
+        payload = build_payload(plan, rows, evaluation)
+        _validate_payload(payload)
+        metrics = payload["events"][0]["metrics"]
+        self.assertEqual(metrics["sampling/omnicontact/table/fraction"], .15)
+        self.assertEqual(metrics["sampling/total_transitions"], 1000)
+        self.assertEqual(payload["summary"]["last/sampling/total_transitions"], 1000)
+        self.assertNotIn(SECRET, json.dumps(payload))
+        metrics["sampling/raw_source_groups"] = 1
+        with self.assertRaisesRegex(ValueError, "whitelist"):
+            _validate_payload(payload)
+
     def test_actor_profile_exports_teacher_identity_and_rejects_arbitrary_strings(self):
         from hoi.v1.privileged import BASE_PROFILE, TEACHER_PROFILE
         plan, rows, evaluation = inputs()
