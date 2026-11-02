@@ -697,4 +697,29 @@ minibatch backward。只有models/reference已装入后发生CUDA OutOfMemoryErr
 2048通过也只说明该环境数的对照通过，不替代默认4096的容量结论。两种配置均0 optimizer step、
 无正式训练或W&B训练run；optimizer.step自身临时分配、完整多步更新和长期峰值仍不在此预检范围。
 CPU容量相关24项测试、启动脚本bash语法及内嵌Python语法检查通过；56资产各自至少有一条
-长于H32的参考片段（各资产最长片段的最小值249帧）。提交不等于容量通过，结果待作业报告。
+长于H32的参考片段（各资产最长片段的最小值249帧）。
+
+1490289最终FAILED/exit 1，总时长02:01:03（2026-11-02 10:26:33 EST开始）。4096与2048
+均完成全部56资产初始化、128步实采、完整WM backward，真实actor起点覆盖所有资产；随后
+均在actor imagination前向的privileged IG最近表面点计算处CUDA OOM，未完成actor backward
+或critic验收。两组源码身份一致、资源测量完整、无外部GPU进程混入、无finalization错误，
+optimizer_steps=0、formal_training_started=false。失败前采样峰值（GiB）：
+
+| 环境数 | 进程树PSS | learner卡 | collector卡 |
+| --- | ---: | ---: | ---: |
+| 4096 | 17.0485 | 23.3203 | 10.3828 |
+| 2048 | 16.2852 | 23.5332 | 7.5938 |
+
+两组各自启动器总耗时3707.21/3197.72秒；整作业Slurm batch MaxRSS为27.6880GiB，口径
+不同于进程树PSS。上述峰值为失败前采样下界，不是完整训练峰值。2048只降低环境/replay宽度，
+actor batch4096/H32不变；不能据此宣称减半了actor计算，也不能把再加采集卡当作解决单卡
+learner显存问题。原始报告保存于capacity_01/envs_{4096,2048}/report.json，本地ignored
+data/compact_teacher_20261101/capacity_{4096,2048}_01.json亦保留。
+
+用户随后明确要求先用两张L40验证完整数据，不拆multi-teacher。新作业 **1493079** 于
+2026-11-02 12:43:03 EST在dj-l40-0实际RUNNING，batch/liu-account、2×L40、16 CPU、64GiB
+RAM、3小时30分上限。复用同一source_06、dataset_04、native evidence及原容量启动器SHA
+`e798b64a6ac6368f90cba77cbf09366c389af841d25a26243e09f593dfcffb9d`，仅改变卡型与独立输出
+capacity_l40_01。仍一张learner、一张collector，先4096，只有干净learner OOM才继续2048；
+训练参数和物理合同不变，0 optimizer step，无正式训练。提交回执在capacity_l40_01_submission。
+当前RUNNING不是容量通过；多teacher拆分尚未实施。
