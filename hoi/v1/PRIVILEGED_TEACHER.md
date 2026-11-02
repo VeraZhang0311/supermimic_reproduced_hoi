@@ -685,3 +685,16 @@ Windows native_snapshot_render出现0xC0000005，该模块隔离后7项全过；
 1490091完成数据构建后因缺少checkout相对MJCF失败；1490092因缺少原始双手STL失败，
 均未完成实采。验收脚本现从bundle绑定MJCF并检查SHA，给冻结checkout挂原始机器人目录，
 检查双手固定SHA，原文件不改写。源码在节点本地临时盘解压，避免登录节点共享盘小文件I/O拖延。
+
+2026-11-02用户授权完整learner容量预检，作业 **1490289** 已提交（2×A10、16 CPU、64GiB RAM，
+3小时30分上限）。入口 `cluster/hoi_compact_teacher_capacity.sbatch.sh` 复用已验收source_06、
+dataset_04和native evidence，另存新目录 `capacity_01`，不覆盖实采证据。
+learner独占cuda:0；两个collector进程各28资产，共用cuda:1。先测4096环境、128步真实采集，
+完整replay深度1000、WM batch2048/window8、actor batch4096/H32保持；预留所有参数两份Adam
+moment，执行真实WM backward、actor imagination backward、全量critic target及一个完整critic
+minibatch backward。只有models/reference已装入后发生CUDA OutOfMemoryError且正常清理、
+源码未变时才顺序试2048环境；其他失败停止诊断，不通过削减数据或batch绕过。
+2048通过也只说明该环境数的对照通过，不替代默认4096的容量结论。两种配置均0 optimizer step、
+无正式训练或W&B训练run；optimizer.step自身临时分配、完整多步更新和长期峰值仍不在此预检范围。
+CPU容量相关24项测试、启动脚本bash语法及内嵌Python语法检查通过；56资产各自至少有一条
+长于H32的参考片段（各资产最长片段的最小值249帧）。提交不等于容量通过，结果待作业报告。
