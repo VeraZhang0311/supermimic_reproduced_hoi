@@ -6,6 +6,10 @@
 精简数据入口 `python -m hoi.data.compact_teacher`，采样合同 `hoi/v1/task_sampling.py`，
 实际 transition 审计 `hoi/v1/sampling_audit.py`，零训练验收脚本
 `cluster/hoi_compact_teacher_verify.sbatch.sh`。完整方案见 teacher 说明的 compact 小节。
+精简数据已在集群 `hoi_compact_teacher_20261101_01/dataset_04` 生成：6537 train、1085 eval，
+其中GRAIL独立评估50条/5椅。2026-11-02作业1490096已COMPLETED/exit 0：4096环境、56资产、
+128步实采524288条transition通过配额审计，原生证据继承和最终preflight均通过。
+正式训练未启动；仍需新的完整learner容量预检决定最终训练卡数。
 
 以下记录继承的资源优化与teacher历史：原资源优化分支从teacher提交`0d1a11e`派生。
 原teacher排队作业1488620及冻结源码保持不动；新分支只做多资产共进程和4096/2048环境

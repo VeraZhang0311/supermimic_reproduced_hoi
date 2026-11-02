@@ -648,4 +648,40 @@ CPU验收：56模块608项，606通过、2项环境跳过（Windows symlink权�
 另补GRAIL独立评估相关58项测试通过。完整回归按模块独立进程执行：单进程discover曾在
 Windows native_snapshot_render出现0xC0000005，该模块隔离后7项全过；不将该异常隐去。
 累计采样报告使用原子更新，已覆盖连续多轮日志与结束时详细报告，避免exclusive写入冲突。
-本地验收明细留ignored `data/compact_teacher_20261101/`。GPU实际采集结果另行记录；未训练。
+本地验收明细留ignored `data/compact_teacher_20261101/`。新增采样指标发送白名单回归通过，
+包括真实audit报告到tracking payload的50个聚合标量；未训练。
+
+2026-11-02实采验收作业 **1490096**（2×A10、4096环境、56资产、每进程28资产）完成128步，
+共 **524288** 条真实transition、12783次episode结束。逐tick类别、子任务、资产、固定lane
+全部一致；两个collector均收到closed ACK并exit 0，无存活子进程，关闭耗时38.36秒。
+实际16类比例如下，最大取整误差 **0.0185547个百分点**：
+
+| 类别 | 目标 | 实采 |
+| --- | ---: | ---: |
+| ULTRA largebox / plasticbox / smallbox（各） | 6% | 6.005859% |
+| ULTRA suitcase | 6% | 5.981445% |
+| HOI-Retarget九类（各） | 4% | 4.003906% |
+| Omni桌面 / soccer（各） | 15% | 14.990234% |
+| GRAIL sitting | 10% | 9.985352% |
+
+实采过程源码未变，source identity `fab38afc03836ff450c272255ce592f26bb248084da58d1835ad32150693ce77`
+与本地可执行源码逐文件一致；冻结source_06 manifest SHA为
+`9d06cb84660a396989dfb1054434aa7c9c73050190224d586350d3ede847e774`。
+原生继承gate已通过（0 blockers）；最终训练入口preflight通过，训练/评估bundle、源码身份
+及完整配额与实采回执一致。Slurm COMPLETED、exit 0、总时长01:04:25。
+不能把此项实采验收称为学习器完整容量验收。optimizer_steps=0、formal_training_started=false。
+
+实采资源观测：进程树PSS采样峰14.0245GiB、两张采集卡的进程显存采样峰3.6816/6.7012GiB，
+采样完整；它们是采样下界，未包含learner、replay、Adam或actor/critic前反向。
+完整作业（含清单/证据/preflight校验）Slurm batch MaxRSS为34.1337GiB，和上述采集阶段
+进程树PSS的口径不同，不能据14GiB采集PSS宣称整个任务只需14GiB内存。
+资产初始化2327.50秒，128步采集619.26秒，collector计时吞吐915.36 environment steps/s；
+不同于端到端训练吞吐，也未验证单张采集卡部署。
+
+结果根目录 `/mnt/projects/ll/tianzizh/hoi_compact_teacher_20261101_01`：
+`dataset_04/report.json`、`verify_06/collection_probe/collection/report.json`、
+`verify_06/native_gate/native_evidence.json`、`gate.json`和`verify_06/final_preflight/plan.json`。
+精简protected_eval占14.2351%，沿用原分区及独立椅子，未为凑10%将protected片段移入训练。
+1490091完成数据构建后因缺少checkout相对MJCF失败；1490092因缺少原始双手STL失败，
+均未完成实采。验收脚本现从bundle绑定MJCF并检查SHA，给冻结checkout挂原始机器人目录，
+检查双手固定SHA，原文件不改写。源码在节点本地临时盘解压，避免登录节点共享盘小文件I/O拖延。
