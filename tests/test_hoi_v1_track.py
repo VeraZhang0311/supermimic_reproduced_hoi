@@ -313,7 +313,9 @@ def fake_sdk(*, fail_init=False):
         url = "https://example.invalid/new-private-run"
         def __init__(self):
             self.summary, self.logs, self.finish_calls = {}, [], 0
-        def log(self, metrics, step):
+        def log(self, metrics, step, commit=None):
+            if commit is not True:
+                raise AssertionError("complete live metric records must commit immediately")
             self.logs.append((step, deepcopy(metrics)))
         def finish(self):
             self.finish_calls += 1

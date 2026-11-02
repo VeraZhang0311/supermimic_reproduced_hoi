@@ -751,3 +751,12 @@ W&B项目superteacher（entity=tianzizh-university-of-pennsylvania）已实时�
 项目链接https://app.forge.coreweave.com/tianzizh-university-of-pennsylvania/superteacher。
 新输出train_01，回执train_01_submission/receipt.json；当前仅确认Slurm启动，在线run创建和
 首次optimizer更新需继续以live_start.json/训练日志为准。
+
+1493722后续已完成56资产初始化、64步replay预填充262144条transition，并记录iteration=1、
+wm_updates=10、policy_updates=0。W&B run为27c0cb5a1b244cdda8a34f12ca09bc28。
+用户报告W&B显示crashed时，Slurm仍RUNNING；学习器PID2152589存活，进程CPU时间增长，
+无live_failure或退出异常。API确认run=crashed、history=0，但summary已有首轮白名单指标。
+定位到日志使用显式step而未传commit=True，SDK会暂存该条history直到后续日志；50轮日志
+间隔及无系统指标上报使界面状态不能直接代表训练进程状态。已在开发源码显式commit=True，
+25项tracking/bootstrap测试通过。该改动尚未部署到正在运行的冻结source_train_01，未重启、
+未伪造服务端running状态；当前run历史恢复与后续训练推进仍需继续核对。

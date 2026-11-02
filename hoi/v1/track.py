@@ -539,7 +539,9 @@ class LiveTrainingTracker:
             raise ValueError("live training steps must increase within the same fresh run")
         _validate_payload({**self.payload, "events": [event], "summary": {}})
         try:
-            self.run.log(event["metrics"], step=event["step"])
+            # An explicit step defaults to commit=False in the SDK. Each
+            # record is complete, so flush it even when the next log is far away.
+            self.run.log(event["metrics"], step=event["step"], commit=True)
         except BaseException as exc:
             self._record_failure("metric_sync")
             if isinstance(exc, Exception):
