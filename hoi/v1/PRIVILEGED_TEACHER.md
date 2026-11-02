@@ -736,3 +736,18 @@ L40资源采样峰：learner卡32818MiB（32.0488GiB），collector卡11084MiB�
 依然optimizer_steps=0、formal_training_started=false：Adam moments已预留，但optimizer.step
 临时开销、完整多次更新与长期稳定性未测，正式训练未启动。原始报告位于
 capacity_l40_01/envs_4096/report.json，原A10失败证据保留。
+
+用户2026-11-02在容量通过后明确授权正式训练，作业 **1493722** 已RUNNING，Slurm记录启动
+15:44:00 EST，dj-l40-0，2×L40/16CPU/64GiB、7天上限、no-requeue。完整4096环境、56资产、
+6537训练片段、原16类配额、完整1085 protected_eval及GRAIL独立坐下评估保持。
+新入口cluster/hoi_compact_teacher_train.sbatch.sh绑定1493079通过的容量报告、完整data/config
+与实际部署；冻结source_train_01相对source_06唯一可执行科学源码列表差异是track.py增加
+HOI_WANDB_RUN_NAME，模型/学习器/采样/物理不改。新source identity为
+0552a21474fb5c75f79ec2f83bb489854377486202beac6918b7f7864614137e。
+25项tracking/bootstrap测试及训练/评估启动器语法检查通过。周期评估独立申请1×L40，使用共享
+持久冻结源码路径，不能改用训练节点临时路径。原273进程teacher启动器保留，不用于本次。
+W&B项目superteacher（entity=tianzizh-university-of-pennsylvania）已实时验证PRIVATE；项目此前
+已创建，本次新run名teacher_v1-20261102-154206-EST，resume=never，仅上传白名单指标/汇总。
+项目链接https://app.forge.coreweave.com/tianzizh-university-of-pennsylvania/superteacher。
+新输出train_01，回执train_01_submission/receipt.json；当前仅确认Slurm启动，在线run创建和
+首次optimizer更新需继续以live_start.json/训练日志为准。

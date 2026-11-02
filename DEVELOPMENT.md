@@ -20,8 +20,10 @@ MaxRSS 34.6634GiB。source_06/dataset_04及训练参数不变；未触发2048回
 用户随后明确授权正式训练：superteacher项目、teacher_v1-<美东日期时间>名称。
 新入口cluster/hoi_compact_teacher_train.sbatch.sh绑定通过的56资产packed报告与原参数；
 仅track.py增加显式HOI_WANDB_RUN_NAME，25项tracking测试及两个启动器语法检查通过。
-当前尚未提交：login1/login2均在SSH握手阶段Connection reset，待连接恢复后完成项目私有性
-核对、冻结训练源码和单次提交。不能把新授权或本地准备表述为已开始训练。
+VPN恢复后已实时核对superteacher项目为PRIVATE，正式训练作业1493722已RUNNING（dj-l40-0，
+2×L40、16CPU/64GiB、7天上限、不自动requeue）。run名teacher_v1-20261102-154206-EST。
+冻结源码source_train_01、输出train_01、提交回执train_01_submission位于同一compact实验根目录。
+当前仅确认作业启动，首次optimizer更新/W&B在线run仍须从训练日志核对，不能将RUNNING称为收敛。
 
 以下记录继承的资源优化与teacher历史：原资源优化分支从teacher提交`0d1a11e`派生。
 原teacher排队作业1488620及冻结源码保持不动；新分支只做多资产共进程和4096/2048环境
