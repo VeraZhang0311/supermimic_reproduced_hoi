@@ -27,8 +27,19 @@ for name,sha in json.loads(raw)['files'].items():
     assert hashlib.sha256((root/name).read_bytes()).hexdigest()==sha,name
 Path(os.environ['VERIFY_ROOT']).mkdir(parents=True,exist_ok=False)
 PY
+ROBOT_MJCF="$(python - <<'PY'
+import hashlib, json, os
+from pathlib import Path
+bundle=json.loads((Path(os.environ['COMPACT_DATASET'])/'bundle_train/bundle.json').read_text())
+binding=bundle['robot_fk']
+path=Path(binding['mjcf_path'])
+assert hashlib.sha256(path.read_bytes()).hexdigest()==binding['mjcf_sha256']
+print(path)
+PY
+)"
 python -m hoi.v1.packed_probe --mode capacity --sampling-audit \
   --bundle "$COMPACT_DATASET/bundle_train/bundle.json" \
+  --robot-mjcf "$ROBOT_MJCF" \
   --output "$VERIFY_ROOT/collection_probe" --num-envs "${PROBE_NUM_ENVS:-4096}" \
   --assets-per-process 28 --collector-devices cuda:0 cuda:1 \
   --worker-startup-concurrency 2 --steps "${PROBE_STEPS:-128}"
@@ -42,6 +53,7 @@ python -m hoi.v1.train --preflight --from-scratch \
   --config configs/hoi_v1_privileged_teacher.json \
   --bundle "$COMPACT_DATASET/bundle_train/bundle.json" \
   --eval-bundle "$COMPACT_DATASET/bundle_protected_eval/bundle.json" \
+  --robot-mjcf "$ROBOT_MJCF" \
   --native-evidence "$VERIFY_ROOT/native_gate/native_evidence.json" \
   --hand-collision --self-collision --device cuda:0 \
   --collector-devices cuda:0 cuda:1 --assets-per-process 28 \
