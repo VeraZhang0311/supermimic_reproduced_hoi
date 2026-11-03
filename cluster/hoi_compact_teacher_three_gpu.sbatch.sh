@@ -48,11 +48,22 @@ assert {p for p in source['files'] if source['files'][p] != baseline['files'][p]
 config, _ = read_config(Path('configs/hoi_v1_privileged_teacher.json'))
 current_config = config.to_dict()
 assert current_config['log_every'] == 10
-assert {k for k in current_config if current_config[k] != r['production_config'][k]} == {'log_every'}
+assert current_config['ckpt_every'] == 100
+assert {k for k in current_config if current_config[k] != r['production_config'][k]} == {'log_every', 'ckpt_every'}
 import torch
 assert torch.cuda.device_count() == 3, 'three allocated GPUs required'
 bundle = _read_bundle_header(Path(os.environ['COMPACT_DATASET'])/'bundle_train/bundle.json')
 assert bundle_identity(bundle) == r['data_identity']
+if os.environ.get('RESUME_CHECKPOINT'):
+    path = Path(os.environ['RESUME_CHECKPOINT'])
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == os.environ['RESUME_CHECKPOINT_SHA256']
+    checkpoint = torch.load(path, map_location='cpu', weights_only=False)
+    assert checkpoint['iteration'] == 500
+    assert checkpoint['data_identity'] == bundle_identity(bundle)
+    assert current_config['wm_only_iters'] == 500
+    previous = checkpoint['extra']['config']
+    assert {k for k in current_config if current_config[k] != previous[k]} <= {'log_every', 'ckpt_every'}
+    del checkpoint
 assert len(bundle['clips']) == 6537
 mjcf = Path(bundle['robot_fk']['mjcf_path'])
 assert hashlib.sha256(mjcf.read_bytes()).hexdigest() == bundle['robot_fk']['mjcf_sha256']
@@ -66,7 +77,11 @@ for side, sha in HAND_SHA.items():
 print(json.dumps({'baseline_two_gpu_capacity_verified':True,'three_gpu_capacity_pretested':False,'collector_devices':['cuda:1','cuda:2'],'source_sha':source['content_sha256'],
                   'run_name':os.environ['HOI_WANDB_RUN_NAME']}),flush=True)
 PY
-exec python -m hoi.v1.train --from-scratch --config configs/hoi_v1_privileged_teacher.json \
+initialization=(--from-scratch)
+if [[ -n "${RESUME_CHECKPOINT:-}" ]]; then
+  initialization=(--resume "$RESUME_CHECKPOINT")
+fi
+exec python -m hoi.v1.train "${initialization[@]}" --config configs/hoi_v1_privileged_teacher.json \
   --bundle "$COMPACT_DATASET/bundle_train/bundle.json" \
   --eval-bundle "$COMPACT_DATASET/bundle_protected_eval/bundle.json" \
   --native-evidence "$NATIVE_EVIDENCE" --device cuda:0 --collector-devices cuda:1 cuda:2 \

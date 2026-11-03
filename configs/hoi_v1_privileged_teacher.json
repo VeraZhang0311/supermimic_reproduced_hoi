@@ -1,4 +1,5 @@
 {
   "actor_observation_profile": "privileged_teacher_v3",
-  "log_every": 10
+  "log_every": 10,
+  "ckpt_every": 100
 }

@@ -174,6 +174,24 @@ class TrainingFlowTests(unittest.TestCase):
         self.assertTrue(prefill["fresh_replay"])
         self.assertFalse(prefill["bitwise_continuation"])
 
+    def test_continuation_at_500_skips_wm_only_and_saves_on_100_boundary(self):
+        for start in (500, 599):
+            with self.subTest(start=start):
+                learner = self.learner(iterations=start + 2)
+                learner.iteration = start
+                learner.config = replace(learner.config, wm_only_iters=500, ckpt_every=100)
+                workers = SyntheticWorkers(learner)
+                output, result = self.run_loop(learner, workers, f"resume_{start}", passed=False)
+                rows = [json.loads(line) for line in (output / "metrics.jsonl").read_text().splitlines()]
+                self.assertEqual([r["iteration"] for r in rows], [start + 1, start + 2])
+                self.assertEqual(result["policy_updates"], 2)
+                self.assertTrue(all(r["actor"] is not None for r in rows))
+                self.assertEqual(workers.steps, 8 + 2 + 3)
+                if start == 599:
+                    self.assertTrue((output / "checkpoint_000600.pt").exists())
+                else:
+                    self.assertFalse((output / "checkpoint_000501.pt").exists())
+
     def test_failed_quality_does_not_delay_first_post_warmup_policy_update(self):
         learner = self.learner(iterations=4)
         learner.config = replace(learner.config, wm_only_iters=2)

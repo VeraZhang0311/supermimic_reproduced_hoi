@@ -1,5 +1,20 @@
 # SuperMimic HOI v1 开发入口
 
+## Liu 三卡恢复（2026-11-03）
+
+两卡1493722与三卡1494432均因PREEMPTED退出；两卡最后日志700轮/7000WM/200policy更新。
+已读回500轮checkpoint，199个张量均有限。用户授权在liu-compute、liu-account、ll-med上
+排3×L40续训，使用同schema --resume恢复模型、优化器与iteration；不重新执行WM-only warmup，
+但缺失replay必须fresh prefill，501轮即执行policy更新。log_every=10、ckpt_every=100；
+完整数据/4096环境/原优化参数/5000轮protected eval保持。ll-med仍可被ll-high抢占。
+新冻结source_train_liu_01、输出train_liu_01与提交回执train_liu_01_submission保留完整出处。
+已提交1496475：liu-compute/ll-med、3×L40、16CPU/64GiB、7天，run名
+teacher_v1-liu3gpu-resume500-20261103-080340-EST（superteacher PRIVATE）。
+source SHA 7434de3896d316edfe3cbbd27ee13c251f7c1a0578848a5f555f5379f7e344fd；
+resume SHA 91955006d11280758657d3de4d3fc670941767c41a1b5cc8c43a8c487f6b8f07。
+39项训练/恢复/追踪测试与bash/内嵌Python语法检查通过；包括501轮policy更新和600轮保存。
+下列旧作业状态仅为历史。
+
 ## 三卡采集对照（2026-11-02）
 
 本工作区分支codex/hoi-three-gpu-collector，用户授权直接启动独立3×L40训练。

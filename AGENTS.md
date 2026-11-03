@@ -1,5 +1,10 @@
 # Repository instructions
 
+2026-11-03最新授权：1493722与1494432均已PREEMPTED；在liu-compute/ll-med排3×L40，
+从train_01/checkpoint_000500.pt恢复完整模型/优化器/iteration，fresh replay后501轮直接policy更新。
+checkpoint每100轮、日志每10轮commit=True；其余科学配置不变。新source/output，保留旧实验。
+ll-med仍可被组内ll-high抢占，不承诺绝不抢占。以下运行状态为历史记录。
+
 当前工作区为用户授权的新分支 `codex/hoi-three-gpu-collector`，从8538851派生。
 原正式训练1493722继续运行，不修改/停止其冻结source_train_01或输出train_01。
 本分支直接启动独立3×L40正式训练对照：learner cuda:0，两个28资产collector各占cuda:1/2；
