@@ -1,5 +1,11 @@
 # Repository instructions
 
+当前工作区为用户授权的新分支 `codex/hoi-three-gpu-collector`，从8538851派生。
+原正式训练1493722继续运行，不修改/停止其冻结source_train_01或输出train_01。
+本分支直接启动独立3×L40正式训练对照：learner cuda:0，两个28资产collector各占cuda:1/2；
+完整数据/4096环境/训练参数保持，仅日志每10轮、commit=True。新输出与W&B run独立。
+以下历史说明中“当前分支”指原两卡实验；以本条新授权为准。
+
 ## 开发入口
 
 - 先读 `DEVELOPMENT.md`，再按需读 `notes/README.md`；默认目录 `D:/supermimic_reproduced_hoi`。

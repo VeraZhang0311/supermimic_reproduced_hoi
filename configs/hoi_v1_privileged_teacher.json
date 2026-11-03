@@ -1,3 +1,4 @@
 {
-  "actor_observation_profile": "privileged_teacher_v3"
+  "actor_observation_profile": "privileged_teacher_v3",
+  "log_every": 10
 }

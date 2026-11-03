@@ -1,5 +1,24 @@
 # SuperMimic HOI v1 开发入口
 
+## 三卡采集对照（2026-11-02）
+
+本工作区分支codex/hoi-three-gpu-collector，用户授权直接启动独立3×L40训练。
+原1493722保持运行；新部署为1张learner、2张collector，两个进程仍各28资产。
+完整数据、4096环境、batch/H32、物理、500轮WM预热与优化参数不变，仅log_every=10、
+W&B commit=True。入口cluster/hoi_compact_teacher_three_gpu.sbatch.sh。
+50项tracking/bootstrap/worker设备分配/packed进程测试与启动器语法检查通过。
+复用两卡容量通过作为学习器/数据基线，明确三卡部署尚未实测，不将旧报告冒充三卡验收。
+比较时使用日志elapsed_seconds差分，排除初始化/prefill，并区分WM-only与actor/critic阶段；
+日志频率差异属于本次对照的已知额外改动。以下是原两卡实验历史。
+
+新正式训练作业1494432已提交：batch/liu-account、3×L40、16CPU/64GiB、7天、no-requeue。
+2026-11-02读回为PENDING(Resources)，预计11月3日07:00:59 EST，估计可能变化。
+原1493722同时读回仍RUNNING，未停止、修改或重启。W&B仍用PRIVATE superteacher，独立run
+teacher_v1-3gpu-20261102-192402-EST，启动后创建在线记录。
+冻结source_train_3gpu_01和输出train_3gpu_01均在hoi_compact_teacher_20261101_01根目录；
+source identity d4326560bc47b88dd422e9f65e2bc8b2093bd81731d1a4ed422db1327b085305。
+回执train_3gpu_01_submission/receipt.json。未获得三卡吞吐数据，不宣称已有加速。
+
 本工作区当前分支 **`codex/hoi-compact-weighted-teacher`**，从资源优化分支
 `hoi/multi-asset-collectors` 的 `85d8c1e` 派生。用户授权精简数据、独立坐下评估和
 16 类 weighted sampling，并要求测试后 commit/push，**先不启动训练**。
