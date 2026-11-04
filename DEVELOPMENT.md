@@ -12,6 +12,14 @@ WorkerSpec的bin数绑定完整资产motion bank，环境数绑定本次选中�
 入口 `cluster/hoi_teacher_subset_evaluate.sbatch.sh`，新源/输出，默认公共1×A10、6CPU/64GiB。
 34项选择/完整轨迹/混合资产布局/旧评估测试及32项packed/periodic-eval测试通过，Bash语法通过。
 不改正在运行的训练冻结源，也不替换其5000轮全量评估日程；GPU结果须以独立回执为准。
+实际提交1500522，公共batch/normal、1×A10/6CPU/64GiB/6小时；读回RUNNING于dj-a40-0，
+原1498746仍RUNNING。10批、每批4–34环境；未启动2000pt小测。
+2200pt位于train_liu_auto_01/attempts/job_1498746_r0010/run/checkpoint_002200.pt，SHA
+9c73665a9c4be43021def99403f2fe905ca9f7867fe7481deb6865c1e8a58ad1。
+独立source_eval_sm_2200_01，source SHA 4f0f0cdb876e00541697014da576af6bfac731cff85bfae98ac58200e8db7e34；
+输出eval_sm_2200_01，回执eval_sm_2200_01_submission/receipt.json，均在compact实验根目录。
+本地回执data/protect_eval_sm_2200/；CPU已确认权重全有限、严格模型加载成功、109条名单绑定一致。
+RUNNING仅表示作业已分配，尚不能声称GPU容量/完整小测通过或已有各类任务成绩。
 
 ## protect_eval_sm 开发子集（2026-11-04）
 
