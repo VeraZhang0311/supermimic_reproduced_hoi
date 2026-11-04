@@ -541,6 +541,8 @@ def main(argv=None):
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--robot-mjcf")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--canonical-hoi80-bundle", type=Path,
+                        help="historical fixed HOI80 registry; select matching protected clips, keeping current data/physics")
     from supermimic.physics import add_physics_arguments, resolve_arguments
     add_physics_arguments(parser)
     args, launcher = parser.parse_known_args(argv)
@@ -550,6 +552,12 @@ def main(argv=None):
     settings, _ = resolve_arguments(args, checkpoint.get("physics"), require_legacy_explicit=True)
     training_bundle, header = _read_bundle_header(args.training_bundle), _read_bundle_header(args.bundle)
     validate_evaluation_identity(training_bundle, header)
+    selection = None
+    selected_ids = None
+    if args.canonical_hoi80_bundle:
+        from .canonical_hoi80 import select_canonical_hoi80
+        selected_ids, selection = select_canonical_hoi80(training_bundle, header, args.canonical_hoi80_bundle)
+        selected_ids = set(selected_ids)
     from .config import bundle_identity
     identity = bundle_identity(training_bundle)
     from supermimic.kinematics import G1Kinematics
@@ -582,6 +590,8 @@ def main(argv=None):
     results, native = [], []
     for asset in bundle["assets"]:
         clip_ids = torch.where(motion.asset_ids[motion.clip_start] == int(asset["asset_id"]))[0].tolist()
+        if selected_ids is not None:
+            clip_ids = [clip for clip in clip_ids if clip in selected_ids]
         if not clip_ids:
             continue
         spec = WorkerSpec(int(asset["asset_id"]), len(clip_ids), len(clip_ids), geometry_group(asset))
@@ -616,7 +626,12 @@ def main(argv=None):
               "aggregate": aggregate_values, "native": native, "optimizer_updates": 0, "normalization_updates": 0,
               "no_failure_reset": True, "physical_objects": True, "elapsed_seconds": time.monotonic() - started,
               "training_data_identity": identity, "evaluation_bundle_content_sha256": bundle["bundle_content_sha256"], **provenance}
-    sitting = grail_sitting_evaluation(bundle, training_bundle, results)
+    if selection is not None:
+        if {case["clip_id"] for case in results} != selected_ids or len(results) != 80:
+            raise RuntimeError("HOI80 evaluation did not cover exactly the selected cases")
+        report["scope"] = selection
+        report["selection"] = selection
+    sitting = grail_sitting_evaluation(bundle, training_bundle, results) if selection is None else None
     if sitting is not None:
         report["grail_sitting_eval"] = sitting
     _verify_evaluation_source(provenance["evaluation_source_identity"])

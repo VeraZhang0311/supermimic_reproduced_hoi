@@ -1,5 +1,16 @@
 # SuperMimic HOI v1 开发入口
 
+## 独立 canonical HOI80 小测（2026-11-04）
+
+用户授权用自动续训 campaign 的 checkpoint 2000 额外跑固定 HOI80，当前训练继续。
+入口 `cluster/hoi_teacher_hoi80.sbatch.sh`，单张 Liu L40；评估使用独立源码/新输出。
+`evaluate --canonical-hoi80-bundle` 只选择当前完整 protected_eval motion bank 中的固定80条，
+不改冻结bundle、不用旧五通道contact cache。旧registry固定content SHA作为名单依据，
+同时核对原motion SHA、原/目标帧数、保护标记、四类各20条及source group不进入train。
+仍按当前teacher的物理/观测/完整时长评估，报告明确为80条子集；不触发GRAIL全量汇总，
+不改变5000轮周期完整protected_eval。该入口不用于部署新训练源，原训练冻结源保持不变。
+28项选择/评估/GRAIL测试与Bash语法检查通过；实际GPU结果另以evaluation.json为准。
+
 ## 抢占自动续训与梯度检查（2026-11-03晚）
 
 1496475在17:23 EST被抢占，最后日志1320轮，完整checkpoint1300含800次本段policy更新。
