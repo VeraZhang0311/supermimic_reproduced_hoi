@@ -10,6 +10,14 @@
 仍按当前teacher的物理/观测/完整时长评估，报告明确为80条子集；不触发GRAIL全量汇总，
 不改变5000轮周期完整protected_eval。该入口不用于部署新训练源，原训练冻结源保持不变。
 28项选择/评估/GRAIL测试与Bash语法检查通过；实际GPU结果另以evaluation.json为准。
+集群CPU预检已通过：2000 checkpoint完整有限、当前模型严格加载成功、80条共23718控制步。
+权重SHA d58fe2d2fb3bd6625c4611d7b1d33c104bd79cefa4a6e44665522c10bbdb1426；
+路径为compact实验根下train_liu_auto_01/attempts/job_1498746_r0010/run/checkpoint_002000.pt。
+独立评估源码source_eval_hoi80_2000_01，source SHA
+1caf7ab8f015bdb7c00be89286a8828baf277a9c1a41c754e872028e4f33a60d；
+作业1500362（1×L40/4CPU/64GiB/4小时），输出eval_hoi80_2000_01，
+回执eval_hoi80_2000_01_submission/receipt.json。提交后PENDING(Resources)，原1498746 RUNNING。
+此为提交/CPU预检事实，尚无本次GPU评分结果；排队状态必须实时查询。
 
 ## 抢占自动续训与梯度检查（2026-11-03晚）
 
