@@ -1,5 +1,18 @@
 # SuperMimic HOI v1 开发入口
 
+## 2200pt protect_eval_sm 批量评估（2026-11-04）
+
+用户将本次小测checkpoint从2000改为2200，要求评估扩展任务且训练不动。
+新增 `evaluate --selection-manifest protect_eval_sm/selection.json --asset-batch-size 4`。
+选择验证绑定父bundle字节/内容哈希、原行索引与哈希、clips.jsonl、训练source group隔离。
+109条保持完整轨迹；同批最多4资产、按资产最长片段时长排序，合并策略推理，复用已有packed worker。
+packed进程内物理仍为独立solver串行context lease，不声称4倍物理并行或逐位等同旧batch形状。
+WorkerSpec的bin数绑定完整资产motion bank，环境数绑定本次选中片段；混合资产布局严格核对。
+结果新增dataset/task/asset分组与每批初始化/采集评分耗时；GRAIL5条不冒充完整50条独立评估。
+入口 `cluster/hoi_teacher_subset_evaluate.sbatch.sh`，新源/输出，默认公共1×A10、6CPU/64GiB。
+34项选择/完整轨迹/混合资产布局/旧评估测试及32项packed/periodic-eval测试通过，Bash语法通过。
+不改正在运行的训练冻结源，也不替换其5000轮全量评估日程；GPU结果须以独立回执为准。
+
 ## protect_eval_sm 开发子集（2026-11-04）
 
 用户要求从当前1085条protected_eval中选10%并先保存，不启动评估、不改自动评估日程。

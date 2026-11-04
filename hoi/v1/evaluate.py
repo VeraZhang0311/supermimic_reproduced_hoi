@@ -274,7 +274,10 @@ def evaluate_group(policy, motion, mdp, shapes, workers, clip_ids, *, fk39, join
         raise ValueError("evaluation clips require at least one full control interval")
     assets = motion.asset_ids[starts]
     if len(assets.unique()) != 1:
-        raise ValueError("evaluate_group only accepts one fixed geometry group")
+        specs = getattr(workers, "specs", ())
+        layout = [s.asset_id for s in specs for _ in range(s.num_envs)]
+        if layout != assets.tolist():
+            raise ValueError("mixed-asset evaluation must match the worker environment layout")
     order = [joint_names.index(name) for name in fk39.dof_names]
     snapshot = workers.reset(starts)
     if not torch.equal(snapshot["f"], starts) or not torch.equal(snapshot["asset_id"], assets):
@@ -543,9 +546,14 @@ def main(argv=None):
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--canonical-hoi80-bundle", type=Path,
                         help="historical fixed HOI80 registry; select matching protected clips, keeping current data/physics")
+    parser.add_argument("--selection-manifest", type=Path, help="frozen protected evaluation development selection")
+    parser.add_argument("--asset-batch-size", type=int, default=1,
+                        help="asset scenes per batch; one packed process, joint actor inference, independent solvers")
     from supermimic.physics import add_physics_arguments, resolve_arguments
     add_physics_arguments(parser)
     args, launcher = parser.parse_known_args(argv)
+    if args.asset_batch_size < 1 or (args.selection_manifest and args.canonical_hoi80_bundle):
+        parser.error("use a positive asset batch size and at most one selection mechanism")
     checkpoint, checkpoint_sha, provenance = _load_evaluation_snapshot(args.checkpoint)
     variant = checkpoint_variant(checkpoint)
     from .variants import geometry_input_enabled, reward_config, max_step_reward
@@ -558,6 +566,9 @@ def main(argv=None):
         from .canonical_hoi80 import select_canonical_hoi80
         selected_ids, selection = select_canonical_hoi80(training_bundle, header, args.canonical_hoi80_bundle)
         selected_ids = set(selected_ids)
+    if args.selection_manifest:
+        from .evaluation_subset import load_selection
+        selected_ids, selection = load_selection(args.selection_manifest, training_bundle, header)
     from .config import bundle_identity
     identity = bundle_identity(training_bundle)
     from supermimic.kinematics import G1Kinematics
@@ -588,23 +599,31 @@ def main(argv=None):
     output = fresh_directory(args.output)
     started = time.monotonic()
     results, native = [], []
-    for asset in bundle["assets"]:
-        clip_ids = torch.where(motion.asset_ids[motion.clip_start] == int(asset["asset_id"]))[0].tolist()
-        if selected_ids is not None:
-            clip_ids = [clip for clip in clip_ids if clip in selected_ids]
-        if not clip_ids:
-            continue
-        spec = WorkerSpec(int(asset["asset_id"]), len(clip_ids), len(clip_ids), geometry_group(asset))
-        config = {"physics": asdict(settings), "output": str(output / f"native_{spec.asset_id:04d}"),
+    from .evaluation_subset import asset_batches, stratified_results
+    batches = asset_batches(bundle, selected_ids, args.asset_batch_size)
+    batch_timings = []
+    registry = {int(a["asset_id"]): a for a in bundle["assets"]}
+    for batch_index, batch in enumerate(batches):
+        batch_started = time.monotonic()
+        clip_ids = [i for _, ids in batch for i in ids]
+        specs = [WorkerSpec(aid, len(ids), int((motion.bin_asset == aid).sum()), geometry_group(registry[aid]))
+                 for aid, ids in batch]
+        name = f"asset_{specs[0].asset_id:04d}" if args.asset_batch_size == 1 else f"batch_{batch_index:04d}"
+        config = {"physics": asdict(settings), "output": str(output / ("native_" + name)),
                   "bundle": str(args.bundle.resolve()), "device": args.device, "require_train": False,
                   "eval_mode": True, "reset_noise": False, "launcher_args": launcher,
+                  "assets_per_process": len(specs), "worker_startup_concurrency": 1,
                   "robot_mjcf": args.robot_mjcf, "seed": args.seed, "variant": variant}
+        print(json.dumps({"evaluation_batch_start": batch_index, "batches": len(batches),
+                          "asset_ids": [s.asset_id for s in specs], "parallel_environments": len(clip_ids)}), flush=True)
         with torch.no_grad():
-            workers = WorkerGroup([spec], config, device=args.device)
+            workers = WorkerGroup(specs, config, device=args.device)
+            initialized = time.monotonic()
             try:
-                _validate_contact_contract(workers.native_reports[0]["contact"])
+                for report in workers.native_reports:
+                    _validate_contact_contract(report["contact"])
                 results.extend(evaluate_group(policy, motion, mdp, shapes, workers, clip_ids, fk39=fk39, wm=wm, variant=variant,
-                                             joint_names=joint_names, output=output / f"asset_{spec.asset_id:04d}",
+                                             joint_names=joint_names, output=output / name,
                                              metadata={"checkpoint_sha256": checkpoint_sha, "checkpoint_iteration": checkpoint["iteration"],
                                                        "evaluation_source_content_sha256": provenance["evaluation_source_identity"]["content_sha256"],
                                                        "checkpoint_training_source_content_sha256": provenance["checkpoint_training_source_identity"].get("content_sha256"),
@@ -615,6 +634,11 @@ def main(argv=None):
                 native.extend(workers.native_reports)
             finally:
                 workers.close()
+        batch_timings.append({"batch": batch_index, "asset_ids": [s.asset_id for s in specs],
+                              "parallel_environments": len(clip_ids), "initialize_seconds": initialized-batch_started,
+                              "rollout_scoring_shutdown_seconds": time.monotonic()-initialized,
+                              "completed_cases": len(results)})
+        print(json.dumps({"evaluation_batch_complete": batch_timings[-1]}), flush=True)
     if sha256_file(args.checkpoint) != checkpoint_sha:
         raise RuntimeError("checkpoint bytes changed during frozen evaluation")
     aggregate_values = aggregate_evaluation_cases(results)
@@ -627,10 +651,15 @@ def main(argv=None):
               "no_failure_reset": True, "physical_objects": True, "elapsed_seconds": time.monotonic() - started,
               "training_data_identity": identity, "evaluation_bundle_content_sha256": bundle["bundle_content_sha256"], **provenance}
     if selection is not None:
-        if {case["clip_id"] for case in results} != selected_ids or len(results) != 80:
-            raise RuntimeError("HOI80 evaluation did not cover exactly the selected cases")
+        if {case["clip_id"] for case in results} != selected_ids or len(results) != len(selected_ids):
+            raise RuntimeError("evaluation did not cover exactly the selected cases")
         report["scope"] = selection
         report["selection"] = selection
+    report["execution"] = {"asset_batch_size": args.asset_batch_size, "batch_timings": batch_timings,
+                           "actor_inference": "batched across all environments in each asset batch",
+                           "physics": "independent asset solvers; serial active-context leases within packed process"}
+    if args.selection_manifest:
+        report["development_subset_results"] = stratified_results(bundle, results)
     sitting = grail_sitting_evaluation(bundle, training_bundle, results) if selection is None else None
     if sitting is not None:
         report["grail_sitting_eval"] = sitting
