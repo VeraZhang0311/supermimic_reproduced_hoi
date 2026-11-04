@@ -43,8 +43,8 @@ assert source['content_sha256'] == os.environ['SOURCE_CONTENT_SHA256']
 baseline = r['source_identity']
 assert baseline['content_sha256'] == 'fab38afc03836ff450c272255ce592f26bb248084da58d1835ad32150693ce77'
 assert set(source['files']) == set(baseline['files'])
-# Only logging code/config differ; collector topology is the explicit experiment.
-assert {p for p in source['files'] if source['files'][p] != baseline['files'][p]} == {'hoi/v1/track.py', 'configs/hoi_v1_privileged_teacher.json'}
+# Reviewed changes: logging, atomic checkpoint publication, gradient diagnostics.
+assert {p for p in source['files'] if source['files'][p] != baseline['files'][p]} == {'hoi/v1/track.py', 'hoi/v1/checkpoint.py', 'hoi/v1/learner.py', 'configs/hoi_v1_privileged_teacher.json'}
 config, _ = read_config(Path('configs/hoi_v1_privileged_teacher.json'))
 current_config = config.to_dict()
 assert current_config['log_every'] == 10
@@ -58,7 +58,8 @@ if os.environ.get('RESUME_CHECKPOINT'):
     path = Path(os.environ['RESUME_CHECKPOINT'])
     assert hashlib.sha256(path.read_bytes()).hexdigest() == os.environ['RESUME_CHECKPOINT_SHA256']
     checkpoint = torch.load(path, map_location='cpu', weights_only=False)
-    assert checkpoint['iteration'] == 500
+    assert checkpoint['iteration'] == int(os.environ['RESUME_ITERATION'])
+    assert current_config['wm_only_iters'] <= checkpoint['iteration'] < current_config['iterations']
     assert checkpoint['data_identity'] == bundle_identity(bundle)
     assert current_config['wm_only_iters'] == 500
     previous = checkpoint['extra']['config']

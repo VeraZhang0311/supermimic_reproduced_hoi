@@ -290,9 +290,13 @@ class Learner:
             nn.utils.clip_grad_value_(self.pi.parameters(), .1)
             if not bool(torch.isfinite(norm)) or not _finite_gradients(self.pi):
                 raise FloatingPointError("nonfinite policy BPTT gradient")
+            gradients = [p.grad.detach() for p in self.pi.parameters() if p.grad is not None]
+            post_clip_norm = torch.linalg.vector_norm(torch.stack([g.norm() for g in gradients]))
+            post_clip_max = torch.stack([g.abs().max() for g in gradients]).max()
             optimizer.step()
         value_loss = self.critic_update(trajectory, start)
         return {"pi_loss": float(loss.detach()), "v_loss": value_loss, "pi_gradnorm": float(norm),
+                "pi_gradnorm_post_clip": float(post_clip_norm), "pi_grad_absmax_post_clip": float(post_clip_max),
                 "imag_human_and_hoi_return_per_step": float(trajectory["reward"].detach().mean()),
                 "imag_survival": float(trajectory["terminal_survival"].detach().mean())}
 

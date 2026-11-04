@@ -1,5 +1,12 @@
 # Repository instructions
 
+2026-11-03晚最新授权：1496475再次PREEMPTED，保留完整1300轮checkpoint。
+用户要求liu-compute/ll-med、3×L40从1300恢复，并在抢占后由Slurm自动requeue、选择最新完整checkpoint。
+入口cluster/hoi_compact_teacher_requeue.sbatch.sh；campaign内按job/restart分attempt，flock防双producer。
+checkpoint原子发布，普通错误不自动重试；每次fresh replay，不重跑WM warmup。
+同步检查1270轮梯度尖峰：pi_gradnorm为裁剪前，norm1/value0.1/finite保护不变；补裁剪后诊断。
+账号当前只获授ll-med与normal；ll-high须管理员授权，不能擅自使用。
+
 2026-11-03最新授权：1493722与1494432均已PREEMPTED；在liu-compute/ll-med排3×L40，
 从train_01/checkpoint_000500.pt恢复完整模型/优化器/iteration，fresh replay后501轮直接policy更新。
 checkpoint每100轮、日志每10轮commit=True；其余科学配置不变。新source/output，保留旧实验。

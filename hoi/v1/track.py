@@ -172,7 +172,7 @@ def _training_event(record):
         values = [row[key] for row in _rows(record.get("wm")) if isinstance(row, dict) and _number(row.get(key))]
         _put(metrics, "wm/" + key, _mean(values))
     actor = _mapping(record.get("actor"))
-    for key in ("pi_loss", "v_loss", "pi_gradnorm", "imag_human_and_hoi_return_per_step", "imag_survival"):
+    for key in ("pi_loss", "v_loss", "pi_gradnorm", "pi_gradnorm_post_clip", "pi_grad_absmax_post_clip", "imag_human_and_hoi_return_per_step", "imag_survival"):
         _put(metrics, "actor/" + key, actor.get(key))
     for key in ("human_reward_normalized", "hoi_reward_normalized", "objective_reward_normalized", "terminations"):
         values = [row[key] for row in _rows(record.get("real")) if isinstance(row, dict) and _number(row.get(key))]
@@ -299,7 +299,7 @@ def _validate_payload(payload):
         raise ValueError("outgoing configuration violates the whitelist")
     train_keys = {"train/" + key for key in ("iteration", "sim_steps", "lr", "elapsed_seconds", "wm_updates", "policy_updates")}
     train_keys.update("wm/" + key for key in ("total", "robot", "object", "contact"))
-    train_keys.update("actor/" + key for key in ("pi_loss", "v_loss", "pi_gradnorm", "imag_human_and_hoi_return_per_step", "imag_survival"))
+    train_keys.update("actor/" + key for key in ("pi_loss", "v_loss", "pi_gradnorm", "pi_gradnorm_post_clip", "pi_grad_absmax_post_clip", "imag_human_and_hoi_return_per_step", "imag_survival"))
     train_keys.update("real/" + key for key in ("human_reward_normalized", "hoi_reward_normalized", "objective_reward_normalized", "terminations"))
     train_keys.update("contact/" + sign + "/" + channel for sign in ("fit_positive", "fit_negative") for channel in CHANNELS)
     train_keys.add("gate/policy_passed")

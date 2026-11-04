@@ -10,8 +10,10 @@ from copy import deepcopy
 from dataclasses import asdict, is_dataclass
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
+import uuid
 
 import torch
 
@@ -94,12 +96,26 @@ def make_checkpoint(policy, wm, critic, optimizers, *, iteration, physics, data_
 
 
 def save_checkpoint(path, *args, **kwargs):
-    """Exclusive create keeps scientific snapshots immutable."""
+    """Publish only complete checkpoints, without replacing existing snapshots."""
     checkpoint = make_checkpoint(*args, **kwargs)
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("xb") as stream:
-        torch.save(checkpoint, stream)
+    temporary = path.with_name(path.name + "." + uuid.uuid4().hex + ".partial")
+    try:
+        with temporary.open("xb") as stream:
+            torch.save(checkpoint, stream)
+            stream.flush()
+            os.fsync(stream.fileno())
+        # Same-filesystem hard link publishes atomically and fails if path exists.
+        os.link(temporary, path)
+        if hasattr(os, "O_DIRECTORY"):
+            descriptor = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+    finally:
+        temporary.unlink(missing_ok=True)
     return checkpoint
 
 

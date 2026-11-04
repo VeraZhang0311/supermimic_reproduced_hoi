@@ -342,6 +342,54 @@ class LearnerTest(unittest.TestCase):
             for key, value in model.state_dict().items():
                 torch.testing.assert_close(value, frozen[name][key])
 
+    def test_large_actor_gradient_is_clipped_before_adam_and_reported_before_clipping(self):
+        learner = make_learner()
+        parameter = next(learner.pi.parameters())
+        trajectory = {"objective": parameter.sum() * 10000., "reward": torch.ones(1),
+                      "terminal_survival": torch.ones(1)}
+        optimizer = learner.optimizers["pi"]
+        original_step = optimizer.step
+        observed = []
+        def checked_step():
+            gradients = [p.grad for p in learner.pi.parameters() if p.grad is not None]
+            norm = torch.stack([g.norm() for g in gradients]).norm()
+            maximum = max(float(g.abs().max()) for g in gradients)
+            observed.append((float(norm), maximum))
+            self.assertLessEqual(float(norm), 1.00001)
+            self.assertLessEqual(maximum, .100001)
+            return original_step()
+        with patch.object(learner.buffer, "sample_starts", return_value=({}, {})), \
+             patch.object(learner, "imagine", return_value=trajectory), \
+             patch.object(learner, "critic_update", return_value=0.), \
+             patch.object(optimizer, "step", side_effect=checked_step):
+            metrics = learner.policy_update()
+        self.assertGreater(metrics["pi_gradnorm"], 3909.)
+        self.assertEqual(len(observed), 1)
+        self.assertAlmostEqual(metrics["pi_gradnorm_post_clip"], observed[0][0])
+        self.assertAlmostEqual(metrics["pi_grad_absmax_post_clip"], observed[0][1])
+
+    def test_single_actor_gradient_component_is_value_clipped(self):
+        learner = make_learner()
+        parameter = next(learner.pi.parameters())
+        trajectory = {"objective": parameter.flatten()[0] * 10000., "reward": torch.ones(1),
+                      "terminal_survival": torch.ones(1)}
+        with patch.object(learner.buffer, "sample_starts", return_value=({}, {})), \
+             patch.object(learner, "imagine", return_value=trajectory), \
+             patch.object(learner, "critic_update", return_value=0.):
+            metrics = learner.policy_update()
+        self.assertAlmostEqual(metrics["pi_grad_absmax_post_clip"], .1)
+        self.assertAlmostEqual(metrics["pi_gradnorm_post_clip"], .1)
+
+    def test_nonfinite_actor_gradient_never_reaches_adam(self):
+        learner = make_learner()
+        parameter = next(learner.pi.parameters())
+        with patch.object(learner.buffer, "sample_starts", return_value=({}, {})), \
+             patch.object(learner, "imagine", return_value={"objective": parameter.sum() * float("inf")}), \
+             patch.object(learner.optimizers["pi"], "step") as step:
+            with self.assertRaisesRegex(FloatingPointError, "nonfinite policy"):
+                learner.policy_update()
+        step.assert_not_called()
+
     def test_checkpoint_resume_still_requires_fresh_real_replay_prefill(self):
         old = make_learner()
         fill(old)

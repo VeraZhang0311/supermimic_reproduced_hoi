@@ -1,5 +1,30 @@
 # SuperMimic HOI v1 开发入口
 
+## 抢占自动续训与梯度检查（2026-11-03晚）
+
+1496475在17:23 EST被抢占，最后日志1320轮，完整checkpoint1300含800次本段policy更新。
+1300 checkpoint SHA 2cafed04a190881682997bc06b196ef37248ebcc86a97e32ba7c3708b68cada2。
+用户授权三卡Liu从1300恢复及自动requeue。集群PreemptMode=REQUEUE，先前no-requeue已移除。
+入口cluster/hoi_compact_teacher_requeue.sbatch.sh及compact_teacher_requeue.py；同一Slurm job
+自动重新排队，按restart count创建独立attempt/run、W&B run后缀；flock防并发producer。
+仅扫描该campaign的checkpoint与绑定初始1300；校验结构、数据/物理/config身份、有限值后选最新。
+checkpoint先fsync临时文件，再hardlink原子发布且不覆盖旧文件；中途partial不会成为恢复候选。
+每次恢复需要fresh replay，不是逐位续跑；普通代码错误不会主动重提。5000倍数恢复点会补查原
+checkpoint目录中的eval提交回执，避免保存后抢占漏评估或重复提交。训练参数不变。
+第1270轮pi_gradnorm=3909.38、1280=256.75、1300=1.56、1320=1.70均为裁剪前指标；
+原实现先norm<=1，再每元素<=0.1，检查非有限后才Adam.step。补充裁剪后norm/absmax日志，
+不改阈值或动作定义。巨大原始梯度的具体样本原因无法从每10轮汇总倒推，不能宣称没有不稳定性。
+账户仅ll-med/normal，ll-high需要管理员开通。以下为历史记录。
+
+正式自动续训已提交1498746：liu-compute/ll-med、3×L40、16CPU/64GiB、7天、--requeue。
+冻结source_train_liu_auto_01、campaign train_liu_auto_01、回执train_liu_auto_01_submission；
+source SHA 19d5497e434b609ad59cb214a4e5e65cd10dee4c8393b4126e20a5a9924a29e1。
+W&B superteacher，run前缀teacher_v1-liu3gpu-auto1300-20261103-195859-EST，attempt后缀-r0000等。
+本地80项综合测试通过，随后新增单梯度分量case与优化器结构检查后的25项相关测试通过；
+集群实际文件系统8项恢复/原子checkpoint测试通过，真实1300权重选择验证通过。
+无GPU Slurm requeue测试1498745：同一job restart0/1均执行、最终COMPLETED/exit0。
+此测试验证主动requeue路径；尚未在正式GPU作业上再次发生抢占并完成恢复，不伪称已实测该事件。
+
 ## Liu 三卡恢复（2026-11-03）
 
 两卡1493722与三卡1494432均因PREEMPTED退出；两卡最后日志700轮/7000WM/200policy更新。
