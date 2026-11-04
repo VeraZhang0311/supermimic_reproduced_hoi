@@ -1,5 +1,20 @@
 # SuperMimic HOI v1 开发入口
 
+## protect_eval_sm 开发子集（2026-11-04）
+
+用户要求从当前1085条protected_eval中选10%并先保存，不启动评估、不改自动评估日程。
+入口 `python -m hoi.data.protected_eval_subset --training-bundle ... --parent-bundle ... --output ...`。
+固定seed20261104，按dataset/task最大余数法选109条（10.046%），层内优先资产覆盖、
+source group多样性；SHA256排序保证同seed可复现，不依赖checkpoint成绩。
+ULTRA27、HOI-Retarget29、Omni48（桌面16、足球32）、GRAIL5（独立eval椅每把1条）。
+共39资产、109不同source group，完整参考时长15.779分钟。
+集群保存于 `/mnt/projects/ll/tianzizh/hoi_compact_teacher_20261101_01/protect_eval_sm/`；
+本地镜像 `data/protect_eval_sm/`。selection.json是选择名单，clips.jsonl保留父bundle原始行，
+README.zh-CN.md解释范围；不是重新构造的bundle。未来消费者加载绑定完整bundle后选择原索引。
+名单内容SHA `24e75b76cc59ef92687754af87e19caa6be5c5bff653f5f7b37d8cc038ccdd71`。
+3项CPU测试（含错误分区/泄漏/重复/篡改/覆盖拒绝）、实际名单重现、父文件哈希及缓存路径检查通过。
+所有未抽中条目仍保持protected；全量数据、训练冻结源与正在运行的作业均未修改。
+
 ## 独立 canonical HOI80 小测（2026-11-04）
 
 用户授权用自动续训 campaign 的 checkpoint 2000 额外跑固定 HOI80，当前训练继续。
