@@ -25,7 +25,8 @@ parser.add_argument("--run_dir", type=str, required=True)
 parser.add_argument("--watch", action="store_true")
 parser.add_argument("--ckpt", type=str, default=None, help="evaluate one checkpoint")
 parser.add_argument("--record", type=str, default=None, help="save trajectories (npz) for rendering")
-parser.add_argument("--motion_dir", type=str, default=os.path.join(REPO, "data", "lafan1_g1"))
+parser.add_argument("--motion_dir", type=str, default=None, help="default: training args.json motion_dir")
+parser.add_argument("--eval_envs", type=int, default=256, help="batch full-library evaluation without creating one environment per clip")
 parser.add_argument("--every", type=int, default=1, help="evaluate every n-th checkpoint")
 add_launcher_args(parser)
 args = parser.parse_args()
@@ -37,14 +38,24 @@ import supermimic.networks as networks
 from supermimic.env import TrackingSim, make_sim
 from supermimic.kinematics import G1Kinematics
 from supermimic.mdp import MAX_STEP_REWARD, OBS_DIM, MDP
-from supermimic.motion import MotionLib
+from supermimic.motion import load_reference
+from supermimic.privileged import PRIVILEGED_DIM, PrivilegedFeatures, RobotKinematics39, checkpoint_contract, validate_checkpoint
 from supermimic.networks import Policy
 from supermimic.robot import default_joint_pos_list
 
 torch.backends.cuda.matmul.allow_tf32 = True
 dev = "cuda:0"
 kin = G1Kinematics(dev)
-motion = MotionLib.from_dir(args.motion_dir, kin, dev)
+if args.eval_envs <= 0:
+    raise ValueError("eval_envs must be positive")
+with open(os.path.join(args.run_dir, "args.json")) as stream:
+    training_args = json.load(stream)
+if args.motion_dir is None:
+    args.motion_dir = training_args["motion_dir"]
+motion = load_reference(training_args["dataset"], args.motion_dir, kin, dev)
+teacher_kin = RobotKinematics39(device=dev)
+privileged = PrivilegedFeatures(teacher_kin, motion)
+gmt_contract = checkpoint_contract(motion, teacher_kin)
 mdp = MDP(kin, motion, torch.tensor(default_joint_pos_list(), device=dev))
 C = len(motion.names)
 
@@ -54,39 +65,51 @@ def evaluate(env: TrackingSim, ck: dict, record: str | None = None) -> dict:
     a_ = ck["args"]
     K, Hh = a_["goal_frames"], a_["hist"]
     networks.AMP_DTYPE = torch.bfloat16 if a_.get("amp", "none") == "bf16" else None
-    pi = Policy(OBS_DIM, 73 * K, hist=Hh).to(dev)
+    validate_checkpoint(ck, gmt_contract)
+    pi = Policy(OBS_DIM, 73 * K, hist=Hh, privileged_dim=PRIVILEGED_DIM).to(dev)
     pi.load_state_dict(ck["pi"])
     pi.eval()
-    ids = torch.arange(C, device=dev)
-    env.done_eval[:] = False
-    env.failed_eval[:] = False
-    env.reset(ids, motion.clip_start.clone())
-    clip_end = motion.clip_end.clone()
-    ret = torch.zeros(C, device=dev)
-    steps = torch.zeros(C, device=dev)
-    hist = None
+    if record and C > env.N:
+        raise ValueError("recording requires eval_envs >= clip count; evaluate the full large library without --record")
+    ids = torch.arange(env.N, device=dev)
+    ret_all, failed_all = [], []
     traj = {"root_p": [], "root_quat": [], "q": [], "f": [], "alive": []}
-    while not bool(env.done_eval.all()):
-        S = env.state()
-        o = mdp.obs(S, env.a_prev, env.xi, env.f)
-        hist = o.unsqueeze(1).repeat(1, Hh, 1) if hist is None else torch.cat((hist[:, 1:], o.unsqueeze(1)), 1)
-        a = pi(hist, motion.goal(env.f, K))
-        alive = ~env.done_eval.clone()
-        if record:
-            from supermimic.rotations import mat_to_quat
-
-            traj["root_p"].append(S[0].cpu()), traj["root_quat"].append(mat_to_quat(S[1]).cpu())
-            traj["q"].append(S[4].cpu()), traj["f"].append(env.f.cpu()), traj["alive"].append(alive.cpu())
-        out = env.step(a)
-        ret += torch.where(alive, out["r"], 0.0)
-        steps += alive.float()
-        env.f = torch.minimum(env.f, clip_end - 1)  # finished clips keep stepping; keep f+1 in range
+    for start in range(0, C, env.N):
+        count = min(env.N, C-start)
+        clips = (start + ids).clamp(max=C-1)
+        env.done_eval[:] = False
+        env.failed_eval[:] = False
+        env.reset(ids, motion.clip_start[clips].clone())
+        env.refresh()
+        env.done_eval[count:] = True
+        clip_end = motion.clip_end[clips]
+        ret = torch.zeros(env.N, device=dev)
+        hist = None
+        q_prev, qd_prev = (x.clone() for x in env.state()[4:6])
+        while not bool(env.done_eval.all()):
+            S = env.state()
+            o = mdp.obs(S, env.a_prev, env.xi, env.f)
+            hist = o.unsqueeze(1).repeat(1, Hh, 1) if hist is None else torch.cat((hist[:, 1:], o.unsqueeze(1)), 1)
+            direct = privileged(S, env.f, env.a_prev, env.xi, q_prev, qd_prev)
+            a = pi(hist, motion.goal(env.f, K), direct)
+            q_prev, qd_prev = S[4].clone(), S[5].clone()
+            alive = ~env.done_eval.clone()
+            if record:
+                from supermimic.rotations import mat_to_quat
+                traj["root_p"].append(S[0].cpu()), traj["root_quat"].append(mat_to_quat(S[1]).cpu())
+                traj["q"].append(S[4].cpu()), traj["f"].append(env.f.cpu()), traj["alive"].append(alive.cpu())
+            out = env.step(a)
+            ret += torch.where(alive, out["r"], 0.0)
+            env.f = torch.minimum(env.f, clip_end - 1)  # keep f+1 in range for finished lanes
+        ret_all.append(ret[:count])
+        failed_all.append(env.failed_eval[:count].clone())
+    ret, failed = torch.cat(ret_all), torch.cat(failed_all)
     norm = ret / ((motion.clip_len - 1).float() * MAX_STEP_REWARD)
     res = {
         "norm_return": norm.mean().item(),
         "norm_return_framew": (ret.sum() / ((motion.clip_len - 1).sum() * MAX_STEP_REWARD)).item(),
-        "n_failed": int(env.failed_eval.sum().item()),
-        "failed": [motion.names[i] for i in env.failed_eval.nonzero().flatten().tolist()],
+        "n_failed": int(failed.sum().item()),
+        "failed": [motion.names[i] for i in failed.nonzero().flatten().tolist()],
         "per_clip": {motion.names[i]: round(norm[i].item(), 4) for i in range(C)},
     }
     if record:
@@ -98,7 +121,7 @@ def evaluate(env: TrackingSim, ck: dict, record: str | None = None) -> dict:
 
 sim_cfg = make_sim(dev, args)
 with launch_simulation(sim_cfg, args):
-    env = TrackingSim(sim_cfg, C, motion, mdp, eval_mode=True)
+    env = TrackingSim(sim_cfg, min(C, args.eval_envs), motion, mdp, eval_mode=True)
     if args.ckpt:
         ck = torch.load(args.ckpt, map_location=dev)
         res = evaluate(env, ck, args.record)

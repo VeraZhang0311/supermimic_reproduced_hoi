@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import glob
+import hashlib
+import json
 import os
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -17,18 +20,34 @@ BIN_FRAMES = 50  # 1 s bins for return-based reset sampling
 
 class MotionLib:
     def __init__(self, files: list[str], kin: G1Kinematics, device: str, src_fps: float = 30.0):
+        if not files or not np.isfinite(src_fps) or src_fps <= 0:
+            raise ValueError("motion library needs CSV files and a finite positive source fps")
         self.device = device
+        self.dataset = "lafan1"
         self.names = [os.path.splitext(os.path.basename(f))[0] for f in files]
+        if len(set(self.names)) != len(self.names):
+            raise ValueError("duplicate LAFAN clip identities")
+        source_manifest = []
         ps, qs, js = [], [], []
         lens = []
         for f in files:
-            raw = torch.tensor(np.loadtxt(f, delimiter=","), dtype=torch.float32)
+            before = hashlib.sha256(Path(f).read_bytes()).hexdigest()
+            raw = torch.tensor(np.loadtxt(f, delimiter=",", ndmin=2), dtype=torch.float32)
+            if raw.shape[1] != 36 or raw.shape[0] < 2 or not torch.isfinite(raw).all():
+                raise ValueError(f"{f}: expected >=2 finite LAFAN frames with 36 columns")
+            if not bool((raw[:, 3:7].norm(dim=-1) > 1e-6).all()):
+                raise ValueError(f"{f}: invalid root quaternion")
+            if hashlib.sha256(Path(f).read_bytes()).hexdigest() != before:
+                raise ValueError(f"{f}: source changed during loading")
+            source_manifest.append({"name": os.path.basename(f), "sha256": before, "source_frames": len(raw)})
             p, q_xyzw, j = raw[:, :3], raw[:, 3:7], raw[:, 7:36]
             quat = torch.cat((q_xyzw[:, 3:4], q_xyzw[:, :3]), -1)
             # resample to 50 Hz
             T_src = raw.shape[0]
             dur = (T_src - 1) / src_fps
             n = int(np.floor(dur / CONTROL_DT)) + 1
+            if n < 2:
+                raise ValueError(f"{f}: less than one complete 50Hz transition")
             t = torch.arange(n, dtype=torch.float32) * CONTROL_DT * src_fps
             i0 = torch.clamp(t.floor().long(), max=T_src - 2)
             a = (t - i0.float()).clamp(0, 1)
@@ -37,6 +56,9 @@ class MotionLib:
             quat = quat_slerp(quat[i0], quat[i0 + 1], a)
             ps.append(p), qs.append(quat), js.append(j)
             lens.append(n)
+        identity = {"dataset": self.dataset, "source_fps": src_fps, "control_dt": CONTROL_DT,
+                    "quaternion": "xyzw", "clips": source_manifest}
+        self.manifest_sha256 = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
         self.clip_len = torch.tensor(lens, device=device)
         self.clip_start = torch.cumsum(torch.cat((torch.zeros(1, dtype=torch.long), torch.tensor(lens[:-1], dtype=torch.long))), 0).to(device)  # dtype: one clip gives an empty (float) tensor
         self.clip_end = self.clip_start + self.clip_len - 1  # last valid frame (inclusive)
@@ -72,7 +94,7 @@ class MotionLib:
         # 1 s bins
         bin_clip, bin_start = [], []
         for c in range(len(lens)):
-            nb = int(np.ceil(lens[c] / BIN_FRAMES))
+            nb = int(np.ceil((lens[c] - 1) / BIN_FRAMES))
             for b in range(nb):
                 bin_clip.append(c)
                 bin_start.append(int(self.clip_start[c]) + b * BIN_FRAMES)
@@ -83,12 +105,14 @@ class MotionLib:
         for b in range(self.num_bins):
             c = bin_clip[b]
             s = bin_start[b]
-            e = min(s + BIN_FRAMES, int(self.clip_end[c]) + 1)
+            e = int(self.clip_end[c]) + 1 if b+1 == self.num_bins or bin_clip[b+1] != c else s + BIN_FRAMES
             self.frame_bin[s:e] = b
 
     @staticmethod
-    def from_dir(path: str, kin: G1Kinematics, device: str) -> MotionLib:
+    def from_dir(path: str, kin: G1Kinematics, device: str, expected_clips=None) -> MotionLib:
         files = sorted(glob.glob(os.path.join(path, "*.csv")))
+        if expected_clips is not None and len(files) != expected_clips:
+            raise ValueError(f"LAFAN1 fullset requires {expected_clips} CSV clips; found {len(files)} in {path}")
         return MotionLib(files, kin, device)
 
     def future_frames(self, f: torch.Tensor, K: int) -> torch.Tensor:
@@ -112,6 +136,9 @@ class MotionLib:
     def ref_state(self, f: torch.Tensor):
         return self.root_p[f], self.root_R[f], self.root_v[f], self.root_w[f], self.q[f], self.qd[f]
 
+    def reference_bodies(self, f):
+        return self.body_p[f], self.body_R[f], self.body_v[f], self.body_w[f]
+
 
 def _gradient(x: torch.Tensor, dt: float) -> torch.Tensor:
     g = torch.zeros_like(x)
@@ -119,3 +146,13 @@ def _gradient(x: torch.Tensor, dt: float) -> torch.Tensor:
     g[0] = (x[1] - x[0]) / dt
     g[-1] = (x[-1] - x[-2]) / dt
     return g
+
+
+def load_reference(dataset, path, kin, device):
+    """Training/evaluation share an explicit dataset contract, LAFAN fullset by default."""
+    if dataset == "lafan1":
+        return MotionLib.from_dir(path, kin, device, expected_clips=40)
+    if dataset == "boneseed":
+        from .boneseed import BoneseedMotionLib
+        return BoneseedMotionLib(path, kin, device)
+    raise ValueError(f"unknown dataset: {dataset}")

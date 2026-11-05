@@ -137,22 +137,28 @@ class WorldModel(nn.Module):
 class Policy(nn.Module):
     """a = dec(enc(g), o_{t-9:t}); deterministic, latent z in R^32 bounded by tanh."""
 
-    def __init__(self, obs_dim: int, goal_dim: int, hist: int = 10, z_dim: int = 32):
+    def __init__(self, obs_dim: int, goal_dim: int, hist: int = 10, z_dim: int = 32, privileged_dim: int = 0):
         super().__init__()
         self.hist = hist
         self.enc = mlp(goal_dim, [2048, 1024, 512, 256], z_dim)
-        self.dec = mlp(z_dim + obs_dim * hist, [2048, 1024, 512, 256], NUM_J)
+        self.dec = mlp(z_dim + obs_dim * hist + privileged_dim, [2048, 1024, 512, 256], NUM_J)
+        self.privileged_norm = RunningNorm(privileged_dim) if privileged_dim else None
         with torch.no_grad():
             self.dec[-1].weight.mul_(0.01)
             self.dec[-1].bias.zero_()
         self.obs_norm = RunningNorm(obs_dim)
         self.goal_norm = RunningNorm(goal_dim)
 
-    def forward(self, obs_hist: torch.Tensor, goal: torch.Tensor) -> torch.Tensor:
+    def forward(self, obs_hist: torch.Tensor, goal: torch.Tensor, privileged=None) -> torch.Tensor:
         """obs_hist: (B, hist, obs_dim) noisy observations, newest last."""
         z = torch.tanh(run_mlp(self.enc, self.goal_norm(goal)))
         o = self.obs_norm(obs_hist).flatten(-2)
-        return run_mlp(self.dec, torch.cat((z, o), -1))
+        inputs = (z, o)
+        if self.privileged_norm is not None:
+            if privileged is None:
+                raise ValueError("privileged policy requires the robot-only direct feature block")
+            inputs += (self.privileged_norm(privileged),)
+        return run_mlp(self.dec, torch.cat(inputs, -1))
 
 
 class Critic(nn.Module):

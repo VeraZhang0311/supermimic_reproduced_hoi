@@ -52,6 +52,9 @@ class TrackingSim:
         self.sim = SimulationContext(sim_cfg)
         self.scene = instantiate(TrackingSceneCfg(num_envs=num_envs, env_spacing=0.0, replicate_physics=True))
         self.sim.reset()
+        from .collision import audit_self_collision
+        self.self_collision_audit = audit_self_collision(self.sim.backend_manager._solver.mj_model)
+        print(f"[physics] self-collision audit: {self.self_collision_audit}", flush=True)
         self.robot = self.scene["robot"]
         assert list(self.robot.joint_names) == G1_JOINT_NAMES, self.robot.joint_names
         self.N = num_envs
@@ -185,6 +188,8 @@ class TrackingSim:
 
     # ------------------------------------------------------------------ step
     def step(self, a: torch.Tensor) -> dict:
+        if not torch.isfinite(a).all():
+            raise FloatingPointError("nonfinite simulator action")
         S = self.state()
         f = self.f.clone()
         xi = self.xi.clone()
@@ -196,8 +201,15 @@ class TrackingSim:
         self.sim.step(render=False)
         self.scene.update(CONTROL_DT)
         S1 = self.state()
+        if not all(bool(torch.isfinite(part).all()) for part in S1):
+            raise FloatingPointError("nonfinite simulator state")
+        overflow = wp.to_torch(self.sim.backend_manager._solver.mjw_data.overflow)
+        if bool((overflow != 0).any()):
+            raise RuntimeError("native contact/constraint buffer overflow")
         f1 = f + 1
         r, terms = self.mdp.reward(S1, f1, a, a_prev, terms=True)
+        if not torch.isfinite(r).all():
+            raise FloatingPointError("nonfinite simulator reward")
         term = self.mdp.termination(S1, f1)
         clip_end = self.motion.clip_end[self.motion.clip_id[f]]
         timeout = (f1 >= clip_end) | (ep_step + 1 >= self.max_episode_steps)

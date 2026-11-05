@@ -1,5 +1,10 @@
 # SuperMimic reproduction on Isaac Lab 3 (kit-less, MuJoCo-Warp)
 
+**Branch `boneseed/privileged`: robot-only privileged GMT on the full 40-clip LAFAN1 set, with simulator
+self-collision enabled.** Current setup, observation schema, preparation and training commands
+are in [DEVELOPMENT.md](DEVELOPMENT.md). The LAFAN results below describe the historical
+`main` baseline; they are not results of this branch.
+
 **Unofficial** reproduction of *SuperMimic: Scaling Humanoid Whole-Body Control with One Differentiable World
 Model* (arXiv 2610.28480) — no official code is released, so everything here is implemented from
 the paper. Target experiment: the controlled LAFAN1 comparison (Fig. 4a): 40 G1-retargeted LAFAN1
@@ -162,8 +167,8 @@ Evaluation return 0.824 at 1.24 h of training (paper: 0.82 at 1.2 h on an H100) 
 
 ## Deviations / choices not specified by the paper
 
-* **Self-collisions disabled** in the simulator (speed); robot–ground contacts use the URDF's
-  convex mesh hulls and foot spheres.
+* Historical `main` disabled self-collision. This branch enables it and audits compiled
+  nonadjacent collision pairs; robot–ground assets remain the original mesh hulls/foot spheres.
 * **bf16 autocast for MLP matmuls** (paper: TF32). On this RTX PRO 6000 it is 24 % faster; all
   state integration, FK and rewards stay fp32.
 * Reward, observation and termination heads are **analytic** (allowed by §3.2); termination in

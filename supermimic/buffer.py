@@ -11,6 +11,8 @@ FIELDS = {
     "s1": (STATE_DIM, torch.float32),
     "a": (29, torch.float32),
     "a_prev": (29, torch.float32),
+    "q_prev": (29, torch.float32),
+    "qd_prev": (29, torch.float32),
     "xi": (XI_DIM, torch.float32),
     "r": ((), torch.float32),
     "f": ((), torch.long),
@@ -63,6 +65,6 @@ class ReplayBuffer:
         back = torch.minimum(back, age.unsqueeze(-1))  # stay inside the buffer
         hrows = self._row(age.unsqueeze(-1) - back)
         henv = env.unsqueeze(-1).expand_as(hrows)
-        start = {k: self.data[k][row, env] for k in ("s", "a_prev", "xi", "f")}
+        start = {k: self.data[k][row, env] for k in ("s", "a_prev", "xi", "f", "q_prev", "qd_prev")}
         hist_d = {k: self.data[k][hrows, henv] for k in ("s", "a_prev", "xi", "f")}
         return start, hist_d
