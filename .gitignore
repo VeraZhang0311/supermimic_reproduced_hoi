@@ -14,5 +14,8 @@ logs/
 *.mp4
 *.npz
 results/analysis/
+# local native-validation results and execution receipts (kept on GRASP too)
+provenance/smoke_*.json
+provenance/validation_wrapper_*.sh
 # third-party paper
 *.pdf
