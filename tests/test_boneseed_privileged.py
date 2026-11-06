@@ -14,20 +14,26 @@ import numpy as np
 import torch
 
 from supermimic.boneseed import BoneseedMotionLib, load_csv, prepare
+from supermimic.actuator_state import advance_actuator_state
 from supermimic.buffer import ReplayBuffer
 from supermimic.collision import audit_self_collision
 from supermimic.kinematics import G1Kinematics
-from supermimic.mdp import MDP, OBS_DIM, flatten_state, unflatten_state
+from supermimic.mdp import MDP, OBS_DIM, clamp_action, flatten_state, normalize_xi, unflatten_state
 from supermimic.motion import load_reference
 from supermimic.networks import Policy, WorldModel
-from supermimic.privileged import PRIVILEGED_DIM, PrivilegedFeatures, RobotKinematics39, validate_checkpoint
-from supermimic.robot_metadata import G1_JOINT_NAMES, TRACKED_BODIES
+from supermimic.privileged import PRIVILEGED_DIM, SCHEMA, PrivilegedFeatures, RobotKinematics38, validate_checkpoint
+from supermimic.robot_metadata import G1_BODY_NAMES, G1_JOINT_NAMES, MJCF_PATH, URDF_PATH, TRACKED_BODIES
 from supermimic.rotations import so3_exp
+from supermimic.g1_assets import asset_cwd, load_model
+
+
+def actuator_fixture(q):
+    """Valid nominal compact actuator context, independent of a simulator."""
+    return torch.cat((q, q.new_full((*q.shape[:-1], 1), 3.), q.new_ones((*q.shape[:-1], 58))), -1)
 
 
 def write_urdf(path):
-    names = ["pelvis", *[n for n in TRACKED_BODIES if n != "pelvis"]]
-    names += [f"link_{i}" for i in range(39-len(names))]
+    names = G1_BODY_NAMES.copy()
     root = ET.Element("robot", name="test_g1")
     mj = ET.SubElement(root, "mujoco")
     ET.SubElement(mj, "compiler", fusestatic="false", discardvisual="true")
@@ -37,11 +43,14 @@ def write_urdf(path):
         ET.SubElement(inertial, "origin", xyz="0.003 -0.002 0.001")
         ET.SubElement(inertial, "mass", value="1")
         ET.SubElement(inertial, "inertia", ixx=".01", iyy=".01", izz=".01", ixy="0", ixz="0", iyz="0")
-    for i in range(1, 39):
-        j = ET.SubElement(root, "joint", name=G1_JOINT_NAMES[i-1] if i <= 29 else f"fixed_{i}",
-                          type="revolute" if i <= 29 else "fixed")
-        ET.SubElement(j, "parent", link=names[i-1])
-        ET.SubElement(j, "child", link=names[i])
+    moving = {name.replace("_joint", "_link"): name for name in G1_JOINT_NAMES}
+    moving["torso_link"] = moving.pop("waist_pitch_link")
+    for i, name in enumerate(names[1:], 1):
+        dof = moving.get(name)
+        j = ET.SubElement(root, "joint", name=dof or f"fixed_{i}",
+                          type="revolute" if dof else "fixed")
+        ET.SubElement(j, "parent", link="pelvis")
+        ET.SubElement(j, "child", link=name)
         ET.SubElement(j, "origin", xyz=".01 .02 .03", rpy=".02 -.01 .03")
         ET.SubElement(j, "axis", xyz="0 1 0")
         ET.SubElement(j, "limit", lower="-3", upper="3", effort="100", velocity="30")
@@ -77,17 +86,18 @@ class ProtocolTests(unittest.TestCase):
         cls.urdf = cls.root / "robot.urdf"
         cls.body_names = write_urdf(cls.urdf)
         # Independent MuJoCo URDF importer, preserving fixed link frames.
-        model = mujoco.MjModel.from_xml_path(str(cls.urdf))
+        model = load_model(cls.urdf)
         xml = cls.root / "robot.xml"
-        mujoco.mj_saveLastXML(str(xml), model)
+        with asset_cwd(cls.root):
+            mujoco.mj_saveLastXML(xml.name, model)
         tree = ET.parse(xml)
         pelvis = tree.find("worldbody/body")
         ET.SubElement(pelvis, "freejoint", name="floating_base_joint")
         tree.write(xml)
-        cls.mj = mujoco.MjModel.from_xml_path(str(xml))
-        with patch("supermimic.kinematics.MJCF_PATH", str(xml)):
+        cls.mj = load_model(xml)
+        with asset_cwd(cls.root), patch("supermimic.kinematics.MJCF_PATH", xml.name):
             cls.kin = G1Kinematics("cpu")
-        cls.full = RobotKinematics39(cls.urdf)
+        cls.full = RobotKinematics38(cls.urdf)
         cls.source = cls.root / "source"
         write_csv(cls.source / "day1/a.csv")
         write_csv(cls.source / "day2/a.csv", shift=50., reorder=True)
@@ -137,7 +147,7 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(len(motion.bin_start), 40)
         f = motion.clip_start
         output = PrivilegedFeatures(self.full, motion)(motion.ref_state(f), f, torch.zeros(40, 29),
-                                                      torch.zeros(40, 33), motion.q[f], motion.qd[f])
+                                                      torch.zeros(40, 33), motion.q[f], motion.qd[f], actuator_fixture(motion.q[f]))
         self.assertEqual(output.shape, (40, PRIVILEGED_DIM))
         old_hash = motion.manifest_sha256
         raw[:, 0] += .1
@@ -162,7 +172,7 @@ class ProtocolTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 load_csv(path)
 
-    def test_all_39_fk_poses_and_com_velocities_against_mujoco(self):
+    def test_all_38_fk_poses_and_com_velocities_against_mujoco(self):
         S = list(self.motion.ref_state(torch.tensor([8])))
         S[1] = so3_exp(torch.tensor([[.1, -.2, .3]]))
         S[3] = torch.tensor([[.3, .5, -.2]])
@@ -207,23 +217,28 @@ class ProtocolTests(unittest.TestCase):
         f = torch.tensor([8, 70])
         S = list(self.motion.ref_state(f))
         S[0] = S[0].clone().requires_grad_()
-        S[4] = S[4].clone().requires_grad_()
+        # Both articulation and root orientation differ from reference. Zero
+        # orientation error would not expose a wrong-frame error rotation.
+        S[1] = so3_exp(torch.tensor([[.13, -.17, .11]])).expand(2, -1, -1) @ S[1]
+        S[4] = (S[4].clone() + torch.linspace(-.15, .2, 29)).requires_grad_()
         feature = PrivilegedFeatures(self.full, self.motion)
         a, xi = torch.randn(2, 29), torch.randn(2, 33)
         qprev, qdprev = S[4].detach()-.1, S[5].detach()+.2
-        out = feature(S, f, a, xi, qprev, qdprev)
+        actuator = actuator_fixture(S[4].detach())
+        out = feature(S, f, a, xi, qprev, qdprev, actuator)
         self.assertEqual(out.shape, (2, PRIVILEGED_DIM))
-        torch.testing.assert_close(out[:, -33:], xi)
-        # q_prev appears after 583 current + 936 target/errors + a,q,qd.
-        torch.testing.assert_close(out[:, 1606:1635], qprev)
+        torch.testing.assert_close(out[:, -121:-88], xi)
+        torch.testing.assert_close(out[:, -88:], actuator)
+        # q_prev appears after 568 current + 912 target/errors + a,q,qd.
+        torch.testing.assert_close(out[:, 1567:1596], qprev)
         grad = torch.autograd.grad(out.square().mean(), S[4], retain_graph=True)[0]
         self.assertTrue(torch.isfinite(grad).all())
         eps = 1e-3
         plus, minus = list(S), list(S)
         delta = torch.zeros_like(S[4]); delta[0, 3] = eps
         plus[4], minus[4] = S[4]+delta, S[4]-delta
-        finite = (feature(plus, f, a, xi, qprev, qdprev).square().mean() -
-                  feature(minus, f, a, xi, qprev, qdprev).square().mean())/(2*eps)
+        finite = (feature(plus, f, a, xi, qprev, qdprev, actuator).square().mean() -
+                  feature(minus, f, a, xi, qprev, qdprev, actuator).square().mean())/(2*eps)
         torch.testing.assert_close(grad[0, 3], finite, atol=2e-5, rtol=.02)
         # A joint world yaw/xy translation must leave the teacher invariant.
         H = so3_exp(torch.tensor([[0., 0., .7]])).expand(2, -1, -1)
@@ -234,7 +249,7 @@ class ProtocolTests(unittest.TestCase):
             return rot(p)+shift, H@R, rot(v), rot(w), q, qd
         transformed_motion = SimpleNamespace(clip_end=self.motion.clip_end, clip_id=self.motion.clip_id,
                                              ref_state=lambda frames: transform(self.motion.ref_state(frames)))
-        transformed = PrivilegedFeatures(self.full, transformed_motion)(transform(S), f, a, xi, qprev, qdprev)
+        transformed = PrivilegedFeatures(self.full, transformed_motion)(transform(S), f, a, xi, qprev, qdprev, actuator)
         torch.testing.assert_close(out, transformed, atol=2e-5, rtol=2e-5)
 
     def test_h32_imagination_backward_with_robot_features(self):
@@ -246,14 +261,20 @@ class ProtocolTests(unittest.TestCase):
             parameter.requires_grad_(False)
         q_prev, qd_prev, a_prev = S[4], S[5], torch.zeros(1, 29)
         history, xi = torch.zeros(1, 10, OBS_DIM), torch.zeros(1, 33)
+        actuator = actuator_fixture(S[4])
         actions = []
         for _ in range(32):
-            a = pi(history, self.motion.goal(f, 10), feature(S, f, a_prev, xi, q_prev, qd_prev))
+            a = pi(history, self.motion.goal(f, 10), feature(S, f, a_prev, xi, q_prev, qd_prev, actuator))
             q_prev, qd_prev = S[4], S[5]
-            S = wm.step(S, a, xi)
+            S = wm.step(S, a, normalize_xi(xi), actuator)
+            actuator = advance_actuator_state(actuator, a, xi)
             a_prev, f = a, f+1
             actions.append(a)
-        (S[4].square().mean()+torch.stack(actions).square().mean()).backward()
+        # The held target is an analytic, differentiable state transition,
+        # including when the learned WM's residual is initially zero.
+        queue_grad = torch.autograd.grad(actuator[..., :29].sum(), actions[-1], retain_graph=True)[0]
+        self.assertTrue(torch.isfinite(queue_grad).all() and (queue_grad != 0).all())
+        (S[4].square().mean()+torch.stack(actions).square().mean()+actuator[..., :29].square().mean()).backward()
         grads = [p.grad for p in pi.parameters() if p.grad is not None]
         self.assertTrue(grads and all(torch.isfinite(g).all() for g in grads))
 
@@ -280,6 +301,7 @@ class ProtocolTests(unittest.TestCase):
                 self.starts.extend(frames.tolist())
             def refresh(self): pass
             def state(self): return motion.ref_state(self.f)
+            def actuator_state(self): return actuator_fixture(self.state()[4])
             def step(self, action):
                 self.f += 1
                 if int(self.f[0]) == 53:  # clip 2 fails on its second transition
@@ -292,6 +314,7 @@ class ProtocolTests(unittest.TestCase):
                          Policy=FakePolicy, OBS_DIM=OBS_DIM, PRIVILEGED_DIM=PRIVILEGED_DIM,
                          validate_checkpoint=lambda *a: None, gmt_contract={}, motion=motion, C=2,
                          mdp=MDP(self.kin, motion, torch.zeros(29)), MAX_STEP_REWARD=.1,
+                         clamp_action=clamp_action,
                          privileged=PrivilegedFeatures(self.full, motion))
         exec(compile(ast.Module(body=[node], type_ignores=[]), "evaluate.py", "exec"), namespace)
         result = namespace["evaluate"](env, {"args": {"goal_frames": 10, "hist": 10}, "pi": {}})
@@ -315,7 +338,7 @@ class ProtocolTests(unittest.TestCase):
     def test_policy_backward_and_contract_rejects_legacy(self):
         f = torch.tensor([8, 70])
         S = self.motion.ref_state(f)
-        direct = PrivilegedFeatures(self.full, self.motion)(S, f, torch.zeros(2, 29), torch.zeros(2, 33), S[4], S[5])
+        direct = PrivilegedFeatures(self.full, self.motion)(S, f, torch.zeros(2, 29), torch.zeros(2, 33), S[4], S[5], actuator_fixture(S[4]))
         pi = Policy(OBS_DIM, 730, privileged_dim=PRIVILEGED_DIM)
         pi.privileged_norm.update(direct)
         count = pi.privileged_norm.count.clone()
@@ -327,6 +350,23 @@ class ProtocolTests(unittest.TestCase):
             validate_checkpoint({"pi": {}}, {"version": "new"})
         validate_checkpoint({"gmt_contract": {"version": "new"}}, {"version": "new"})
 
+    def test_hw3_schema_and_body_identity_reject_old_39_links(self):
+        self.assertEqual(PRIVILEGED_DIM, 3371)
+        self.assertEqual(SCHEMA["bodies"], 38)
+        self.assertEqual(SCHEMA["version"], "robot_privileged_gmt_hw3_actuator_v3")
+        self.assertEqual(self.full.body_names, G1_BODY_NAMES)
+        self.assertNotIn("d435_link", self.full.body_names)
+        self.assertNotIn("left_rubber_hand", self.full.body_names)
+        self.assertEqual(self.full.body_names[-2:], ["LL_FOOT", "LR_FOOT"])
+        altered = self.root / "old_robot.urdf"
+        tree = ET.parse(self.urdf)
+        ET.SubElement(tree.getroot(), "link", name="d435_link")
+        tree.write(altered)
+        with self.assertRaisesRegex(ValueError, "exact hw3 38-link"):
+            RobotKinematics38(altered)
+        with self.assertRaisesRegex(ValueError, "contract mismatch"):
+            validate_checkpoint({"gmt_contract": {"version": "robot_privileged_gmt_v1", "dim": 3361}}, SCHEMA)
+
     def test_self_collision_audit_preserves_parent_filter(self):
         model = mujoco.MjModel.from_xml_string('''<mujoco><worldbody><body name="root"><freejoint/>
             <geom size=".1"/><body name="adjacent" pos="0 0 .2"><joint/><geom size=".1"/>
@@ -337,6 +377,45 @@ class ProtocolTests(unittest.TestCase):
         model.geom_conaffinity[:] = 0
         with self.assertRaises(RuntimeError):
             audit_self_collision(model)
+
+
+@unittest.skipUnless(Path(URDF_PATH).is_file() and Path(MJCF_PATH).is_file(), "prepare real hw3 assets first")
+class RealHw3SkeletonTests(unittest.TestCase):
+    def test_all_source_frames_and_nominal_com_velocities_match_prepared_mujoco(self):
+        full = RobotKinematics38()
+        model = load_model(MJCF_PATH)
+        data = mujoco.MjData(model)
+        p = torch.tensor([[.1, -.2, .9]])
+        R = so3_exp(torch.tensor([[.1, -.2, .3]]))
+        v, w = torch.tensor([[.2, -.1, .3]]), torch.tensor([[.3, .5, -.2]])
+        q = torch.linspace(-.2, .2, 29).unsqueeze(0)
+        qd = torch.linspace(-.4, .6, 29).unsqueeze(0)
+        P, Rs, V, W = full.forward((p, R, v, w, q, qd))
+        from supermimic.rotations import mat_to_quat
+        data.qpos[:7] = torch.cat((p, mat_to_quat(R)), -1)[0].numpy()
+        data.qvel[:3] = v[0].numpy()
+        data.qvel[3:6] = (R.transpose(-1, -2) @ w.unsqueeze(-1))[0, :, 0].numpy()
+        for i, name in enumerate(G1_JOINT_NAMES):
+            j = model.joint(name)
+            data.qpos[j.qposadr[0]], data.qvel[j.dofadr[0]] = q[0, i], qd[0, i]
+        mujoco.mj_forward(model, data)
+        for i, name in enumerate(G1_BODY_NAMES):
+            body = model.body(name).id
+            np.testing.assert_allclose(P[0, i].numpy(), data.xpos[body], atol=3e-6)
+            np.testing.assert_allclose(Rs[0, i].numpy(), data.xmat[body].reshape(3, 3), atol=3e-6)
+            velocity = np.zeros(6)
+            mujoco.mj_objectVelocity(model, data, mujoco.mjtObj.mjOBJ_BODY, body, velocity, 0)
+            if model.body_mass[body] == 0:
+                # Massless IMU/lidar markers have no physical COM. MuJoCo's
+                # importer may retain an arbitrary inertial-frame offset;
+                # compare the explicitly specified nominal URDF COM marker
+                # using MuJoCo's independent point Jacobian instead.
+                marker = data.xpos[body] + data.xmat[body].reshape(3, 3) @ full.com[i].numpy()
+                jacp, jacr = np.zeros((3, model.nv)), np.zeros((3, model.nv))
+                mujoco.mj_jac(model, data, jacp, jacr, marker, body)
+                velocity[:3], velocity[3:] = jacr @ data.qvel, jacp @ data.qvel
+            np.testing.assert_allclose(V[0, i].numpy(), velocity[3:], atol=4e-6)
+            np.testing.assert_allclose(W[0, i].numpy(), velocity[:3], atol=4e-6)
 
 
 if __name__ == "__main__":

@@ -18,6 +18,12 @@ STATE_DIM = 71
 OBS_DIM = 29 + 29 + 3 + 3 + 29 + 6
 XI_DIM = 33
 NUM_J = 29
+ACTION_LIMIT = 20.
+
+
+def clamp_action(action):
+    """Use the collector's existing command bounds in imagination/evaluation too."""
+    return action.clamp(-ACTION_LIMIT, ACTION_LIMIT)
 
 # Table A.1 sensor noise (uniform half-widths), plus the reference-relative orientation
 OBS_NOISE = torch.cat(
@@ -114,7 +120,7 @@ class MDP:
         rp, rR = m.root_p[f], m.root_R[f]
         ref_body_p, ref_body_R, ref_body_v, ref_body_w = m.reference_bodies(f)
         # reference bodies re-anchored to the robot's root (xy + yaw), as in BeyondMimic
-        dR = yaw_mat(R @ rR.transpose(-1, -2))
+        dR = yaw_mat(R) @ yaw_mat(rR).transpose(-1, -2)
         anchor = torch.cat((p[..., :2], rp[..., 2:3]), -1)
         ref_bp = anchor.unsqueeze(-2) + ((dR.unsqueeze(-3) @ (ref_body_p - rp.unsqueeze(-2)).unsqueeze(-1)).squeeze(-1))
         ref_bR = dR.unsqueeze(-3) @ ref_body_R
@@ -170,7 +176,7 @@ class MDP:
         Ht = H.transpose(-1, -2)
         rp, rR = m.root_p[f], m.root_R[f]
         bp = self.kin.forward(p, R, v, w, q, qd)[0]
-        dR = yaw_mat(R @ rR.transpose(-1, -2))
+        dR = yaw_mat(R) @ yaw_mat(rR).transpose(-1, -2)
         anchor = torch.cat((p[..., :2], rp[..., 2:3]), -1)
         ref_bp = anchor.unsqueeze(-2) + ((dR.unsqueeze(-3) @ (m.body_p[f] - rp.unsqueeze(-2)).unsqueeze(-1)).squeeze(-1))
         e_body = (Ht.unsqueeze(-3) @ (ref_bp - bp).unsqueeze(-1)).squeeze(-1).flatten(-2)

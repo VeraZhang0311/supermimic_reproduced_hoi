@@ -5,6 +5,7 @@ from __future__ import annotations
 import torch
 
 from .mdp import STATE_DIM, XI_DIM
+from .actuator_state import ACTUATOR_DIM
 
 FIELDS = {
     "s": (STATE_DIM, torch.float32),
@@ -14,6 +15,7 @@ FIELDS = {
     "q_prev": (29, torch.float32),
     "qd_prev": (29, torch.float32),
     "xi": (XI_DIM, torch.float32),
+    "actuator": (ACTUATOR_DIM, torch.float32),
     "r": ((), torch.float32),
     "f": ((), torch.long),
     "ep_step": ((), torch.int32),
@@ -47,7 +49,7 @@ class ReplayBuffer:
         ages = t0.unsqueeze(-1) + torch.arange(k, device=self.device)
         rows = self._row(ages)
         e = env.unsqueeze(-1).expand_as(rows)
-        out = {key: self.data[key][rows, e] for key in ("s", "s1", "a", "xi", "done")}
+        out = {key: self.data[key][rows, e] for key in ("s", "s1", "a", "xi", "actuator", "done")}
         # transition j is valid if no episode ended at transitions 0..j-1
         d = out["done"].float()
         mask = torch.cumprod(torch.cat((torch.ones(B, 1, device=self.device), 1 - d[:, :-1]), -1), -1)
@@ -65,6 +67,6 @@ class ReplayBuffer:
         back = torch.minimum(back, age.unsqueeze(-1))  # stay inside the buffer
         hrows = self._row(age.unsqueeze(-1) - back)
         henv = env.unsqueeze(-1).expand_as(hrows)
-        start = {k: self.data[k][row, env] for k in ("s", "a_prev", "xi", "f", "q_prev", "qd_prev")}
+        start = {k: self.data[k][row, env] for k in ("s", "a_prev", "xi", "actuator", "f", "q_prev", "qd_prev")}
         hist_d = {k: self.data[k][hrows, henv] for k in ("s", "a_prev", "xi", "f")}
         return start, hist_d

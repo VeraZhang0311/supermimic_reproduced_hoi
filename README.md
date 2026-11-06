@@ -1,9 +1,23 @@
 # SuperMimic reproduction on Isaac Lab 3 (kit-less, MuJoCo-Warp)
 
-**Branch `boneseed/privileged`: robot-only privileged GMT on the full 40-clip LAFAN1 set, with simulator
-self-collision enabled.** Current setup, observation schema, preparation and training commands
+**Branch `boneseed/privileged`: robot-only privileged GMT on LAFAN1 and filtered BONES-SEED,
+with Feng Qiao hw3 G1 physics and the same 38-link reference/privileged skeleton.** Current setup, observation schema, preparation and training commands
 are in [DEVELOPMENT.md](DEVELOPMENT.md). The LAFAN results below describe the historical
 `main` baseline; they are not results of this branch.
+
+The current v3 teacher adds an exact 88D actuator state to replay, WM, critic and
+privileged observations (3371D total). Command memory advances analytically during
+imagination. Old v2 checkpoints cannot resume. Native learning-path validation uses
+`python -m supermimic.gmt_preflight ... --compile`; it performs no optimizer updates.
+The explicit GRASP launcher is `cluster/gmt_privileged.sbatch.sh`.
+The original LAFAN1 run (Slurm 1506052) was stopped at the user's request.
+The next run transfers its complete 26k checkpoint to all 131,593 filtered BONES-SEED
+clips for 20,000 new updates, with `wm_only_iters=0`, retaining model/RMS/Adam state.
+It uses a separate private run in `supermimic_gmt` and a fixed 512-clip BONES-SEED
+training subset for evaluation every 2000 updates. A CPU supervisor logs `eval/*`
+using `eval/iteration`; evaluation runs in separate A10 allocations.
+Current run/output paths,
+driver graph compatibility and verification limits are in [DEVELOPMENT.md](DEVELOPMENT.md).
 
 **Unofficial** reproduction of *SuperMimic: Scaling Humanoid Whole-Body Control with One Differentiable World
 Model* (arXiv 2610.28480) — no official code is released, so everything here is implemented from
@@ -50,8 +64,26 @@ Neither Isaac Lab nor any data is included in this repository; the steps below f
 Docker with the NVIDIA Container Toolkit (`docker run --gpus` must work), ~20 GB of disk for the
 images and ~0.2 GB for the data.
 
-Physics: Newton with the MuJoCo-Warp solver (`NewtonCfg(MJWarpSolverCfg(...))`), no Kit, no PhysX;
-50 Hz control, 4 substeps of 5 ms, implicitfast integrator, MuJoCo collision pipeline.
+Physics: Newton with the MuJoCo-Warp solver (`NewtonCfg(MJWarpSolverCfg(...))`), no Kit or PhysX.
+The current branch uses explicit hw3 PD/envelope/delay at 200 Hz, four 5 ms steps per 50 Hz policy
+interval, and elliptic contacts with `impratio=10`. Prepare the verified handoff via
+`python -m supermimic.g1_assets --archive /path/GR00T-WholeBodyControl-4aed2bb.tar.gz`;
+run CPU contact validation via `python -m supermimic.g1_validation --output .cache/hw3_cpu.json`.
+In the pinned Linux runtime, `python -m supermimic.g1_usd` prepares USD in a separate
+interpreter. The worker registers the standalone importer's schema plugins before importing
+`MJCFImporter`, disables MuJoCo-to-PhysX conversion, and saves/verifies the `Physics=mujoco`
+selection. `UsdFileCfg` then loads that completed variant. Input/output hashes bind the
+cache receipt; a failed or modified conversion is never used as a fallback. Robot collision
+meshes retain their hulls with `newton:maxHullVertices=-1`, avoiding Newton's default
+64-vertex simplification. A model-level contact callback preserves hand/object friction
+multiplication while retaining the soft normal material. No Kit or Isaac Sim application
+is launched. On GRASP A10, full native smoke passed 104 physical substeps in two worlds,
+and all six real contact/CUDA-graph tests passed. That physical smoke performs no training; validation
+receipts and remaining modeling limits are in [DEVELOPMENT.md](DEVELOPMENT.md).
+The legacy asset setup below describes the historical main baseline; current branch setup and
+the separate no-training native validation command are in [DEVELOPMENT.md](DEVELOPMENT.md).
+The local CPU suite currently collects 44 tests: 41 pass and 3 optional Warp/MuJoCo-Warp
+array tests skip in the minimal CPU venv. These counts do not certify the GPU smoke.
 
 ### 1. Isaac Lab (kit-less Docker image)
 
@@ -168,7 +200,8 @@ Evaluation return 0.824 at 1.24 h of training (paper: 0.82 at 1.2 h on an H100) 
 ## Deviations / choices not specified by the paper
 
 * Historical `main` disabled self-collision. This branch enables it and audits compiled
-  nonadjacent collision pairs; robot–ground assets remain the original mesh hulls/foot spheres.
+  nonadjacent collision pairs; the robot now uses the shared hw3 collision assets described
+  in [DEVELOPMENT.md](DEVELOPMENT.md), including split hand colliders.
 * **bf16 autocast for MLP matmuls** (paper: TF32). On this RTX PRO 6000 it is 24 % faster; all
   state integration, FK and rewards stay fp32.
 * Reward, observation and termination heads are **analytic** (allowed by §3.2); termination in
@@ -184,10 +217,12 @@ Evaluation return 0.824 at 1.24 h of training (paper: 0.82 at 1.2 h on an H100) 
   which cannot initialize under such a limit. Cap memory with the container's cgroup
   (`--memory`) instead. Rootless docker ignores `--cpuset-cpus`; pin CPUs with `taskset`
   (`CPUS=...` in `run_train.sh`).
-* Asset import: the kit-less URDF/MJCF importers fail inside a running Isaac Lab process
-  (`PhysxJointAPI` schema not registered), so the USD is converted once, offline, by
-  `tools/mjcf_to_usd.py` (registers the importer's schema plugin first) and spawned with
-  `UsdFileCfg(variants={"Physics": "mujoco"})`.
+* Asset import: the kit-less MJCF importer fails inside the active Isaac Lab process
+  (`PhysxJointAPI` schema not registered). This branch uses `supermimic/g1_usd.py` to convert
+  in an isolated interpreter after schema registration, validates the MuJoCo variant and
+  caches a receipt bound to the source XML, assets, helper/options and output-file hashes.
+  `robot.py` spawns the resulting path with `UsdFileCfg(variants={"Physics": "mujoco"})`.
+  The old `tools/mjcf_to_usd.py` command above belongs to the historical main setup.
 
 ## Attribution and licenses
 

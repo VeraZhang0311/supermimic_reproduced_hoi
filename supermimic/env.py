@@ -24,6 +24,8 @@ from .mdp import MAX_STEP_REWARD, MDP, flatten_state
 from .motion import CONTROL_DT, MotionLib
 from .robot import G1_CFG, G1_JOINT_NAMES, action_scale
 from .rotations import mat_to_quat, quat_to_mat, so3_exp
+from .g1_physics import PHYSICS_DT, CONTROL_DECIMATION, CONTACT_CONE, CONTACT_IMPRATIO
+from .g1_runtime import G1PhysicsRuntime
 
 
 @configclass
@@ -33,11 +35,14 @@ class TrackingSceneCfg(InteractiveSceneCfg):
 
 
 def make_sim(device: str, args) -> SimulationContext:
+    if abs(CONTROL_DT - PHYSICS_DT * CONTROL_DECIMATION) > 1e-10:
+        raise ValueError("Motion and shared G1 control time bases differ")
     physics = NewtonCfg(
-        solver_cfg=MJWarpSolverCfg(njmax=500, nconmax=128, cone="pyramidal", integrator="implicitfast", use_mujoco_contacts=True),
-        num_substeps=4,
+        solver_cfg=MJWarpSolverCfg(njmax=500, nconmax=128, cone=CONTACT_CONE, impratio=CONTACT_IMPRATIO,
+                                  integrator="implicitfast", use_mujoco_contacts=True),
+        num_substeps=1,
     )
-    return sim_utils.SimulationCfg(dt=CONTROL_DT, device=device, physics=physics)
+    return sim_utils.SimulationCfg(dt=PHYSICS_DT, device=device, physics=physics)
 
 
 class TrackingSim:
@@ -69,7 +74,8 @@ class TrackingSim:
 
         # ---- sim context xi = [friction, joint offsets(29), torso com offset(3)] ----
         self.xi = torch.zeros(self.N, 33, device=dev)
-        self._setup_friction()
+        self.physics = G1PhysicsRuntime(self.sim, self.robot, self.scene, randomize=not eval_mode)
+        self.physics_report = self.physics.report
         if eval_mode:
             self.xi[:, 0] = 1.0
         else:
@@ -102,18 +108,8 @@ class TrackingSim:
         self.reset(torch.arange(self.N, device=dev))
 
     # ------------------------------------------------------------------ friction
-    def _setup_friction(self):
-        mgr = self.sim.backend_manager
-        model = mgr.get_model()
-        self._mu_view = wp.to_torch(self.robot._root_view.get_attribute("shape_material_mu", model)[:, 0])
-        # ground shapes (body == -1): lowest friction of the range, since MuJoCo takes the max of a pair
-        shape_body = wp.to_torch(model.shape_body)
-        mu_all = wp.to_torch(model.shape_material_mu)
-        mu_all[shape_body < 0] = 0.3 if not self.eval_mode else 1.0
-
     def _apply_friction(self):
-        self._mu_view[:] = self.xi[:, :1]
-        self.sim.backend_manager.add_model_change(ModelFlags.SHAPE_PROPERTIES)
+        self.physics.set_surface_friction(self.xi[:, 0])
 
     # ------------------------------------------------------------------ state
     def state(self):
@@ -126,6 +122,9 @@ class TrackingSim:
         return (p, R, vel[:, :3], vel[:, 3:6], d.joint_pos.torch.clone(), d.joint_vel.torch.clone())
 
     # ------------------------------------------------------------------ reset
+    def actuator_state(self):
+        return self.physics.actuator_state()
+
     def sample_frames(self, n: int) -> tuple[torch.Tensor, torch.Tensor]:
         m = self.motion
         soft = torch.softmax(-25.0 * self.bin_G / self.G_max, 0)
@@ -180,6 +179,7 @@ class TrackingSim:
         if not self.eval_mode:
             self.xi[env_ids, 1:30] = torch.empty(n, 29, device=dev).uniform_(-0.01, 0.01)
         self.scene.reset(env_ids)
+        self.physics.reset(env_ids, q)
 
     def refresh(self):
         """Propagate written states so that ``state()`` is consistent after a reset."""
@@ -195,11 +195,10 @@ class TrackingSim:
         xi = self.xi.clone()
         a_prev = self.a_prev.clone()
         ep_step = self.ep_step.clone()
+        actuator = self.actuator_state()
         target = self.default_q + xi[:, 1:30] + self.alpha * a
-        self.robot.set_joint_position_target_index(target=target)
-        self.scene.write_data_to_sim()
-        self.sim.step(render=False)
-        self.scene.update(CONTROL_DT)
+        self.physics.step_target(target)
+        actuator1 = self.actuator_state()  # before any auto-reset changes delay/strength/FIFO
         S1 = self.state()
         if not all(bool(torch.isfinite(part).all()) for part in S1):
             raise FloatingPointError("nonfinite simulator state")
@@ -217,6 +216,7 @@ class TrackingSim:
         out = {
             "s": flatten_state(S), "a": a.clone(), "a_prev": a_prev, "f": f, "s1": flatten_state(S1), "r": r,
             "term": term, "done": done, "ep_step": ep_step, "xi": xi, "terms": terms,
+            "actuator": actuator, "actuator1": actuator1,
         }  # fmt: skip
         # bookkeeping
         self.ep_disc_ret += (self.gamma ** ep_step.float()) * r
