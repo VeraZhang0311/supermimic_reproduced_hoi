@@ -7,6 +7,7 @@ import torch.nn as nn
 
 from .mdp import INV_DIM, NUM_J, XI_DIM, invariant_features
 from .rotations import so3_exp, yaw_mat
+from .actuator_state import ACTUATOR_DIM, normalize_actuator_state
 
 
 def mlp(inp: int, hidden: list[int], out: int, act=nn.ELU, layer_norm: bool = False) -> nn.Sequential:
@@ -69,15 +70,15 @@ class WorldModel(nn.Module):
 
     def __init__(self, hidden=(2048, 2048, 2048)):
         super().__init__()
-        self.in_dim = INV_DIM + NUM_J + XI_DIM
+        self.in_dim = INV_DIM + NUM_J + XI_DIM + ACTUATOR_DIM
         self.net = mlp(self.in_dim, list(hidden), WM_OUT, act=nn.SiLU, layer_norm=True)
         nn.init.zeros_(self.net[-1].weight)
         nn.init.zeros_(self.net[-1].bias)
         self.in_norm = RunningNorm(self.in_dim)
         self.out_norm = RunningNorm(WM_OUT, eps=1e-4)
 
-    def inputs(self, S, a, xi_n):
-        return torch.cat((invariant_features(S), a, xi_n), -1)
+    def inputs(self, S, a, xi_n, actuator):
+        return torch.cat((invariant_features(S), a, xi_n, normalize_actuator_state(actuator)), -1)
 
     @staticmethod
     def targets(S, S1):
@@ -100,9 +101,9 @@ class WorldModel(nn.Module):
             -1,
         )
 
-    def step(self, S, a, xi_n):
+    def step(self, S, a, xi_n, actuator):
         p, R, v, w, q, qd = S
-        y = run_mlp(self.net, self.in_norm(self.inputs(S, a, xi_n)))
+        y = run_mlp(self.net, self.in_norm(self.inputs(S, a, xi_n, actuator)))
         d = y * self.out_norm.std() + self.out_norm.mean
         H = yaw_mat(R)
         dp, dth, dv, dw, dq, dqd = d.split((3, 3, 3, 3, NUM_J, NUM_J), -1)

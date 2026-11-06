@@ -37,9 +37,9 @@ import torch
 import supermimic.networks as networks
 from supermimic.env import TrackingSim, make_sim
 from supermimic.kinematics import G1Kinematics
-from supermimic.mdp import MAX_STEP_REWARD, OBS_DIM, MDP
+from supermimic.mdp import MAX_STEP_REWARD, OBS_DIM, MDP, clamp_action
 from supermimic.motion import load_reference
-from supermimic.privileged import PRIVILEGED_DIM, PrivilegedFeatures, RobotKinematics39, checkpoint_contract, validate_checkpoint
+from supermimic.privileged import PRIVILEGED_DIM, PrivilegedFeatures, RobotKinematics38, checkpoint_contract, validate_checkpoint
 from supermimic.networks import Policy
 from supermimic.robot import default_joint_pos_list
 
@@ -53,7 +53,7 @@ with open(os.path.join(args.run_dir, "args.json")) as stream:
 if args.motion_dir is None:
     args.motion_dir = training_args["motion_dir"]
 motion = load_reference(training_args["dataset"], args.motion_dir, kin, dev)
-teacher_kin = RobotKinematics39(device=dev)
+teacher_kin = RobotKinematics38(device=dev)
 privileged = PrivilegedFeatures(teacher_kin, motion)
 gmt_contract = checkpoint_contract(motion, teacher_kin)
 mdp = MDP(kin, motion, torch.tensor(default_joint_pos_list(), device=dev))
@@ -90,8 +90,8 @@ def evaluate(env: TrackingSim, ck: dict, record: str | None = None) -> dict:
             S = env.state()
             o = mdp.obs(S, env.a_prev, env.xi, env.f)
             hist = o.unsqueeze(1).repeat(1, Hh, 1) if hist is None else torch.cat((hist[:, 1:], o.unsqueeze(1)), 1)
-            direct = privileged(S, env.f, env.a_prev, env.xi, q_prev, qd_prev)
-            a = pi(hist, motion.goal(env.f, K), direct)
+            direct = privileged(S, env.f, env.a_prev, env.xi, q_prev, qd_prev, env.actuator_state())
+            a = clamp_action(pi(hist, motion.goal(env.f, K), direct))
             q_prev, qd_prev = S[4].clone(), S[5].clone()
             alive = ~env.done_eval.clone()
             if record:

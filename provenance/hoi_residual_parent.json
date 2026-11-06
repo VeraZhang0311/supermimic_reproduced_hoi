@@ -1,0 +1,131 @@
+{
+  "parent_branch": "boneseed/privileged",
+  "parent_head": "948449e2c894187fcb27c4d9449fb9b464a4d5a3",
+  "parent_worktree": "D:\\supermimic_reproduced_hoi\\tmp\\boneseed_privileged",
+  "frozen_source": "/mnt/projects/ll/tianzizh/gmt_bones26k_20261106_02/source",
+  "note": "Parent working tree contains uncommitted hw3/v3 changes; baseline copied without editing original",
+  "checkpoint_sha256": "05caab65b9b4e35e4362bea6207b5e5fb925ae6b51f4a0fe7217e4849e03ba64",
+  "resmimic_commit": "fa20d98dbbf9b5b903db20435d90a4964bcf09d9",
+  "source_files": [
+    {
+      "file": "actuator_state.py",
+      "sha256": "ea3ca5b87533a6c96d79fd214f523ef0c9d57f9d5be23ac21f32ed469079b5d2",
+      "identical": true
+    },
+    {
+      "file": "boneseed.py",
+      "sha256": "884427151a9234c1b4903a0eab2bdcdffde2daf7057926495dc84c1a49c9359b",
+      "identical": true
+    },
+    {
+      "file": "buffer.py",
+      "sha256": "3b77b76a4bf61b2fb6fb7304a7a050228279cf79fb039045c31d905cbf5a01ee",
+      "identical": true
+    },
+    {
+      "file": "collision.py",
+      "sha256": "b09c00c00933ac77f8d2680faea0995985a579c8429b2bcfb3c52e830bf68672",
+      "identical": true
+    },
+    {
+      "file": "env.py",
+      "sha256": "edc6785dcf246cf151b0f82eb8fef84b692ab0cb6b069127235e2f1fb7008b3c",
+      "identical": true
+    },
+    {
+      "file": "evaluate.py",
+      "sha256": "86efd92f09a430d9c745ded895f544f73201099d0b13e61739c32aa51c15d97a",
+      "identical": true
+    },
+    {
+      "file": "g1_assets.py",
+      "sha256": "78589a0201d3d8b1ee1b5dc55961c84e1b69db46558105ed07fd11b5b9f806bf",
+      "identical": true
+    },
+    {
+      "file": "g1_contactmix.py",
+      "sha256": "6009e8f304903b238dff02ab240ae1b69e9de11555d4c81322c0083d0b13f55d",
+      "identical": true
+    },
+    {
+      "file": "g1_native_smoke.py",
+      "sha256": "daf6ac857c8991f0c07e34a9685514b479bd798dda359b7d58998139524dd3b0",
+      "identical": true
+    },
+    {
+      "file": "g1_physics.py",
+      "sha256": "55b1c702df577a774485624f72fcaabb8935bcbd4c1dbc7637134177caef4303",
+      "identical": true
+    },
+    {
+      "file": "g1_runtime.py",
+      "sha256": "5fbdcd13b4025bb588927aeb16b8ebb39cc78dc851753b000533da146fd40b38",
+      "identical": true
+    },
+    {
+      "file": "g1_usd.py",
+      "sha256": "c6dc6771301afd68810b62d1db3029d7b3522fb04d8d34e0f30ebe6cffc462a1",
+      "identical": true
+    },
+    {
+      "file": "g1_validation.py",
+      "sha256": "25707441d81950ac49966d7a5c6bf1fdc83dc3e48e06abd2660e431cb2f4831b",
+      "identical": true
+    },
+    {
+      "file": "gmt_preflight.py",
+      "sha256": "27a4dc27a6715bc6af6b12ddfb1ac24404fc0910b8b14f08880920272035a769",
+      "identical": true
+    },
+    {
+      "file": "gmt_transfer.py",
+      "sha256": "54f5487d27bc3c302c4e8a5a77f5eeeeae73e5b47f6c1abe2a9260ef62ba69d0",
+      "identical": true
+    },
+    {
+      "file": "kinematics.py",
+      "sha256": "75ca3850be7ddbc89c7e03c3efe696b7064a6df6fe0f4d1da456656bc675b505",
+      "identical": true
+    },
+    {
+      "file": "mdp.py",
+      "sha256": "53f6d16be45bb16c96c8d4ed96271df70e45b0f6aae6ed48439e5942a4b1c3f6",
+      "identical": true
+    },
+    {
+      "file": "motion.py",
+      "sha256": "6eb4adc5257b0064d630af1d15ae3b110809d6bdeeab509478f7bd4048a140c5",
+      "identical": true
+    },
+    {
+      "file": "networks.py",
+      "sha256": "6578176b4d3e39587412a3d8144c08ef6c3f1771e0dedccc3ec6fbd0cb38d6c2",
+      "identical": true
+    },
+    {
+      "file": "privileged.py",
+      "sha256": "35986a04995bd63c03fc833a70a4fe87aa22ce626989eaceb2dd0900845930a8",
+      "identical": true
+    },
+    {
+      "file": "robot_metadata.py",
+      "sha256": "9e4ab0dcb323b902a70f7b69909b94e8bc197dd6f247285c57481a13d4ebcc31",
+      "identical": true
+    },
+    {
+      "file": "robot.py",
+      "sha256": "85fd922d2915216eaf48ad33401647dd7d97d110db515603e7b958121818b930",
+      "identical": true
+    },
+    {
+      "file": "rotations.py",
+      "sha256": "45db90d70cc0341db97c337c4a1b560e9042a2bb681e346b9c7f9a9fae850358",
+      "identical": true
+    },
+    {
+      "file": "train.py",
+      "sha256": "db202769dd75d9e51ef1d32ecf3a45885cfc44c611cd8e2f32ee5f75b767dec5",
+      "identical": true
+    }
+  ]
+}

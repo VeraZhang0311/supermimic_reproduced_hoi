@@ -1,0 +1,7 @@
+# Frozen GMT / residual checkpoint contracts hash these files byte-for-byte.
+# Preserve the verified bytes, including the inherited mixed line endings.
+supermimic/*.py -text
+hoi_residual/*.py -text
+
+# Slurm launchers must execute unchanged on Linux after Windows development.
+cluster/*.sh text eol=lf

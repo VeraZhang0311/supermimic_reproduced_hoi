@@ -8,6 +8,7 @@ import argparse
 import os
 import re
 import subprocess
+import sys
 
 os.environ.setdefault("MUJOCO_GL", "egl")
 # use the NVIDIA EGL vendor (GPU) rather than Mesa's CPU rasterizer when the image does not register it
@@ -18,13 +19,16 @@ import mujoco
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
-ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
-MJCF = os.path.join(ROOT, "data", "g1_description", "g1_29dof.xml")
+ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+sys.path.insert(0, ROOT)
+from supermimic.robot_metadata import MJCF_PATH
+
+MJCF = MJCF_PATH
 
 
 def two_robot_xml() -> str:
     xml = open(MJCF).read()
-    xml = re.sub(r'meshdir="[^"]*"', 'meshdir="' + os.path.join(ROOT, 'data', 'g1_description') + '/"', xml)
+    xml = re.sub(r'meshdir="[^"]*"', lambda _: 'meshdir="' + os.path.dirname(MJCF).replace("\\", "/") + '/"', xml)
     body = xml[xml.index('<body name="pelvis"') : xml.index("</worldbody>")]
     ghost = re.sub(r' name="([^"]+)"', r' name="ref_\1"', body)
     ghost = re.sub(r'rgba="[^"]*"', 'rgba="0.35 0.65 1.0 0.25"', ghost)

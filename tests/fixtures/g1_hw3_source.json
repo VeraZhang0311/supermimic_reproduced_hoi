@@ -1,0 +1,186 @@
+{
+  "source_commit": "4aed2bb",
+  "archive_md5": "4389c0463f2037ef8f04520eda1f949b",
+  "source_sha256": {
+    "mdp/motor_model.py": "09f17195a121798590baf0706d33000efba540b7dff08a72df2eda3b13bd3c0e",
+    "mdp/friction_hw3.py": "dda83c5d9d9ebc8cf3d2c305d70e5fe2134578ad457e11db26ced3047a050696"
+  },
+  "MOTORS": {
+    "7520-22": [
+      111.0,
+      131.0,
+      14.5,
+      22.7,
+      2.4,
+      0.24
+    ],
+    "7520-14": [
+      71.0,
+      83.3,
+      22.63,
+      35.52,
+      1.6,
+      0.16
+    ],
+    "2x5020": [
+      49.6,
+      63.8,
+      30.86,
+      40.13,
+      1.2,
+      0.12
+    ],
+    "5020": [
+      24.8,
+      31.9,
+      30.86,
+      40.13,
+      0.6,
+      0.06
+    ],
+    "4010": [
+      4.8,
+      8.6,
+      15.3,
+      24.76,
+      0.6,
+      0.06
+    ]
+  },
+  "G1_JOINT_MOTORS": {
+    ".*_hip_pitch_joint": "7520-22",
+    ".*_hip_roll_joint": "7520-22",
+    ".*_knee_joint": "7520-22",
+    ".*_hip_yaw_joint": "7520-14",
+    "waist_yaw_joint": "7520-14",
+    ".*_ankle_pitch_joint": "2x5020",
+    ".*_ankle_roll_joint": "2x5020",
+    "waist_roll_joint": "2x5020",
+    "waist_pitch_joint": "2x5020",
+    ".*_shoulder_pitch_joint": "5020",
+    ".*_shoulder_roll_joint": "5020",
+    ".*_shoulder_yaw_joint": "5020",
+    ".*_elbow_joint": "5020",
+    ".*_wrist_roll_joint": "5020",
+    ".*_wrist_pitch_joint": "4010",
+    ".*_wrist_yaw_joint": "4010"
+  },
+  "G1_FRICTION_LEVELS_HW3": {
+    "left_hip_pitch_joint": [
+      0.893,
+      0.747
+    ],
+    "left_hip_roll_joint": [
+      0.686,
+      0.63
+    ],
+    "left_hip_yaw_joint": [
+      1.079,
+      0.879
+    ],
+    "left_knee_joint": [
+      0.978,
+      0.713
+    ],
+    "left_ankle_pitch_joint": [
+      0.729,
+      0.612
+    ],
+    "left_ankle_roll_joint": [
+      0.468,
+      0.385
+    ],
+    "right_hip_pitch_joint": [
+      0.809,
+      0.769
+    ],
+    "right_hip_roll_joint": [
+      0.568,
+      0.577
+    ],
+    "right_hip_yaw_joint": [
+      0.963,
+      0.911
+    ],
+    "right_knee_joint": [
+      0.848,
+      0.7
+    ],
+    "right_ankle_pitch_joint": [
+      0.759,
+      0.623
+    ],
+    "right_ankle_roll_joint": [
+      0.529,
+      0.438
+    ],
+    "waist_yaw_joint": [
+      0.462,
+      0.443
+    ],
+    "waist_roll_joint": [
+      0.869,
+      0.905
+    ],
+    "waist_pitch_joint": [
+      0.869,
+      0.905
+    ],
+    "left_shoulder_pitch_joint": [
+      0.324,
+      0.277
+    ],
+    "left_shoulder_roll_joint": [
+      0.453,
+      0.395
+    ],
+    "left_shoulder_yaw_joint": [
+      0.296,
+      0.271
+    ],
+    "left_elbow_joint": [
+      0.412,
+      0.348
+    ],
+    "left_wrist_roll_joint": [
+      0.395,
+      0.297
+    ],
+    "left_wrist_pitch_joint": [
+      0.177,
+      0.17
+    ],
+    "left_wrist_yaw_joint": [
+      0.163,
+      0.162
+    ],
+    "right_shoulder_pitch_joint": [
+      0.368,
+      0.304
+    ],
+    "right_shoulder_roll_joint": [
+      0.461,
+      0.379
+    ],
+    "right_shoulder_yaw_joint": [
+      0.258,
+      0.212
+    ],
+    "right_elbow_joint": [
+      0.444,
+      0.367
+    ],
+    "right_wrist_roll_joint": [
+      0.322,
+      0.247
+    ],
+    "right_wrist_pitch_joint": [
+      0.204,
+      0.199
+    ],
+    "right_wrist_yaw_joint": [
+      0.134,
+      0.137
+    ]
+  }
+}

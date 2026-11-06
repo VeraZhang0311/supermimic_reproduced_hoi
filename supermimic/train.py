@@ -42,10 +42,17 @@ parser.add_argument("--dataset", choices=["lafan1", "boneseed"], default="lafan1
 parser.add_argument("--motion_dir", type=str, default=None, help="default: data/lafan1_g1; BONES option uses data/boneseed_g1")
 parser.add_argument("--log_dir", type=str, default=os.path.join(REPO, "logs", "lafan1_privileged"))
 parser.add_argument("--seed", type=int, default=0)
-parser.add_argument("--resume", type=str, default=None)
+initialization = parser.add_mutually_exclusive_group()
+initialization.add_argument("--resume", type=str, default=None)
+initialization.add_argument("--transfer_from", type=str, default=None,
+                            help="full-state cross-dataset fine-tune into a new run with fresh local counters")
+parser.add_argument("--transfer_parent_iteration", type=int, default=None,
+                    help="require this exact parent iteration for --transfer_from")
 parser.add_argument("--amp", type=str, default="bf16", choices=["none", "bf16"], help="autocast dtype for MLP matmuls")
 add_launcher_args(parser)
 args = parser.parse_args()
+if args.transfer_parent_iteration is not None and args.transfer_from is None:
+    parser.error("--transfer_parent_iteration requires --transfer_from")
 if args.motion_dir is None:
     args.motion_dir = os.path.join(REPO, "data", "lafan1_g1" if args.dataset == "lafan1" else "boneseed_g1")
 args.motion_dir = os.path.abspath(args.motion_dir)
@@ -56,12 +63,19 @@ import torch.nn as nn
 from supermimic.buffer import ReplayBuffer
 from supermimic.env import TrackingSim, make_sim
 from supermimic.kinematics import G1Kinematics
-from supermimic.mdp import CRITIC_EXTRA, INV_DIM, MDP, OBS_DIM, invariant_features, normalize_xi, unflatten_state
+from supermimic.mdp import CRITIC_EXTRA, INV_DIM, MDP, OBS_DIM, invariant_features, normalize_xi, unflatten_state, clamp_action
 from supermimic.motion import load_reference
-from supermimic.privileged import PRIVILEGED_DIM, PrivilegedFeatures, RobotKinematics39, checkpoint_contract, validate_checkpoint
+from supermimic.privileged import PRIVILEGED_DIM, PrivilegedFeatures, RobotKinematics38, checkpoint_contract, validate_checkpoint
 import supermimic.networks as networks
 from supermimic.networks import Critic, Policy, WorldModel
 from supermimic.robot import default_joint_pos_list
+from supermimic.actuator_state import ACTUATOR_DIM, advance_actuator_state, normalize_actuator_state
+
+if args.transfer_from:
+    from supermimic.gmt_transfer import normalize_transfer_launcher_args
+    # KitLauncher records resolved display defaults in saved checkpoint args.
+    # Set the equivalent explicit disabled values before strict transfer checks.
+    vars(args).update(normalize_transfer_launcher_args(vars(args)))
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -74,7 +88,9 @@ os.makedirs(args.log_dir, exist_ok=True)
 
 kin = G1Kinematics(dev)
 motion = load_reference(args.dataset, args.motion_dir, kin, dev)
-teacher_kin = RobotKinematics39(device=dev)
+print(f"[gmt] reference dataset={motion.dataset}, clips={len(motion.names)}, frames={motion.num_frames}; "
+      f"CUDA allocated={torch.cuda.memory_allocated()/2**30:.3f} GiB", flush=True)
+teacher_kin = RobotKinematics38(device=dev)
 privileged = PrivilegedFeatures(teacher_kin, motion)
 gmt_contract = checkpoint_contract(motion, teacher_kin)
 mdp = MDP(kin, motion, torch.tensor(default_joint_pos_list(), device=dev))
@@ -82,7 +98,7 @@ K, Hh, HZ = args.goal_frames, args.hist, args.horizon
 if not bool((motion.clip_len > HZ).any()):
     raise ValueError("no motion is long enough for the configured imagination horizon")
 GOAL_DIM = 73 * K
-CRITIC_IN = INV_DIM + CRITIC_EXTRA + GOAL_DIM
+CRITIC_IN = INV_DIM + CRITIC_EXTRA + GOAL_DIM + ACTUATOR_DIM
 
 wm = WorldModel().to(dev)
 pi = Policy(OBS_DIM, GOAL_DIM, hist=Hh, privileged_dim=PRIVILEGED_DIM).to(dev)
@@ -91,12 +107,27 @@ opt_wm = torch.optim.Adam(wm.parameters(), lr=args.lr)
 opt_pi = torch.optim.Adam(pi.parameters(), lr=args.lr, betas=(0.9, 0.95))
 opt_v = torch.optim.Adam(critic.parameters(), lr=args.lr)
 start_it, wall_offset, sim_steps = 0, 0.0, 0
+transfer, lr_iteration_offset = None, 0
 if args.resume:
-    ck = torch.load(args.resume, map_location=dev)
+    ck = torch.load(args.resume, map_location=dev, weights_only=True)
     validate_checkpoint(ck, gmt_contract)
     wm.load_state_dict(ck["wm"]), pi.load_state_dict(ck["pi"]), critic.load_state_dict(ck["critic"])
     opt_wm.load_state_dict(ck["opt_wm"]), opt_pi.load_state_dict(ck["opt_pi"]), opt_v.load_state_dict(ck["opt_v"])
     start_it, wall_offset, sim_steps = ck["iteration"], ck["wall_time"], ck["sim_steps"]
+    transfer = ck.get("transfer")
+    lr_iteration_offset = 0 if transfer is None else transfer["learning_rate_iteration_offset"]
+elif args.transfer_from:
+    from supermimic.gmt_transfer import load_transfer_checkpoint
+    initial = load_transfer_checkpoint(args.transfer_from, gmt_contract, vars(args),
+        wm=wm, pi=pi, critic=critic, opt_wm=opt_wm, opt_pi=opt_pi, opt_v=opt_v,
+        run_dir=args.log_dir, additional_iterations=args.iterations,
+        expected_parent_iteration=args.transfer_parent_iteration, map_location="cpu")
+    start_it, wall_offset, sim_steps = initial["iteration"], initial["wall_time"], initial["sim_steps"]
+    transfer, lr_iteration_offset = initial["transfer"], initial["learning_rate_iteration_offset"]
+    json.dump(transfer, open(os.path.join(args.log_dir, "transfer.json"), "w"), indent=2)
+    print(f"[gmt] full-state transfer from iteration {transfer['parent_iteration']}; "
+          f"new updates={args.iterations}, wm_only_iters={args.wm_only_iters}, "
+          f"LR schedule offset={lr_iteration_offset}", flush=True)
 json.dump(vars(args), open(os.path.join(args.log_dir, "args.json"), "w"), indent=2)
 json.dump(gmt_contract, open(os.path.join(args.log_dir, "gmt_contract.json"), "w"), indent=2)
 
@@ -106,11 +137,13 @@ ERR_FLOOR = torch.cat((torch.full((3,), 3e-3), torch.full((3,), 5e-3), torch.ful
                        torch.full((29,), 3e-3), torch.full((29,), 5e-2))).to(dev)  # fmt: skip
 
 
-def _wm_rollout(s, a, xi):
+def _wm_rollout(s, a, xi, actuator):
     S = unflatten_state(s[:, 0])
+    context = actuator[:, 0]
     preds = []
     for j in range(args.wm_window):
-        S = wm.step(S, a[:, j], normalize_xi(xi[:, j]))
+        S = wm.step(S, a[:, j], normalize_xi(xi[:, j]), context)
+        context = advance_actuator_state(context, a[:, j], xi[:, j])
         preds.append(S)
     return tuple(torch.stack([P[i] for P in preds], 1) for i in range(6))  # (B, k, ...)
 
@@ -122,21 +155,22 @@ def _wm_err(S_hat, s1, mask):
     return (e * mask).sum() / s1.shape[0], e[:, -1]
 
 
-def _imag_step(S, o_hist, a_prev, f, xi, xi_n, g, q_prev, qd_prev):
-    a = pi(o_hist, g, privileged(S, f, a_prev, xi, q_prev, qd_prev))
-    S1 = wm.step(S, a, xi_n)
+def _imag_step(S, o_hist, a_prev, f, xi, xi_n, g, q_prev, qd_prev, actuator):
+    a = clamp_action(pi(o_hist, g, privileged(S, f, a_prev, xi, q_prev, qd_prev, actuator)))
+    S1 = wm.step(S, a, xi_n, actuator)
+    actuator1 = advance_actuator_state(actuator, a, xi)
     f1 = f + 1
     o1 = mdp.obs(S1, a, xi, f1)
     o_hist = torch.cat((o_hist[:, 1:], o1.unsqueeze(1)), 1)
-    return S1, a, o_hist, f1, motion.goal(f1, K), S[4], S[5]
+    return S1, a, o_hist, f1, motion.goal(f1, K), S[4], S[5], actuator1
 
 
 def _reward_term(S, f, a, a_prev):
     return mdp.reward(S, f, a, a_prev), mdp.soft_termination(S, f)
 
 
-def _critic_input(S, f, xi_n, g):
-    return torch.cat((mdp.critic_features(S, f, xi_n), g), -1)
+def _critic_input(S, f, xi_n, g, actuator):
+    return torch.cat((mdp.critic_features(S, f, xi_n), g, normalize_actuator_state(actuator)), -1)
 
 
 wm_rollout = torch.compile(_wm_rollout)
@@ -160,7 +194,7 @@ def set_requires_grad(m: nn.Module, flag: bool):
 # ------------------------------------------------------------------------------------------------
 def wm_update():
     w = buffer.sample_windows(args.wm_batch, args.wm_window)
-    S_hat = wm_rollout(w["s"], w["a"], w["xi"])
+    S_hat = wm_rollout(w["s"], w["a"], w["xi"], w["actuator"])
     loss, e_last = wm_err(S_hat, w["s1"], w["mask"])
     opt_wm.zero_grad(set_to_none=True)
     loss.backward()
@@ -196,17 +230,19 @@ def policy_update():
     with torch.no_grad():
         o_hist = mdp.obs(unflatten_state(h["s"]), h["a_prev"], h["xi"], h["f"])
     q_prev, qd_prev = s["q_prev"], s["qd_prev"]
+    actuator = s["actuator"]
     set_requires_grad(wm, False)
     set_requires_grad(critic, False)
     B = args.pi_batch
     g0 = motion.goal(f, K)
     g = g0
     S0 = S
-    Ss, As, Aps, Fs, Gs = [], [], [], [], []
+    Ss, As, Aps, Fs, Gs, Actuators = [], [], [], [], [], []
     for t in range(HZ):
         Aps.append(a_prev)
-        S, a_prev, o_hist, f, g, q_prev, qd_prev = imag_step(S, o_hist, a_prev, f, xi, xi_n, g, q_prev, qd_prev)
+        S, a_prev, o_hist, f, g, q_prev, qd_prev, actuator = imag_step(S, o_hist, a_prev, f, xi, xi_n, g, q_prev, qd_prev, actuator)
         Ss.append(S), As.append(a_prev), Fs.append(f), Gs.append(g)
+        Actuators.append(actuator)
     flat = lambda xs: torch.stack(xs).flatten(0, 1)  # noqa: E731  (H*B, ...)
     S_all = tuple(flat([St[i] for St in Ss]) for i in range(6))
     f_all = flat(Fs)
@@ -220,7 +256,7 @@ def policy_update():
     r_sum = (c_t * r).detach().sum(0)
     rews, dones = r.detach(), d.detach()
     if not args.no_critic:
-        J = J + (args.gamma**HZ) * c * critic(_critic_input(S, f, xi_n, g))
+        J = J + (args.gamma**HZ) * c * critic(_critic_input(S, f, xi_n, g, actuator))
     loss = -J.mean()
     if PROFILE:
         torch.cuda.synchronize(); tq1 = time.time()
@@ -242,7 +278,8 @@ def policy_update():
             f_c = torch.cat((s["f"].unsqueeze(0), torch.stack(Fs)), 0).flatten()
             g_c = torch.cat((g0.unsqueeze(0), torch.stack(Gs)), 0).flatten(0, 1)
             xi_c = xi_n.unsqueeze(0).expand(HZ + 1, -1, -1).flatten(0, 1)
-            X = critic_input_c(S_c, f_c, xi_c, g_c).view(HZ + 1, B, -1)
+            actuator_c = torch.cat((s["actuator"].unsqueeze(0), torch.stack(Actuators).detach()), 0).flatten(0, 1)
+            X = critic_input_c(S_c, f_c, xi_c, g_c, actuator_c).view(HZ + 1, B, -1)
         critic.norm.update(X)
         with torch.no_grad():
             V = critic(X)
@@ -275,6 +312,8 @@ sim_cfg = make_sim(dev, args)
 with launch_simulation(sim_cfg, args):
     env = TrackingSim(sim_cfg, args.num_envs, motion, mdp, gamma=args.gamma)
     buffer = ReplayBuffer(args.buffer_steps, args.num_envs, dev)
+    print(f"[gmt] native collection N={args.num_envs}, replay_steps={args.buffer_steps}, H={HZ}; "
+          f"CUDA allocated={torch.cuda.memory_allocated()/2**30:.3f} GiB", flush=True)
     obs_hist = torch.zeros(args.num_envs, Hh, OBS_DIM, device=dev)
     q_prev, qd_prev = (x.clone() for x in env.state()[4:6])
 
@@ -291,16 +330,16 @@ with launch_simulation(sim_cfg, args):
             g = motion.goal(env.f, K)
             pi.obs_norm.update(o)
             pi.goal_norm.update(g)
-            direct = privileged(S, env.f, env.a_prev, env.xi, q_prev, qd_prev)
+            direct = privileged(S, env.f, env.a_prev, env.xi, q_prev, qd_prev, env.actuator_state())
             pi.privileged_norm.update(direct)
             a = pi(obs_hist, g, direct)
-            a = torch.clamp(a + args.action_noise * torch.randn_like(a), -20, 20)
+            a = clamp_action(a + args.action_noise * torch.randn_like(a))
             out = env.step(a)
             out["q_prev"], out["qd_prev"] = q_prev, qd_prev
             buffer.add(out)
             q_prev, qd_prev = S[4].clone(), S[5].clone()
             S0, S1 = unflatten_state(out["s"]), unflatten_state(out["s1"])
-            wm.in_norm.update(wm.inputs(S0, out["a"], normalize_xi(out["xi"])))
+            wm.in_norm.update(wm.inputs(S0, out["a"], normalize_xi(out["xi"]), out["actuator"]))
             wm.out_norm.update(wm.targets(S0, S1))
             sim_steps += args.num_envs
             stats["r"].append(out["r"].mean() / 0.1)
@@ -321,7 +360,7 @@ with launch_simulation(sim_cfg, args):
     step_acc = 0.0
     agg = {"wm": [], "wm8": [], "pi": [], "v": [], "ir": [], "gn": [], "surv": []}
     for it in range(start_it, args.iterations):
-        lr = lr_at(it)
+        lr = lr_at(it + lr_iteration_offset)
         for o in (opt_wm, opt_pi, opt_v):
             for gparam in o.param_groups:
                 gparam["lr"] = lr
@@ -345,6 +384,10 @@ with launch_simulation(sim_cfg, args):
                 torch.cuda.synchronize(); tp3 = time.time()
                 print(f"[prof] collect {1e3*(tp1-tp0):.0f} ms ({n} steps) | wm {1e3*(tp2-tp1):.0f} ms | policy+critic {1e3*(tp3-tp2):.0f} ms", flush=True)
             agg["pi"].append(pl), agg["v"].append(vl), agg["ir"].append(ir), agg["gn"].append(gn), agg["surv"].append(surv)
+        if it == start_it:
+            print(f"[gmt] first update complete: local_iteration={it+1}, wm_only_iters={args.wm_only_iters}; "
+                  f"CUDA peak allocated={torch.cuda.max_memory_allocated()/2**30:.3f} GiB, "
+                  f"peak reserved={torch.cuda.max_memory_reserved()/2**30:.3f} GiB", flush=True)
         if (it + 1) % args.log_every == 0:
             mean = lambda x: float(sum(float(v) for v in x) / max(len(x), 1))  # noqa: E731
             ips = args.log_every / (time.time() - t_log)
@@ -364,10 +407,14 @@ with launch_simulation(sim_cfg, args):
                   "opt_pi": opt_pi.state_dict(), "opt_v": opt_v.state_dict(), "iteration": it + 1,
                   "wall_time": time.time() - t_start, "sim_steps": sim_steps, "args": vars(args),
                   "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"), "gmt_contract": gmt_contract}  # fmt: skip
+            if transfer is not None:
+                ck["transfer"] = transfer
             last = os.path.join(args.log_dir, "last.pt")
             torch.save(ck, last + ".tmp")
             os.replace(last + ".tmp", last)
             small = {k: ck[k] for k in ("pi", "wm", "iteration", "wall_time", "sim_steps", "args", "saved_at", "gmt_contract")}
+            if transfer is not None:
+                small["transfer"] = transfer
             path = os.path.join(args.log_dir, f"ckpt_{it + 1:06d}.pt")
             torch.save(small, path + ".tmp")
             os.replace(path + ".tmp", path)
