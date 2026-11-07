@@ -15,6 +15,11 @@ import re
 import time
 
 
+RESMIMIC_TERMS = ("joint_pos", "joint_vel", "root_height", "root_rotation", "root_linear_vel",
+                  "root_angular_vel", "body_local", "body_global", "object_surface", "action_rate",
+                  "joint_limits", "joint_speed", "joint_accel")
+
+
 def write_json(path, data):
     with Path(path).open('x', encoding='utf-8') as stream:
         json.dump(data, stream, indent=2, default=str, allow_nan=False)
@@ -54,6 +59,8 @@ def run(args, launch_simulation):
     from .ppo import PPO, PPOConfig, RolloutBatch
     from .randomization import CONTRACT as DR_CONTRACT
     from .contract import implementation_contract
+    from .capacity import capacity_profile, capacity_readback, configure_capacity
+    from .resume import checkpoint_paths, restore_training, save_checkpoint
     from supermimic.env import make_sim
     from supermimic.kinematics import G1Kinematics
     from supermimic.privileged import PrivilegedFeatures, RobotKinematics38, checkpoint_contract
@@ -114,17 +121,37 @@ def run(args, launch_simulation):
     asset = dict(assets[motion.object_assets[asset_id]], asset_id=asset_id)
     v11_reward = None
     reward_inputs = {}
+    term_names = RESMIMIC_TERMS if args.resume_checkpoint else ()
     if profile == 'hoi_v1_1':
         from .v11_reward import TERM_NAMES, V11Reward
+        term_names = TERM_NAMES
         v11_reward = V11Reward(motion, asset, args.v11_train_bundle,
                                expected_bundle_content_sha256=experiment['v11_bundle_content_sha256'])
         reward_inputs = v11_reward.contract
+    training_assets = ([motion.object_assets[i] for i in sorted({r % 8 for r in range(world)})]
+                       if world > 1 else [asset['object_asset']])
+    identity = dict(gmt=gmt.metadata, manifest_sha256=motion.manifest_sha256,
+        asset_bundle_sha256=asset_bundle_sha256, domain_randomization=DR_CONTRACT,
+        residual_contract=residual_contract, warp_runtime=warp_runtime,
+        experiment=experiment, reward_inputs=reward_inputs, observation_contract=observation_contract(),
+        shape_bank_sha256=shape_metadata['bank_sha256'], shape_contract=shape_metadata['contract'],
+        assets=motion.object_assets, world_size=world, execution=execution, smoke=args.smoke,
+        data_scope={'partition':'train', 'one_clip_per_asset':args.smoke}, training_assets=training_assets)
+    capacity = capacity_profile(args.nconmax, args.njmax, args.epa_horizon)
+    resume = None
+    if args.resume_checkpoint:
+        resume = restore_training(args.resume_checkpoint, args.resume_sha256, policy=policy, ppo=ppo,
+                                  identity=identity, total_iterations=args.iterations,
+                                  num_envs=args.num_envs, seed=args.seed, capacity=capacity)
+        # Neither the per-rank simulator state nor its pending rollout was checkpointed.
+        resume['rank_seed'] = args.seed + ppo.updates * world + rank
+        torch.manual_seed(resume['rank_seed'])
+    start_iteration = ppo.updates + 1
     mdp = MDP(kin,motion,torch.tensor(default_joint_pos_list(),device=device))
     cfg = make_sim(device,args)
     # Allocation capacity only: the 121/134-hull ULTRA objects require more
     # contacts/constraints. All solver options, integration and robot stay GMT.
-    cfg.physics.solver_cfg.nconmax = 512
-    cfg.physics.solver_cfg.njmax = 2048
+    configure_capacity(cfg, capacity)
     write_json(output/'config.json',{'args':vars(args),'rank':rank,'world_size':world,
         'asset':asset['object_asset'],'asset_bundle_sha256':asset_bundle_sha256,'execution':execution,
         'gmt':gmt.metadata,'network':policy.architecture(),
@@ -133,7 +160,8 @@ def run(args, launch_simulation):
         'oracle_blocks':BLOCKS,'observation_contract':observation_contract(),
         'shape':shape_metadata,'ppo':asdict(ppo.config),'domain_randomization':DR_CONTRACT,
         'data_selection':motion.selection_contract,
-        'capacity':{'nconmax':512,'njmax':2048,'gmt_baseline':[128,500],
+        'resume':resume, 'first_iteration':start_iteration,
+        'capacity':{**capacity, 'gmt_baseline':[128,500],
                     'reason':'extra dynamic ULTRA collision hulls; allocation only'},
         'world_model_constructed':False})
     with launch_simulation(cfg,args):
@@ -182,22 +210,24 @@ def run(args, launch_simulation):
         norm_data = (oracle,base)
         started = time.monotonic()
         with (output/'metrics.jsonl').open('x',encoding='utf-8') as log:
-            for iteration in range(1,args.iterations+1):
+            for iteration in range(start_iteration,args.iterations+1):
                 if norm_data is not None:
                     policy.update_normalizer(*norm_data)
                     norm_data = None
                 rows = {k:[] for k in ('oracle','base_actions','actions','log_probs','values','rewards',
                                        'terminated','truncated','next_values')}
-                if v11_reward is not None:
-                    reward_terms = torch.zeros(len(TERM_NAMES), device=device)
+                if term_names:
+                    reward_terms = torch.zeros(len(term_names), device=device)
                 for tick in range(args.rollout_steps):
                     sample = policy.sample(oracle,base,shape_points)
                     combined = clamp_action(base+sample['actions'])
                     out = env.step(combined)
-                    if v11_reward is not None:
-                        reward_terms += torch.stack([out['terms'][key].detach().mean() for key in TERM_NAMES])
+                    if term_names:
+                        reward_terms += torch.stack([out['terms'][key].detach().mean() for key in term_names])
                     if robot_physics_before is None:
                         robot_physics_before = env.physics.readback()
+                        native_capacity = capacity_readback(env.physics)
+                        write_json(output/'native_capacity.json', native_capacity)
                     qprev,qdprev = out['previous_q'],out['previous_qd']
                     new_obs = mdp.obs(env.state(),env.a_prev,env.xi,env.f)
                     history = torch.cat((history[:,1:],new_obs[:,None]),1)
@@ -243,46 +273,38 @@ def run(args, launch_simulation):
                 metrics = ppo.update(batch)
                 # The very first tick already warmed the RMS before rollout 1.
                 # Each collected input contributes once, even with a 1-step rollout.
-                first = 1 if iteration == 1 else 0
+                first = 1 if iteration == start_iteration else 0
                 norm_data = ((batch.oracle[first:],batch.base_actions[first:])
                              if batch.oracle.shape[0] > first else None)
                 metrics.update(iteration=iteration,mean_reward=float(batch.rewards.mean()),
                                elapsed_seconds=time.monotonic()-started)
-                if v11_reward is not None:
+                if term_names:
                     means = (reward_terms / args.rollout_steps).cpu()
-                    metrics['reward_terms_by_asset'] = dict(zip(TERM_NAMES, means.tolist()))
+                    metrics['reward_terms_by_asset'] = dict(zip(term_names, means.tolist()))
                     if world > 1:
                         means = means.to('cpu' if args.shared_gpu else device)
                         dist.all_reduce(means)
                         means /= world
-                    metrics['reward_terms'] = dict(zip(TERM_NAMES, means.tolist()))
+                    metrics['reward_terms'] = dict(zip(term_names, means.tolist()))
                     if abs(sum(metrics['reward_terms'].values()) - metrics['reward_mean']) > 1e-5:
-                        raise RuntimeError('weighted v1.1 reward terms do not sum to the PPO rollout reward')
+                        raise RuntimeError('weighted reward terms do not sum to the PPO rollout reward')
                 # Only oracle/base inputs are needed for the next RMS update.
                 # Keeping the entire last batch alive would compete with Warp.
                 del batch
                 log.write(json.dumps(metrics,allow_nan=False)+'\n')
                 log.flush()
                 print(json.dumps({'rank':rank,**metrics}),flush=True)
-                if iteration % args.save_every == 0 or iteration == args.iterations:
+                paths = checkpoint_paths(root, iteration, args.iterations, args.save_every, args.recovery_save_every)
+                if paths:
                     gmt.assert_unchanged()
                     if rank == 0:
-                        ck={'schema':'hoi_residual_ppo_teacher_v2','iteration':iteration,
+                        ck={**identity,'schema':'hoi_residual_ppo_teacher_v2','iteration':iteration,
                             'residual':policy.state_dict(),'optimizer':ppo.optimizer.state_dict(),
                             'architecture':policy.architecture(),'ppo_config':asdict(ppo.config),
-                            'gmt':gmt.metadata,'manifest_sha256':motion.manifest_sha256,
-                            'asset_bundle_sha256':asset_bundle_sha256,'domain_randomization':DR_CONTRACT,
-                            'residual_contract':residual_contract,'warp_runtime':warp_runtime,
-                            'experiment':experiment,'reward_inputs':reward_inputs,
-                            'observation_contract':observation_contract(),
-                            'shape_bank_sha256':shape_metadata['bank_sha256'],'shape_contract':shape_metadata['contract'],
-                            'capacity':{'nconmax':512,'njmax':2048},
-                            'assets':motion.object_assets,'world_size':world,'execution':execution,
-                            'smoke':args.smoke,'data_scope':{'partition':'train','one_clip_per_asset':args.smoke},
-                            'training_assets':([motion.object_assets[i] for i in sorted({r % 8 for r in range(world)})]
-                                               if world>1 else [asset['object_asset']]),
+                            'capacity':capacity, 'resume':resume, 'ppo_updates':ppo.updates,
+                            'num_envs_per_rank':args.num_envs, 'seed':args.seed,
                             'rng_state':torch.get_rng_state(), 'resume_semantics':'fresh simulator; not bitwise continuation'}
-                        torch.save(ck,root/f'checkpoint_{iteration:06d}.pt')
+                        save_checkpoint(ck, paths)
         changed_actor = any(not torch.equal(p,init_actor[n]) for n,p in policy.actor.named_parameters())
         changed_critic = any(not torch.equal(p,init_critic[n]) for n,p in policy.critic.named_parameters())
         changed_shape = {key:any(not torch.equal(p,init_shape[key][n])
@@ -307,6 +329,8 @@ def run(args, launch_simulation):
                 raise AssertionError('Distributed residual parameters/RMS diverged between assets')
         report = {'passed':True,'scope':'real IsaacLab/Newton/MuJoCo-Warp residual PPO smoke' if args.smoke else 'training',
             'experiment':experiment,'reward_inputs':reward_inputs,
+            'resume':resume,'first_iteration':start_iteration,'ppo_updates':ppo.updates,'capacity':capacity,
+            'native_capacity':native_capacity,
             'execution':execution,'synchronized_policy_sha256':policy_sha256,
             'asset':asset['object_asset'],'selected_train_clips':len(motion.names),
             'iterations':args.iterations,'transitions':transitions,'resets':resets,'timeouts':timeout_count,
@@ -350,12 +374,22 @@ def main():
     parser.add_argument('--epochs',type=int,default=5)
     parser.add_argument('--minibatches',type=int,default=4)
     parser.add_argument('--save-every',type=int,default=100)
+    parser.add_argument('--recovery-save-every',type=int,default=0,help='refresh recovery_latest.pt every N updates (0 disables)')
+    parser.add_argument('--resume-checkpoint',help='start from this completed PPO update in a new output directory')
+    parser.add_argument('--resume-sha256',help='expected SHA256 of the resume checkpoint')
+    parser.add_argument('--nconmax',type=int,default=512)
+    parser.add_argument('--njmax',type=int,default=2048)
+    parser.add_argument('--epa-horizon',type=int,default=24)
     parser.add_argument('--seed',type=int,default=0)
     from isaaclab.app import add_launcher_args,launch_simulation
     add_launcher_args(parser)
     args=parser.parse_args()
     if min(args.num_envs,args.iterations,args.rollout_steps,args.epochs,args.minibatches,args.save_every)<1:
         parser.error('training sizes must be positive')
+    if bool(args.resume_checkpoint) != bool(args.resume_sha256):
+        parser.error('--resume-checkpoint and --resume-sha256 must be provided together')
+    if args.recovery_save_every < 0:
+        parser.error('--recovery-save-every must be nonnegative')
     if args.smoke and (args.num_envs<2 or args.rollout_steps<8 or args.iterations<2):
         parser.error('smoke requires >=2 envs, >=8 steps, >=2 updates')
     run(args,launch_simulation)

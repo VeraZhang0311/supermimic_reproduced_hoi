@@ -41,8 +41,8 @@ def validate_metadata(checkpoint, *, architecture, gmt_metadata, manifest_sha256
     if (not isinstance(trained, list) or not trained or len(set(trained)) != len(trained)
             or not set(trained).issubset(object_assets) or selected_asset not in trained):
         raise ValueError("checkpoint did not train the requested asset; select a covered --asset")
-    if checkpoint.get("capacity") != {"nconmax": 512, "njmax": 2048}:
-        raise ValueError("residual checkpoint contact/constraint capacity differs from evaluation")
+    from .capacity import checkpoint_capacity
+    checkpoint_capacity(checkpoint.get("capacity"))
     from .randomization import CONTRACT
     if checkpoint.get("domain_randomization") != CONTRACT:
         raise ValueError("residual checkpoint domain-randomization contract mismatch")
@@ -238,7 +238,8 @@ def run_asset(args, launch_simulation):
     asset = dict(assets[motion.object_assets[args.asset]], asset_id=args.asset)
     mdp = MDP(kin, motion, torch.tensor(default_joint_pos_list(), device=device))
     cfg = make_sim(device, args)
-    cfg.physics.solver_cfg.nconmax, cfg.physics.solver_cfg.njmax = 512, 2048
+    from .capacity import configure_capacity
+    configure_capacity(cfg, checkpoint["capacity"])
     cases = []
     with launch_simulation(cfg, args):
         env = HOISim(cfg, 1, motion, mdp, asset, output, eval_mode=True)

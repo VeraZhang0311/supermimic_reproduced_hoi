@@ -200,6 +200,7 @@ def load_teacher(args, motion, teacher_kin, device):
     identity = {"schema": "residual_canonical_hoi80_v1", "checkpoint_sha256": digest,
                 "training_reward_profile": checkpoint.get("experiment", {}).get("reward_profile", "resmimic"),
                 "evaluation_reward_profile": "resmimic",
+                "capacity": checkpoint["capacity"],
                 "iteration": args.iteration, "gmt_checkpoint_sha256": gmt.metadata["checkpoint_sha256"],
                 "gmt_iteration": gmt.metadata["iteration"], "canonical_manifest_sha256": motion.manifest_sha256,
                 "ultra_manifest_sha256": motion.selection_contract["ultra_manifest_sha256"],
@@ -259,7 +260,8 @@ def worker(args, launch_simulation):
     mdp = MDP(kin, motion, torch.tensor(default_joint_pos_list(), device=device))
     references = [motion.load_reference(lane) for lane in range(len(motion.cases))]
     cfg = make_sim(device, args)
-    cfg.physics.solver_cfg.nconmax, cfg.physics.solver_cfg.njmax = 512, 2048
+    from .capacity import configure_capacity
+    configure_capacity(cfg, identity["capacity"])
     with launch_simulation(cfg, args), torch.no_grad():
         env = HOISim(cfg, len(references), motion, mdp, asset, output, eval_mode=True)
         env.step(torch.zeros(env.N, 29, device=device))
@@ -302,7 +304,7 @@ def aggregate(reports, canonical):
             "canonical_manifest_sha256", "ultra_manifest_sha256", "asset_catalog_sha256",
             "shape_bank_sha256", "protocol_files_sha256")
     identity = {key: reports[0][key] for key in keys}
-    for key in ("training_reward_profile", "evaluation_reward_profile"):
+    for key in ("training_reward_profile", "evaluation_reward_profile", "capacity"):
         if key in reports[0]:
             identity[key] = reports[0][key]
     if any(any(report[key] != value for key, value in identity.items()) for report in reports):

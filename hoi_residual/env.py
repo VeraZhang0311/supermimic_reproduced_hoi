@@ -121,10 +121,18 @@ class HOISim(TrackingSim):
             raise FloatingPointError('Nonfinite combined GMT/residual action')
         S0, previous = self.state(), self.a_prev.clone()
         target = self.default_q + self.xi[:,1:30] + self.alpha * action
-        if self.v11_reward is None:
-            self.physics.step_target(target)
-        else:
-            contact, contact_valid = self.hand_contacts.step(target)
+        try:
+            if self.v11_reward is None:
+                self.physics.step_target(target)
+            else:
+                contact, contact_valid = self.hand_contacts.step(target)
+        except RuntimeError as exc:
+            if "native contact/constraint buffer overflow" in str(exc):
+                from .capacity import overflow_detail
+                exc.add_note(f"asset={self.asset['object_asset']}, "
+                             f"active_reference_frame_range={int(self.f.min())}..{int(self.f.max())}, "
+                             f"native_buffers={overflow_detail(self.physics)}")
+            raise
         if self._check_object_after_step:
             from .native_checks import audit_object_solver
             self.object_solver_report = audit_object_solver(self)

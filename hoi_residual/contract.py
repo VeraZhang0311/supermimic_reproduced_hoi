@@ -15,7 +15,7 @@ from pathlib import Path
 SCHEMA = "hoi_residual_learning_implementation_v1"
 FILES = ("assets.py", "contract.py", "data.py", "distributed.py", "env.py", "features.py",
          "native_checks.py", "policy.py", "ppo.py", "randomization.py",
-         "rewards.py", "runtime.py", "shape.py", "train.py")
+         "rewards.py", "runtime.py", "shape.py", "train.py", "capacity.py", "resume.py")
 
 
 def implementation_contract(reward_profile="resmimic"):
@@ -34,12 +34,17 @@ def compatible_for_evaluation(stored, reward_profile):
     current = implementation_contract(reward_profile)
     if stored == current:
         return True
-    # 1509634 used the exact baseline from commit 541f7bd. Its eval path
-    # still uses the same reward and step semantics; bind the full old digest.
-    if reward_profile != "resmimic" or not isinstance(stored, dict):
+    # Both earlier runs predate resumable PPO and configurable EPA scratch.
+    # Permit only the exact published source bundles through this migration.
+    if not isinstance(stored, dict):
         return False
     digest = hashlib.sha256(json.dumps(stored, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-    if digest != "471e9be4e34aa5d94ec9b569999d30944229d6a1794ae36915831a836bc47e9a":
+    allowed = {
+        "resmimic": {"471e9be4e34aa5d94ec9b569999d30944229d6a1794ae36915831a836bc47e9a",
+                     "f75d4b55c0585799476c6b6faf7700ad9e2255bb01498b48c01b539ee437609c"},
+        "hoi_v1_1": {"c83896ec3d7f826ae2fbffa9441eda6eee11107c93d5108ca3ee8b2b5c924048"},
+    }
+    if digest not in allowed[reward_profile]:
         return False
     return all(stored["implementation_sha256"][key] == current["implementation_sha256"][key]
-               for key in FILES if key not in ("contract.py", "train.py", "env.py"))
+               for key in stored["implementation_sha256"] if key not in ("contract.py", "train.py", "env.py"))

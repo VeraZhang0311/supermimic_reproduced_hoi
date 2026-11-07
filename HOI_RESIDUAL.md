@@ -337,6 +337,19 @@ sbatch "$SOURCE/cluster/hoi_residual_train.sbatch.sh" "$ROOT" "$SOURCE" 100000 "
 `reward_terms_by_asset` 对应该 rank 的资产，`reward_terms` 是全局均值，各项之和等于
 `reward_mean`。正式对比使用相同的 HOI80 通过率、物体误差和固定评测奖励。
 
+### 基线 checkpoint 恢复与碰撞保护
+
+基线作业 1509634 在第 688 轮采样时触发原生 `EPA_HORIZON` 标志。
+恢复命令可用 `HOI_RESUME_CHECKPOINT` 和 `HOI_RESUME_SHA256` 指定最后一个完整的
+PPO checkpoint。恢复模式默认将每对凸体的 EPA 边容量从 24 提高到 64，并在首次物理步
+检查实际分配的维度。其余接触与约束缓冲区沿用 512/2048。再次溢出时记录求解器标志和
+受影响环境，丢弃未完成的 rollout。
+
+恢复作业每 10 轮原子更新 `recovery_latest.pt`，每 100 轮保留编号归档。
+actor、critic、shape encoder、归一化统计、Adam 和 PPO 更新计数从 checkpoint 载入。
+旧 checkpoint 未保存仿真状态、下一次归一化所需的 rollout、采样课程和各 rank 的随机流，
+新进程会重新初始化这些状态。两个作业的同轮数记录分别保存在各自的目录和 W&B run。
+
 设计参考：[ResMimic repository](https://github.com/amazon-far/ResMimic)。
 本新增实现没有复制其 simulator/PD 源码。若后续直接搬运上游文件，应保留根 Apache-2.0
 `LICENSE` / `NOTICE`，以及 `rsl_rl`、`legged_gym` 各自 BSD-3-Clause 文件头与许可证。
