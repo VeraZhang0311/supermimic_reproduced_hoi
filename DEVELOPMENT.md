@@ -3,7 +3,7 @@
 ## HOI residual 扩展入口
 
 当前独立开发分支为 `codex/hoi-residual-ppo-teacher`。新增 `hoi_residual/`，
-以冻结 26000 GMT + 特权残差 PPO 训练 ULTRA HOI teacher，详见
+以冻结 Boneseed 续训4000轮 GMT + 特权残差 PPO 训练 ULTRA HOI teacher，详见
 [HOI_RESIDUAL.md](HOI_RESIDUAL.md)。下文保留父分支与原实验记录。
 `supermimic/` 科学实现逐字节继承当前 privileged 冻结快照；不启动原 GMT 实验。
 

@@ -1,13 +1,18 @@
 # Frozen privileged GMT + residual PPO HOI teacher
 
 本分支在 `supermimic_reproduced_hoi` 的 `boneseed/privileged` 实现上增加
-`hoi_residual/`。目标是使用本体与物体 oracle 的 HOI teacher；没有部署观测约束、
-student 蒸馏或 world model 学习。ResMimic 对照仓库位于 `D:/ResMimic`，
+`hoi_residual/`。目标是使用本体与物体 oracle 的 HOI teacher；可共享物体输入
+对齐 v1.1 actor，为后续蒸馏准备接口。本分支尚未实现 student 蒸馏，也不做 world model 学习。
+ResMimic 对照仓库位于 `D:/ResMimic`，
 固定源版本 `fa20d98dbbf9b5b903db20435d90a4964bcf09d9`。
 
 ## 继承边界
 
-- 使用指定 26000 GMT checkpoint 的 `pi` 及其全部 RMS。加载器不实例化 WM、
+- 当前使用用户指定 Boneseed 续训第4000轮 checkpoint 的 `pi` 及其全部 RMS：
+  `/mnt/projects/ll/tianzizh/runs/gmt_bones_filtered_from26k_20k_20261106_02/ckpt_004000.pt`，
+  SHA256 `0b6df18de18306204972530d8d1b6ffff489e9c06066dc1dacabcc0526e3ab31`。
+  它的训练来源是原26k GMT；此前1508407验证用的是原26k权重。
+  加载器不实例化 WM、
   GMT critic 或旧 optimizer；使用 `Policy(99, 730, hist=10, privileged_dim=3371)`。
 - GMT schema、38-link/29-joint 顺序、URDF、物理与 analytic implementation SHA
   必须严格匹配当前运行代码。只有 reference dataset 与 manifest SHA 可以变化。
@@ -25,16 +30,45 @@ student 蒸馏或 world model 学习。ResMimic 对照仓库位于 `D:/ResMimic`
 
 ## 网络和动作
 
-残差 actor 与 critic 均输入 `3442D oracle + 29D frozen base action`。
-Oracle 由原样 3371D robot privileged block、15D 当前物体状态、两个未来时刻
-的共 30D 物体误差、12D 物体/地面物理上下文、8D asset one-hot、6D shape bounds 组成。
-未来偏移为 `[1, 13]`，对象特征采用机器人 heading 坐标系；所有字段在
-`features.py` 有版本化 schema，不能静默换序或加减字段。
+当前观测 schema 是 `hoi_oracle_hw3_torso_fps128_v2`，checkpoint schema 为
+`hoi_residual_ppo_teacher_v2`。旧 residual checkpoint 因观测与网络不一致会被拒绝。
+残差 actor 与 critic 均使用 `3647D oracle + 29D frozen base action`，归一化后再拼接
+各自的 64D shape embedding，MLP 输入共 3740D。
+
+| Raw oracle 子块 | 维度 | 定义 |
+|---|---:|---|
+| Robot privileged | 3371 | 原 GMT 输入逐字段保留，仍含其原本的 1/13 帧参考 |
+| Object history | 90 | 10×9；每个历史时刻物体相对该时刻实际 torso 的位置3、heading下旋转6 |
+| Object future reference | 63 | 7×9；未来参考位置3/旋转6，统一锚定当前实际 torso |
+| Explicit tracking errors | 105 | 同一7时刻各15D：位置3、旋转6、线速度差3、角速度差3 |
+| Object oracle velocity | 6 | 当前物体世界线/角速度转到当前 torso heading；保留teacher特权 |
+| Object physical context | 12 | 实际质量、COM、惯量6分量、物体与地面摩擦 |
+
+物体参考偏移严格采用 v1.1 的 `[1,2,5,7,12,18,25]`，即
+`[.02,.04,.10,.14,.24,.36,.50] s`。位置锚点为当前 `torso_link` link origin，
+旋转基底为其 yaw heading（不是完整 torso roll/pitch 旋转）；旋转6D使用X/Z列。
+torso FK来自当前冻结hw3机器人，包含waist joints；没有导入旧机器人配置。
+历史启动时重复首帧，reset只重复该world的新初始观测；历史各tick保留自身采集坐标系，
+不重投影到当前torso。未来参考越界重复当前clip末帧，不跨clip、不增加validity mask。
+
+FPS128复用已绑定v1.1 geometry cache的精确float32点，保持物体link局部米制坐标和实际尺寸；
+验证cache SHA、collision mesh、scale、sampling contract与point hash后，导出独立shape bank。
+该采样协议为4096个暴露碰撞并集表面候选点→确定性FPS128，剔除内部重叠表面。
+训练只读新bank，不依赖旧HOI代码。actor/critic各自拥有可训练PointNet：
+逐点`3→64→128→128`（ELU），max pooling，ELU+`128→64`。
+shape点与embedding不进入RunningNorm；每个PPO minibatch从原始点重新计算embedding，
+梯度同时更新两个encoder。asset one-hot和包围盒已移出网络输入；asset ID仅用于物理与数据索引。
+每个训练rank只负责一种资产，因此rollout只保存一份原始`[128,3]`点云；
+每个minibatch中两个encoder各算一次，再广播64D embedding，并将所有样本的梯度汇总回encoder。
+这与逐样本重复编码在数学上等价；FP32归约顺序可有微小数值差异，不缓存或detach学习到的embedding。
+混合资产batch仍支持逐样本点云。训练在stack完成后释放逐步副本，下一次RMS更新后释放旧输入，
+以免PyTorch的无用rollout引用挤占Warp物理所需显存。
+用于reward的1024点、奖励公式和物理配置保持原样。
 
 两套独立 MLP 的隐藏层均为 `[512, 512, 256, 128]`、SiLU、最后隐藏层 LayerNorm。
 残差最后线性层全零初始化，因此 deterministic residual 初始为零；可训练 Gaussian
 初始标准差为 `0.1`。这保留 ResMimic 的 additive residual 设计，但用明确的 oracle
-schema 取代上游 student history/future 拼接网络。上游发布版的 object 7D 与 future
+schema 与 v1.1 物体 history/future/shape 接口。上游发布版的 object 7D 与 future
 切片不一致，以及 `final_layer_gain` 未传递的问题不带入本实现。
 
 执行动作是 `clamp(base + sampled_residual, -20, 20)`，随后仍由原 action scale
@@ -66,18 +100,26 @@ clip `.2`、value coefficient `1`、entropy `.005`、gradient norm 上限 `1`。
 
 Residual normalizer 只在下一轮 rollout 开始前更新一次；采集和该轮全部 PPO epochs
 使用相同统计量。Protected eval 不更新任何 normalizer。
+物体9D历史统计在10个槽间共享，只以当前tick累计一次；63D目标按future slot统计。
+统计更新遵守PPO的rollout边界，不在采集中改变动作分布的预处理。
 真正 failure 的 bootstrap 为零；time limit/motion end 从 **reset 前最后观测** 的 value
 bootstrap；两种边界都截断 GAE trace，不能接入下一个 episode 的 value/advantage。
 
-checkpoint 另绑定 `contract.py` 中 12 个残差学习实现文件的 SHA，包括训练时序、
-奖励、观测、资产处理与随机化。评估拒绝实现、manifest 或资产 catalog 身份不符的权重。
+checkpoint 另绑定 `contract.py` 中 14 个残差学习实现文件的 SHA，包括训练时序、
+奖励、观测、资产处理与随机化；也绑定shape bank SHA与观测协议。
+评估拒绝实现、manifest、资产catalog或FPS128 bank身份不符的权重。
 
-默认完整训练由 8 个（或 8 的整数倍）distributed ranks 共同训练**同一套策略**：每个 rank 固定一种
+完整训练由 8 个（或 8 的整数倍）distributed ranks 共同训练**同一套策略**：每个 rank 固定一种
 exact asset geometry，并从该资产的 train clips 采样，保持单 worker 中所有 MuJoCo Warp
 worlds 拓扑一致。训练入口广播初始参数与 buffers，随后跨 ranks 汇总 normalizer moments、
 advantages 与 gradients；梯度平均后再 clip。各 rank 的 rollout 长度、环境数、epochs
-和 minibatch 数必须一致。当前入口把 `LOCAL_RANK` 映射为该节点的 CUDA device，
-因此每节点的 rank 数须与分配 GPU 数匹配；资源由 Slurm/torchrun 显式配置。
+和 minibatch 数必须一致。当前默认launcher采用一张L40上的8个独立物理进程，
+每rank512环境，共4096环境。显式`--shared-gpu`要求调度器只暴露一张卡；所有rank使用cuda:0，
+Gloo通过独立CPU缓冲同步broadcast、RMS与梯度，完成后同步拷回CUDA，规避NCCL重复设备限制。
+仍按8个等量资产rank平均梯度，不改变PPO超参数、物理或参考数据量。
+短验收结束时比较所有rank完整policy/RMS的SHA，必须完全一致。
+多GPU模式省略`--shared-gpu`，按`LOCAL_RANK`使用不同CUDA设备和NCCL；
+launcher可用`HOI_SHARED_GPU=0`配合显式8张GPU分配选择该模式。
 单资产运行必须显式 `--asset`，或作为 `--smoke`；它不代表四类八资产训练已完成。
 
 ## 奖励适配
@@ -143,25 +185,64 @@ regression 历史上曾用于开发，不能称为 untouched test；test 本次 
 
 ## 运行与验收
 
+本次观测v2已通过本地42项专项CPU测试（8.828 s），包括torso/七参考时刻精确对齐、
+历史reset隔离、共享历史RMS、FPS128身份校验、两套shape encoder真实PPO更新，
+固定点云编码的输出/梯度/Adam近似等价，以及两进程Gloo参数/梯度/Adam同步。
+集群CPU作业 `1509569` 同样通过42项测试（6.662 s）。当前原生验收绑定冻结
+`source_smoke08`，归档SHA256为
+`d693476d2d4cb0112dec5bd4b8eaa73d1af5b4036249b6319f7edab36262b9b3`；
+93个源码文件、14个learning模块、24个GMT共享模块及75个机器人文件均已核对。
+
+观测v2的L40完整验收已通过：Slurm `1509570`，`ll-l40-2`，
+NVIDIA L40 / driver `535.216.01`；美东2026-11-06 `19:14:14–19:36:51`，
+22分37秒，退出码 `0:0`。验收包括：
+
+- 八种资产分别使用8个环境、32-step rollout、2轮PPO。
+- 单张L40上的8 ranks各用8个环境、24-step rollout、2轮联合PPO。
+- 同一单卡上8 ranks各用512个环境，完整覆盖2651条train动作，
+  24-step rollout、3轮PPO，共294912 transitions；第三轮覆盖完整RMS更新的容量峰值。
+- 两阶段联合PPO均验证八个rank最终policy/RMS SHA完全一致，两套shape encoder及
+  actor/critic真实更新，冻结GMT权重/RMS不变，DR启用，history/reset隔离通过。
+
+GPU显存5秒采样峰值为 `44243 / 46068 MiB`（约43.2 / 45.0 GiB）；
+这是实际全数据容量运行的观测值，不能用理论激活节省替代。
+train-only评估完整执行一条220-step（4.4秒）轨迹，零optimizer/RMS更新、
+无中途reset，未访问Protected动作张量。该条轨迹未触发failure，但这只是实现验收，
+不能据此声称teacher收敛或具有总体HOI任务成功率。
+
+当前完整报告与回执为本地ignored文件：
+`provenance/smoke_1509570_full.json`、`provenance/smoke_1509570_train_eval.json`、
+`provenance/smoke_1509570_receipt.json`、`provenance/smoke_1509570_formal_gate.json`。
+集群原始输出保留于 `/mnt/projects/ll/tianzizh/hoi_residual_ppo_20261106_01/smoke_1509570`。
+下方1508407是旧观测v1的历史记录，不替代本次v2验收。
+
 先准备新的 manifest/output，使用已有冻结 asset bundle 和 GMT checkpoint；输入均只读。
+FPS bank一次性准备命令（输出路径须尚不存在）：
+
+```bash
+python -m hoi_residual.shape --source-bundle /path/legacy_bound_bundle.json \
+  --catalog /path/current/assets.json --output /path/new/shape_bank_v2.json
+```
+
 smoke 示例（只在 Slurm 分配的 GPU 环境内运行）：
 
 ```bash
 python -m hoi_residual.train \
   --manifest /absolute/new/manifest.json \
   --asset-bundle /absolute/frozen/assets.json \
-  --gmt-checkpoint /absolute/frozen/ckpt_026000.pt \
+  --shape-bank /absolute/frozen/shape_bank_v2.json \
+  --gmt-checkpoint /absolute/frozen/ckpt_004000.pt --gmt-iteration 4000 \
   --output /absolute/new/hoi_teacher_smoke \
   --device cuda:0 --num-envs 2 --rollout-steps 24 --iterations 2 --smoke
 ```
 
 完整任务入口相同，去掉 `--smoke`，按启动器分配 8 ranks；不要在 GRASP login node
 执行 GPU workload，不改运行中的 GMT job、冻结 source 或共享 Python runtime。
-例如，已经获得单节点 8 GPU 分配时可用 `torchrun --standalone --nproc_per_node=8
--m hoi_residual.train ...`。`--asset INDEX` 仅用于明确指定的单资产实验；其索引采用
+例如，已经获得单L40分配时可用 `torchrun --standalone --nproc_per_node=8
+-m hoi_residual.train --shared-gpu ...`。`--asset INDEX` 仅用于明确指定的单资产实验；其索引采用
 canonical alphabetically sorted asset names，旧 bundle 的 `source_asset_id` 只作来源记录。
 默认 `--num-envs 512` 是每个 rank 的环境数；默认 `--iterations 100000`、
-`--save-every 100`、`--gmt-iteration 26000`。CPU 功能检查：
+`--save-every 100`、`--gmt-iteration 4000`。CPU 功能检查：
 
 ```bash
 python -m unittest discover -s tests -p 'test_hoi_residual_*.py' -v
@@ -170,15 +251,15 @@ python -m unittest discover -s tests -p 'test_hoi_residual_*.py' -v
 PPO 专项 CPU 测试包括真实 GMT policy/RMS 加载与冻结、0 WM 构造、零残差初始化、
 未裁剪 action likelihood、timeout/failure GAE、真实 actor/critic optimizer 更新、
 normalizer 冻结，以及 2-rank Gloo 的参数/梯度/统计同步。多进程测试需要本机 loopback。
-2026-11-06 本地已有 `.venv-hoi-tests` 的 PPO 专项 7 项全部通过（15.312 s），包括真实
+旧观测v1在2026-11-06使用本地 `.venv-hoi-tests` 时，PPO专项7项通过（15.312 s），包括真实
 两进程 Gloo；Windows 沙盒禁止 loopback 的第一次运行失败，经允许本机通信后通过。
 数据/观测/奖励 15 项与完整时长评估协议 2 项也通过，Warp 前向编译配置 3 项通过，
-新增 CPU 测试共 27 项。
+当时新增CPU测试共27项；当前v2对应上文42项测试。
 CPU 测试、native physical smoke、PPO smoke 与正式训练收敛是不同证据；只跑通 smoke
 不能声称得到高性能 HOI teacher。实际 GPU 作业、checkpoint SHA、输出路径和通过项
 以对应 run receipts 为准。
 
-2026-11-06 的真实 GPU smoke 已通过：Slurm `1508407`，`ll-l40-0`，
+原始观测v1的真实 GPU smoke 已通过（不作为本次v2观测改动的验收）：Slurm `1508407`，`ll-l40-0`，
 NVIDIA L40 / driver `535.216.01`；美东 `13:40:44–13:52:37`，退出码 `0:0`。
 8 种资产分别使用 8 个物理环境、32-step rollout、2 轮 PPO，共 4096 transitions、
 16 轮 PPO / 320 个 optimizer steps。每个资产均验证 actor/critic 更新、GMT 权重与
@@ -197,8 +278,17 @@ Protected 数据未用于本轮 smoke。八个独立资产 smoke 也不是八资
 `provenance/smoke_1508407_train_eval.json`。
 这些是本地 ignored 验收结果，不随源码提交；集群保留原始报告。
 集群结果根目录是 `/mnt/projects/ll/tianzizh/hoi_residual_ppo_20261106_01/smoke_1508407`，
-执行的冻结代码是同级 `source_smoke05`；其 12 个 learning module SHA 与本地一致。
-正式联合长训尚未启动；默认调度资源使用 `liu-compute / liu-account / ll-med / L40`。
+执行的冻结代码是同级 `source_smoke05`；其12个learning模块SHA属于旧commit
+`5001210307bdd9d72397f1e38aee7d8d6d466d83`，不与当前14模块实现混用。
+
+正式联合训练作业 `1509634` 已在美东2026-11-06 `19:36:56` 于 `ll-l40-2` 启动。
+Slurm的 `afterok:1509570` 及独立guard均已通过；guard重新验证完整验收、源码与输入SHA，
+随后从新run开始，不恢复smoke或容量测试的optimizer状态。
+正式使用单张L40、8 ranks、每rank512个环境，目标100000轮，保存间隔100轮，
+冻结GMT为用户指定的Boneseed `ckpt_004000.pt`，输入shape bank及train/Protected划分保持不变。
+运行目录为 `/mnt/projects/ll/tianzizh/hoi_residual_ppo_20261106_01/train_1509634`，
+日志为同根目录 `formal-source08-1509634.log`；进度以各rank的 `metrics.jsonl` 为准。
+调度资源为 `liu-compute / liu-account / ll-med`，1 L40、24 CPU、96 GiB主机内存、72小时时限。
 
 `.gitattributes` 对 `supermimic/*.py` 与 `hoi_residual/*.py` 关闭 Git 换行转换，
 保留已验证文件的原始字节，以便新 checkout 继续匹配 checkpoint 的源码 SHA。
@@ -214,8 +304,9 @@ Protected eval 入口示例：
 
 ```bash
 python -m hoi_residual.evaluate --checkpoint /path/residual.pt \
-  --gmt-checkpoint /path/ckpt_026000.pt --manifest /path/manifest.json \
-  --asset-bundle /path/assets.json --partition test --output /path/new_eval
+  --gmt-checkpoint /path/ckpt_004000.pt --gmt-iteration 4000 --manifest /path/manifest.json \
+  --asset-bundle /path/assets.json --shape-bank /path/shape_bank_v2.json \
+  --partition test --output /path/new_eval
 ```
 
 省略 `--asset` 时要求 checkpoint 覆盖全部八资产，再分八个进程顺序运行。

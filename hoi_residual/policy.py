@@ -23,6 +23,7 @@ from torch.distributions import Normal
 from supermimic.networks import Policy, RunningNorm
 from supermimic.privileged import PRIVILEGED_DIM, SCHEMA
 from supermimic.robot_metadata import G1_BODY_NAMES, G1_JOINT_NAMES
+from .distributed import all_reduce_tensor
 
 
 def file_sha256(path):
@@ -150,26 +151,57 @@ def _mlp(input_dim, hidden, output_dim):
     return nn.Sequential(*layers)
 
 
-class ResidualActorCritic(nn.Module):
-    """Oracle MLP conditioned on the actual frozen GMT action.
+class ShapeEncoder(nn.Module):
+    """v1.1 PointNet on FPS128 object-link-local coordinates in metres.
 
-Actor and critic both observe oracle+base_action. The residual mean is exactly
+    The layer order matches hoi/v1/networks.py@66d9184. Residual PPO keeps its
+    own trainable encoder in FP32 rather than inheriting GMT's AMP setting.
+    Neither raw metric points nor the changing embedding enter RunningNorm.
+    """
+
+    output_dim = 64
+
+    def __init__(self):
+        super().__init__()
+        self.point = nn.Sequential(nn.Linear(3, 64), nn.ELU(), nn.Linear(64, 128),
+                                   nn.ELU(), nn.Linear(128, 128))
+        self.out = nn.Sequential(nn.ELU(), nn.Linear(128, self.output_dim))
+
+    def forward(self, points):
+        if points.shape[-2:] != (128, 3):
+            raise ValueError("Shape encoder requires FPS points [...,128,3]")
+        return self.out(self.point(points).amax(-2))
+
+
+class ResidualActorCritic(nn.Module):
+    """Oracle MLP conditioned on GMT actions and learned FPS128 geometry.
+
+Actor and critic observe the same oracle+base_action and metric point cloud,
+with separate trainable shape encoders. The residual mean is exactly
 zero at initialization. The residual Gaussian is sampled without action
 clipping: combine with GMT, then use the existing environment action bound.
 Normalizer statistics must stay fixed throughout collection AND PPO epochs.
 """
 
-    def __init__(self, oracle_dim, action_dim=29, schema="hoi_oracle_v1",
+    def __init__(self, oracle_dim, action_dim=29, schema="hoi_oracle_shape_v2",
                  hidden=(512, 512, 256, 128), init_noise_std=0.1):
         super().__init__()
         if oracle_dim <= 0 or action_dim <= 0 or not hidden or init_noise_std <= 0 or not schema:
             raise ValueError("Invalid oracle residual network configuration")
         self.oracle_dim, self.action_dim, self.schema = oracle_dim, action_dim, schema
         self.hidden = tuple(hidden)
+        from .features import BLOCKS, HISTORY, ORACLE_DIM, SCHEMA as ORACLE_SCHEMA
+        self._object_history_rms = None
+        if schema == ORACLE_SCHEMA:
+            if oracle_dim != ORACLE_DIM:
+                raise ValueError("The torso/FPS128 observation schema requires its declared raw dimension")
+            self._object_history_rms = (BLOCKS["robot_privileged"], HISTORY, 9)
         self.norm = RunningNorm(oracle_dim + action_dim)
         self.register_buffer("_normalizer_revision", torch.zeros((), dtype=torch.long))
-        self.actor = _mlp(oracle_dim + action_dim, hidden, action_dim)
-        self.critic = _mlp(oracle_dim + action_dim, hidden, 1)
+        self.actor_shape_encoder = ShapeEncoder()
+        self.critic_shape_encoder = ShapeEncoder()
+        self.actor = _mlp(oracle_dim + action_dim + ShapeEncoder.output_dim, hidden, action_dim)
+        self.critic = _mlp(oracle_dim + action_dim + ShapeEncoder.output_dim, hidden, 1)
         nn.init.zeros_(self.actor[-1].weight)
         nn.init.zeros_(self.actor[-1].bias)
         self.log_std = nn.Parameter(torch.full((action_dim,), math.log(init_noise_std)))
@@ -186,10 +218,34 @@ Normalizer statistics must stay fixed throughout collection AND PPO epochs.
             raise FloatingPointError("Nonfinite residual oracle/base action")
         return inputs
 
+    @staticmethod
+    def _shape_points(shape_points, inputs):
+        if (not isinstance(shape_points, torch.Tensor) or shape_points.ndim < 2
+                or shape_points.shape[-2:] != (128, 3)):
+            raise ValueError("Residual shape input must contain FPS points [...,128,3]")
+        expected = inputs.shape[:-1] + (128, 3)
+        if shape_points.shape != (128, 3) and shape_points.shape != expected:
+            raise ValueError("Residual shape input batch does not match oracle/base actions")
+        if shape_points.device != inputs.device or shape_points.dtype != inputs.dtype:
+            raise ValueError("Residual shape points must share oracle device and floating dtype")
+        if not bool(torch.isfinite(shape_points).all()):
+            raise FloatingPointError("Nonfinite residual shape points")
+        return shape_points
+
     @torch.no_grad()
     def update_normalizer(self, oracle, base_actions):
         """Call once before collecting the next on-policy rollout, never mid-rollout."""
         inputs = self._inputs(oracle, base_actions)
+        if self._object_history_rms is not None:
+            start, frames, width = self._object_history_rms
+            end = start + frames * width
+            # v1.1 uses one 9D RMS shared by all ten history positions. Feed
+            # only the current real tick to each tied slot; old repeated or
+            # overlapping history frames must not be counted again. Forward
+            # still normalizes and consumes the actual full pose history.
+            current = inputs[..., end - width:end]
+            repeated = current.repeat(*([1] * (current.ndim - 1)), frames)
+            inputs = torch.cat((inputs[..., :start], repeated, inputs[..., end:]), -1)
         if dist.is_available() and dist.is_initialized():
             # Each rank owns a different object asset. Pool all training ranks
             # before changing the shared policy normalization, in float64 to
@@ -197,7 +253,7 @@ Normalizer statistics must stay fixed throughout collection AND PPO epochs.
             flat = inputs.reshape(-1, inputs.shape[-1]).double()
             moments = torch.cat((flat.sum(0), flat.square().sum(0),
                                  torch.tensor([len(flat)], device=flat.device, dtype=flat.dtype)))
-            dist.all_reduce(moments)
+            all_reduce_tensor(moments)
             if self.norm.count < self.norm.max_count:
                 width = inputs.shape[-1]
                 count = moments[-1]
@@ -216,21 +272,31 @@ Normalizer statistics must stay fixed throughout collection AND PPO epochs.
             self.norm.update(inputs)
         self._normalizer_revision.add_(1)
 
-    def distribution(self, oracle, base_actions):
+    def distribution(self, oracle, base_actions, shape_points):
         inputs = self.norm(self._inputs(oracle, base_actions))
-        mean = self.actor(inputs)
+        points = self._shape_points(shape_points, inputs)
+        # Recompute embeddings with the current weights during every PPO
+        # minibatch. Storing detached rollout embeddings would lose gradients.
+        # A fixed asset supplies one raw cloud: encode it once, then broadcast
+        # the embedding. ExpandBackward sums each sample's encoder gradient;
+        # the point MLP's large activations need not be repeated per sample.
+        embedding_shape = inputs.shape[:-1] + (ShapeEncoder.output_dim,)
+        actor_shape = self.actor_shape_encoder(points).expand(embedding_shape)
+        mean = self.actor(torch.cat((inputs, actor_shape), -1))
         std = self.log_std.clamp(-5.0, 2.0).exp().expand_as(mean)
-        return Normal(mean, std), self.critic(inputs).squeeze(-1)
+        critic_shape = self.critic_shape_encoder(points).expand(embedding_shape)
+        value = self.critic(torch.cat((inputs, critic_shape), -1)).squeeze(-1)
+        return Normal(mean, std), value
 
     @torch.no_grad()
-    def sample(self, oracle, base_actions):
-        distribution, value = self.distribution(oracle, base_actions)
+    def sample(self, oracle, base_actions, shape_points):
+        distribution, value = self.distribution(oracle, base_actions, shape_points)
         actions = distribution.sample()
         return {"actions": actions, "log_prob": distribution.log_prob(actions).sum(-1),
                 "value": value, "mean": distribution.mean, "std": distribution.stddev}
 
-    def evaluate(self, oracle, base_actions, actions):
-        distribution, value = self.distribution(oracle, base_actions)
+    def evaluate(self, oracle, base_actions, actions, shape_points):
+        distribution, value = self.distribution(oracle, base_actions, shape_points)
         if actions.shape != distribution.mean.shape:
             raise ValueError("PPO must evaluate the stored sampled residual action")
         return {"log_prob": distribution.log_prob(actions).sum(-1),
@@ -238,12 +304,12 @@ Normalizer statistics must stay fixed throughout collection AND PPO epochs.
                 "mean": distribution.mean, "std": distribution.stddev}
 
     @torch.no_grad()
-    def value(self, oracle, base_actions):
-        return self.distribution(oracle, base_actions)[1]
+    def value(self, oracle, base_actions, shape_points):
+        return self.distribution(oracle, base_actions, shape_points)[1]
 
     @torch.no_grad()
-    def act(self, oracle, base_actions, deterministic=True):
-        distribution, _ = self.distribution(oracle, base_actions)
+    def act(self, oracle, base_actions, shape_points, deterministic=True):
+        distribution, _ = self.distribution(oracle, base_actions, shape_points)
         return distribution.mean if deterministic else distribution.sample()
 
     def architecture(self):
@@ -251,4 +317,13 @@ Normalizer statistics must stay fixed throughout collection AND PPO epochs.
                 "action_dim": self.action_dim, "hidden": list(self.hidden),
                 "base_action_input": True, "activation": "silu", "initial_mean": "zero",
                 "normalizer": "separate_oracle_plus_base_frozen_within_rollout",
+                "object_history_normalizer": ({"shared_dim": 9, "frames": 10,
+                    "statistics": "current_real_tick_once", "clip": None}
+                    if self._object_history_rms is not None else None),
+                "mlp_input_dim": self.oracle_dim + self.action_dim + ShapeEncoder.output_dim,
+                "shape_encoder": {"input": [128, 3], "frame": "object_link_local_metres",
+                                  "point_mlp": [3, 64, 128, 128], "pooling": "max",
+                                  "projection": [128, 64], "activation": "elu",
+                                  "independent_actor_critic": True, "trainable": True,
+                                  "precision": "float32", "normalization": "none"},
                 "action_distribution": "unclipped_residual_gaussian"}

@@ -15,10 +15,16 @@ import sys
 
 
 def validate_metadata(checkpoint, *, architecture, gmt_metadata, manifest_sha256,
-                      object_assets, asset_bundle_sha256, selected_asset):
+                      object_assets, asset_bundle_sha256, selected_asset, shape_metadata):
     """Strict identities before any protected trajectory is evaluated."""
-    if checkpoint.get("schema") != "hoi_residual_ppo_teacher_v1":
+    if checkpoint.get("schema") != "hoi_residual_ppo_teacher_v2":
         raise ValueError("unsupported residual checkpoint schema")
+    from .features import observation_contract
+    if checkpoint.get("observation_contract") != observation_contract():
+        raise ValueError("residual checkpoint observation contract mismatch")
+    if (checkpoint.get("shape_bank_sha256") != shape_metadata['bank_sha256'] or
+            checkpoint.get("shape_contract") != shape_metadata['contract']):
+        raise ValueError("residual checkpoint FPS128 shape bank mismatch")
     from .contract import implementation_contract
     if checkpoint.get("residual_contract") != implementation_contract():
         raise ValueError("residual checkpoint learning implementation identity mismatch")
@@ -79,10 +85,10 @@ def summarize(cases):
     return result
 
 
-def rollout_clip(env, motion, mdp, privileged, gmt, policy, clip):
+def rollout_clip(env, motion, mdp, privileged, gmt, policy, clip, teacher_kin, shape_points):
     """Exactly T actions and T+1 states; never reset after a failure flag."""
     import torch
-    from .features import oracle_features
+    from .features import oracle_features, ObjectHistory, object_observation, torso_pose
     from .rewards import MAX_POSITIVE_REWARD
     from supermimic.mdp import clamp_action
     from supermimic.rotations import so3_log
@@ -96,6 +102,7 @@ def rollout_clip(env, motion, mdp, privileged, gmt, policy, clip):
         qprev, qdprev = S[4].clone(), S[5].clone()
         observation = mdp.obs(S, env.a_prev, env.xi, env.f)
         history = observation[:, None].expand(-1, 10, -1).clone()
+        object_history = ObjectHistory(object_observation(torso_pose(teacher_kin,S),env.object_state()))
         steps = int(motion.clip_len[clip]) - 1
         if steps < 1:
             raise ValueError("evaluation clip has no complete control intervals")
@@ -108,9 +115,9 @@ def rollout_clip(env, motion, mdp, privileged, gmt, policy, clip):
             S = env.state()
             direct = privileged(S, env.f, env.a_prev, env.xi, qprev, qdprev, env.actuator_state())
             base = gmt(history, motion.goal(env.f, 10), direct)
-            oracle = oracle_features(direct, S, env.object_state(), motion, env.f,
-                                     env.object_context(), env.asset_ids, env.bounds)
-            residual = policy.act(oracle, base, deterministic=True)
+            oracle = oracle_features(direct, torso_pose(teacher_kin,S), env.object_state(), motion, env.f,
+                                     env.object_context(), object_history.values)
+            residual = policy.act(oracle, base, shape_points, deterministic=True)
             combined = base + residual
             action = clamp_action(combined)
             clipped_steps += int(not torch.equal(action, combined))
@@ -141,6 +148,7 @@ def rollout_clip(env, motion, mdp, privileged, gmt, policy, clip):
                 values[key].append(float(value.item()))
             next_observation = mdp.obs(actual, env.a_prev, env.xi, env.f)
             history = torch.cat((history[:, 1:], next_observation[:, None]), 1)
+            object_history.advance(object_observation(torso_pose(teacher_kin,actual),obj))
         if int(env.f.item()) != int(motion.clip_end[clip]):
             raise RuntimeError("full-duration evaluation did not finish at the exact clip end")
         result = {"clip": clip, "motion": motion.entries[clip]["motion"],
@@ -169,7 +177,8 @@ def run_asset(args, launch_simulation):
     from .assets import load_assets
     from .data import UltraMotionLib, sha256_file
     from .env import HOISim
-    from .features import ORACLE_DIM, SCHEMA
+    from .features import ORACLE_DIM, SCHEMA, observation_contract
+    from .shape import load_shape_bank
     from .policy import FrozenGMT, ResidualActorCritic
     from supermimic.env import make_sim
     from supermimic.kinematics import G1Kinematics
@@ -192,6 +201,8 @@ def run_asset(args, launch_simulation):
     gmt = FrozenGMT(args.gmt_checkpoint, checkpoint_contract(motion, teacher_kin),
                     device=device, expected_iteration=args.gmt_iteration)
     networks.AMP_DTYPE = torch.bfloat16 if gmt.metadata["source_amp"] == "bf16" else None
+    shape_bank, shape_metadata = load_shape_bank(args.shape_bank,args.asset_bundle)
+    shape_points = shape_bank[args.asset].to(device)
     policy = ResidualActorCritic(ORACLE_DIM, schema=SCHEMA).to(device)
     checkpoint_sha = sha256_file(args.checkpoint)
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
@@ -199,7 +210,8 @@ def run_asset(args, launch_simulation):
         raise RuntimeError("residual checkpoint changed during read")
     validate_metadata(checkpoint, architecture=policy.architecture(), gmt_metadata=gmt.metadata,
                       manifest_sha256=motion.manifest_sha256, object_assets=motion.object_assets,
-                      asset_bundle_sha256=sha256_file(args.asset_bundle), selected_asset=motion.object_assets[args.asset])
+                      asset_bundle_sha256=sha256_file(args.asset_bundle), selected_asset=motion.object_assets[args.asset],
+                      shape_metadata=shape_metadata)
     if not isinstance(checkpoint.get("residual"), dict):
         raise ValueError("missing residual weights/RMS state")
     expected_state = policy.state_dict()
@@ -222,7 +234,7 @@ def run_asset(args, launch_simulation):
         env = HOISim(cfg, 1, motion, mdp, asset, output, eval_mode=True)
         curriculum_before = {name: getattr(env, name).clone() for name in ("bin_G", "bin_w_avg")}
         for clip in range(len(motion.names)):
-            result = rollout_clip(env, motion, mdp, privileged, gmt, policy, clip)
+            result = rollout_clip(env, motion, mdp, privileged, gmt, policy, clip, teacher_kin, shape_points)
             cases.append(result)
             _write_json(output / f"case_{clip:05d}.json", result)
             print(json.dumps({"asset": args.asset, "case": clip + 1, "cases": len(motion.names),
@@ -242,6 +254,7 @@ def run_asset(args, launch_simulation):
                   "manifest_sha256": motion.manifest_sha256, "manifest_content_sha256": motion.manifest["content_sha256"],
                   "asset_bundle_sha256": sha256_file(args.asset_bundle), "data_selection": motion.selection_contract,
                   "residual_contract": checkpoint["residual_contract"], "warp_runtime": warp_runtime,
+                  "observation_contract":observation_contract(),"shape":shape_metadata,
                   "normalizer_updates": 0, "optimizer_updates": 0, "world_model_constructed": False,
                   "all_model_parameters_and_buffers_unchanged": True, "deterministic": True,
                   "reset_curriculum_unchanged": True,
@@ -260,9 +273,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--gmt-checkpoint", required=True)
-    parser.add_argument("--gmt-iteration", type=int, default=26000)
+    parser.add_argument("--gmt-iteration", type=int, default=4000)
     parser.add_argument("--manifest", required=True)
     parser.add_argument("--asset-bundle", required=True)
+    parser.add_argument("--shape-bank", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--asset", type=int, choices=range(8))
     parser.add_argument("--partition", required=True, choices=("validation", "regression", "test", "protected_eval", "train"))

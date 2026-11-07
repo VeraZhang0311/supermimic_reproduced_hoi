@@ -10,6 +10,7 @@ import math
 
 import torch
 import torch.distributed as dist
+from .distributed import all_reduce_tensor
 
 
 @dataclass(frozen=True)
@@ -52,6 +53,7 @@ class RolloutBatch:
     truncated: torch.Tensor
     next_values: torch.Tensor
     normalizer_revision: int
+    shape_points: torch.Tensor  # Fixed [128,3] or mixed [time,environment,128,3].
 
     def validate(self):
         if self.rewards.ndim != 2 or min(self.rewards.shape) == 0:
@@ -66,6 +68,10 @@ class RolloutBatch:
                 raise ValueError(f"PPO rollout shape mismatch: {name}")
         if self.base_actions.shape != self.actions.shape:
             raise ValueError("Base and sampled residual action dimensions differ")
+        if self.shape_points.shape not in ((128, 3), (*shape, 128, 3)):
+            raise ValueError("PPO shape points must be raw fixed [128,3] or [time, environment,128,3] coordinates")
+        if self.shape_points.dtype != self.oracle.dtype:
+            raise ValueError("PPO shape points and oracle must share floating dtype")
         for name in ("terminated", "truncated"):
             if getattr(self, name).dtype != torch.bool:
                 raise ValueError(f"PPO {name} flags must be boolean")
@@ -125,8 +131,8 @@ class PPO:
                                       rollout.actions.shape[-1], cfg.epochs, cfg.minibatches,
                                       rollout.normalizer_revision], device=rollout.rewards.device)
             low, high = signature.clone(), signature.clone()
-            dist.all_reduce(low, op=dist.ReduceOp.MIN)
-            dist.all_reduce(high, op=dist.ReduceOp.MAX)
+            all_reduce_tensor(low, op=dist.ReduceOp.MIN)
+            all_reduce_tensor(high, op=dist.ReduceOp.MAX)
             if not torch.equal(low, high):
                 raise ValueError("Distributed PPO requires equal rollout and optimizer step shapes on all ranks")
         advantages, returns = compute_gae(rollout.rewards, rollout.values, rollout.next_values,
@@ -135,7 +141,7 @@ class PPO:
         if distributed:
             moments = torch.stack((advantages.double().sum(), advantages.double().square().sum(),
                                    advantages.new_tensor(advantages.numel(), dtype=torch.float64)))
-            dist.all_reduce(moments)
+            all_reduce_tensor(moments)
             mean = moments[0] / moments[2]
             std = (moments[1] / moments[2] - mean.square()).clamp_min(0).sqrt().clamp_min(1e-8)
             advantages = ((advantages.double() - mean) / std).to(advantages.dtype)
@@ -143,6 +149,8 @@ class PPO:
             advantages = (advantages - advantages.mean()) / advantages.std(unbiased=False).clamp_min(1e-8)
         fields = {name: getattr(rollout, name).flatten(0, 1) for name in
                   ("oracle", "base_actions", "actions", "log_probs", "values")}
+        fixed_shape = rollout.shape_points.ndim == 2
+        points = rollout.shape_points if fixed_shape else rollout.shape_points.flatten(0, 1)
         returns = returns.flatten()
         count = advantages.numel()
         if cfg.minibatches > count:
@@ -152,7 +160,8 @@ class PPO:
         for _ in range(cfg.epochs):
             permutation = torch.randperm(count, device=advantages.device)
             for indices in torch.tensor_split(permutation, cfg.minibatches):
-                result = self.actor_critic.evaluate(fields["oracle"][indices], fields["base_actions"][indices], fields["actions"][indices])
+                result = self.actor_critic.evaluate(fields["oracle"][indices], fields["base_actions"][indices],
+                                                    fields["actions"][indices], points if fixed_shape else points[indices])
                 log_ratio = result["log_prob"] - fields["log_probs"][indices]
                 ratio = log_ratio.exp()
                 surrogate = torch.minimum(ratio * advantages[indices],
@@ -174,7 +183,7 @@ class PPO:
                         if parameter.requires_grad:
                             if parameter.grad is None:
                                 raise RuntimeError("Distributed PPO encountered an unused trainable parameter")
-                            dist.all_reduce(parameter.grad)
+                            all_reduce_tensor(parameter.grad)
                             parameter.grad.div_(world_size)
                 grad_norm = torch.nn.utils.clip_grad_norm_(self.actor_critic.parameters(), cfg.max_grad_norm, error_if_nonfinite=True)
                 self.optimizer.step()
@@ -193,7 +202,7 @@ class PPO:
         if distributed:
             packed = torch.tensor([*totals.values(), sample_count, return_mean, reward_mean],
                                   device=rollout.rewards.device, dtype=torch.float64)
-            dist.all_reduce(packed)
+            all_reduce_tensor(packed)
             totals = dict(zip(totals, packed[:len(totals)].tolist()))
             sample_count = float(packed[-3])
             return_mean, reward_mean = (packed[-2:] / world_size).tolist()

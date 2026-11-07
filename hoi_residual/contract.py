@@ -12,9 +12,9 @@ import hashlib
 from pathlib import Path
 
 SCHEMA = "hoi_residual_learning_implementation_v1"
-FILES = ("assets.py", "contract.py", "data.py", "env.py", "features.py",
+FILES = ("assets.py", "contract.py", "data.py", "distributed.py", "env.py", "features.py",
          "native_checks.py", "policy.py", "ppo.py", "randomization.py",
-         "rewards.py", "runtime.py", "train.py")
+         "rewards.py", "runtime.py", "shape.py", "train.py")
 
 
 def implementation_contract():

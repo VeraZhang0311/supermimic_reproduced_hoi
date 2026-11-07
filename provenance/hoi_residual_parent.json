@@ -5,6 +5,12 @@
   "frozen_source": "/mnt/projects/ll/tianzizh/gmt_bones26k_20261106_02/source",
   "note": "Parent working tree contains uncommitted hw3/v3 changes; baseline copied without editing original",
   "checkpoint_sha256": "05caab65b9b4e35e4362bea6207b5e5fb925ae6b51f4a0fe7217e4849e03ba64",
+  "current_frozen_teacher": {
+    "checkpoint": "/mnt/projects/ll/tianzizh/runs/gmt_bones_filtered_from26k_20k_20261106_02/ckpt_004000.pt",
+    "sha256": "0b6df18de18306204972530d8d1b6ffff489e9c06066dc1dacabcc0526e3ab31",
+    "iteration": 4000,
+    "lineage": "Boneseed fine-tune initialized from the original 26000 GMT; unchanged architecture and physics contract"
+  },
   "resmimic_commit": "fa20d98dbbf9b5b903db20435d90a4964bcf09d9",
   "source_files": [
     {
