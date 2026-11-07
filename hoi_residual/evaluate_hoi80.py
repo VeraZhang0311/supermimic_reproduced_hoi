@@ -19,6 +19,13 @@ from .data import ASSETS, sha256_file
 from .evaluate import _write_json, frozen_residual
 
 
+REWARD_TERMS = (
+    "joint_pos", "joint_vel", "root_height", "root_rotation", "root_linear_vel",
+    "root_angular_vel", "body_local", "body_global", "object_surface", "action_rate",
+    "joint_limits", "joint_speed", "joint_accel",
+)
+
+
 def _verified_protocol():
     """Bind the same selection, scoring and initialization used for the GMT baseline."""
     import hoi_zero_shot
@@ -53,8 +60,8 @@ def collect(env, motion, mdp, privileged, teacher_kin, gmt, policy, points, audi
     base_actions, residuals, actions = (storage(steps, 29) for _ in range(3))
     rewards = torch.empty(steps, env.N, device=env.device)
     terminated = torch.empty_like(rewards, dtype=torch.bool)
-    diagnostics = {name: torch.empty_like(rewards) for name in
-                   ("object_surface_error_m", "object_surface", "action_rate")}
+    reward_terms = storage(steps, len(REWARD_TERMS))
+    surface_error = torch.empty_like(rewards)
 
     def record(t, state, obj):
         states[t] = flatten_state(state)
@@ -81,8 +88,8 @@ def collect(env, motion, mdp, privileged, teacher_kin, gmt, policy, points, audi
         out = env.step(action)
         actions[t], base_actions[t], residuals[t] = action, base, residual
         rewards[t], terminated[t] = out["reward"], out["terminated"]
-        for name, values in diagnostics.items():
-            values[t] = out["terms"][name]
+        torch.stack([out["terms"][name] for name in REWARD_TERMS], dim=-1, out=reward_terms[t])
+        surface_error[t] = out["terms"]["object_surface_error_m"]
         qprev, qdprev = out["previous_q"], out["previous_qd"]
         state, obj = env.state(), env.object_state()
         record(t + 1, state, obj)
@@ -94,7 +101,10 @@ def collect(env, motion, mdp, privileged, teacher_kin, gmt, policy, points, audi
         raise RuntimeError("canonical formal rollouts failed to reach the exact final states")
     return {"robot_state_wxyz": states, "object_state_xyzw": objects, "action": actions,
             "base_action": base_actions, "residual_action": residuals,
-            "residual_reward": rewards, "residual_termination": terminated, **diagnostics}
+            "residual_reward": rewards, "residual_termination": terminated,
+            "object_surface_error_m": surface_error, "reward_terms": reward_terms,
+            "object_surface": reward_terms[..., REWARD_TERMS.index("object_surface")],
+            "action_rate": reward_terms[..., REWARD_TERMS.index("action_rate")]}
 
 
 def score_lane(output, motion, lane, reference, rollout, virtual, mdp):
@@ -105,6 +115,11 @@ def score_lane(output, motion, lane, reference, rollout, virtual, mdp):
     steps = case["scored_control_steps"]
     arrays = {name: batch[:steps + int(name in ("robot_state_wxyz", "object_state_xyzw")), lane].cpu()
               for name, batch in rollout.items()}
+    contributions = arrays["reward_terms"]
+    if (contributions.shape != (steps, len(REWARD_TERMS)) or not torch.isfinite(contributions).all() or
+            not torch.allclose(contributions.sum(-1), arrays["residual_reward"], rtol=1e-5, atol=5e-7)):
+        raise ValueError(f"HOI80 reward contributions do not sum to the valid per-step rewards of {case['id']}")
+    per_step = dict(zip(REWARD_TERMS, contributions.double().mean(0).tolist(), strict=True))
     state = unflatten_state(rollout["robot_state_wxyz"][:steps + 1, lane])
     body = virtual(state).cpu()
     metrics = score(body, arrays["object_state_xyzw"][:, :7], reference, dt=.02)
@@ -122,6 +137,7 @@ def score_lane(output, motion, lane, reference, rollout, virtual, mdp):
     target = output / (case["id"] + ".npz")
     with target.open("xb") as stream:
         np.savez_compressed(stream, **{key: value.numpy() for key, value in arrays.items()},
+                            reward_term_names=np.array(REWARD_TERMS),
                             body_pos39=body.numpy(), reference=reference, time=np.arange(steps + 1) * .02,
                             body_names=np.array(virtual.body_names), joint_names=np.array(virtual.joint_names))
     clipped = arrays["action"] != (arrays["base_action"] + arrays["residual_action"])
@@ -130,6 +146,7 @@ def score_lane(output, motion, lane, reference, rollout, virtual, mdp):
                 reference_sha256=case["reference_sha256"], control_steps=steps, state_frames=steps + 1,
                 full_duration=True, resets_within_clip=0, clipped_action_steps=int(clipped.any(-1).sum()),
                 hoi_return=float(arrays["residual_reward"].sum()),
+                reward_terms_per_step=per_step,
                 mean_hoi_reward_per_step=float(arrays["residual_reward"].mean()),
                 mean_object_surface_error_m=float(arrays["object_surface_error_m"].mean()),
                 mean_object_surface_reward_per_step=float(arrays["object_surface"].mean()),
@@ -139,7 +156,7 @@ def score_lane(output, motion, lane, reference, rollout, virtual, mdp):
 
 
 def summarize(cases):
-    return {"clips": len(cases), "control_steps": sum(case["control_steps"] for case in cases),
+    summary = {"clips": len(cases), "control_steps": sum(case["control_steps"] for case in cases),
             **{key + "_count": sum(case[key] for case in cases)
                for key in ("human_pass", "object_pass", "joint_pass")},
             **{key + "_rate": sum(case[key] for case in cases) / len(cases)
@@ -149,6 +166,14 @@ def summarize(cases):
                 ("mean_hoi_reward_per_step", "mean_object_surface_error_m",
                  "mean_object_surface_reward_per_step", "mean_action_rate_reward_per_step",
                  "author_robot_normalized_return")}}
+    # Historical reports predate component collection. Never turn missing
+    # terms into zeros or average over a subset of the panel.
+    if any("reward_terms_per_step" in case for case in cases):
+        if any(set(case.get("reward_terms_per_step", {})) != set(REWARD_TERMS) for case in cases):
+            raise ValueError("HOI80 reward decomposition is incomplete across clips")
+        summary["reward_terms_per_step"] = {
+            key: sum(case["reward_terms_per_step"][key] for case in cases) / len(cases) for key in REWARD_TERMS}
+    return summary
 
 
 def load_teacher(args, motion, teacher_kin, device):

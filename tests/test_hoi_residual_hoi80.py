@@ -9,7 +9,7 @@ import numpy as np
 import torch
 
 from hoi_residual.data import ASSETS
-from hoi_residual.evaluate_hoi80 import _verified_protocol, aggregate, collect, score_lane
+from hoi_residual.evaluate_hoi80 import REWARD_TERMS, _verified_protocol, aggregate, collect, score_lane, summarize
 from supermimic.mdp import clamp_action
 
 
@@ -34,10 +34,13 @@ class PanelTests(unittest.TestCase):
                 self.f = self.f + 1
                 self.a_prev = action.clone()
                 # Both lanes fail immediately, even though the second lasts longer.
+                terms = {name: torch.zeros(2) for name in REWARD_TERMS}
+                terms.update(body_global=torch.full((2,), self.tick + .5),
+                             object_surface=torch.full((2,), .25), action_rate=torch.full((2,), -.75),
+                             object_surface_error_m=torch.ones(2) * self.tick * .01)
                 return dict(previous_q=torch.zeros(2, 29), previous_qd=torch.zeros(2, 29),
                             reward=torch.ones(2) * self.tick, terminated=torch.ones(2, dtype=torch.bool),
-                            terms={"object_surface_error_m": torch.ones(2) * self.tick * .01,
-                                   "object_surface": torch.zeros(2), "action_rate": torch.zeros(2)})
+                            terms=terms)
             def object_context(self):
                 return torch.zeros(2, 12)
             def actuator_state(self):
@@ -96,13 +99,24 @@ class PanelTests(unittest.TestCase):
             self.assertEqual(case["scored_frames"], 2)
             self.assertEqual(case["resets_within_clip"], 0)
             self.assertEqual(case["mean_hoi_reward_per_step"], 1.5)
+            contributions = case["reward_terms_per_step"]
+            self.assertEqual(tuple(contributions), REWARD_TERMS)
+            self.assertEqual(contributions["body_global"], 2.0)
+            self.assertEqual(contributions["object_surface"], case["mean_object_surface_reward_per_step"])
+            self.assertEqual(contributions["action_rate"], -.75)
+            self.assertEqual(sum(contributions.values()), 1.5)
             self.assertAlmostEqual(case["mean_object_surface_error_m"], .015)
             self.assertEqual(case["first_author_robot_failure_step"], 1)
             with np.load(Path(directory) / case["rollout"], allow_pickle=False) as saved:
+                self.assertEqual(saved["reward_term_names"].tolist(), list(REWARD_TERMS))
+                self.assertEqual(saved["reward_terms"].shape, (2, 13))
                 self.assertEqual(saved["robot_state_wxyz"].shape, (3, 71))
                 self.assertEqual(saved["action"].shape, (2, 29))
                 self.assertEqual(saved["residual_termination"].tolist(), [True, True])
                 np.testing.assert_array_equal(saved["time"], [0., .02, .04])
+            rollout["reward_terms"][0, 0, 0] = 100.
+            with self.assertRaisesRegex(ValueError, "sum to the valid"):
+                score_lane(Path(directory), motion, 0, ref, rollout, Markers(), mdp)
 
     def test_aggregate_rejects_missing_duration_reordered_id_or_mixed_checkpoint(self):
         reports, panel = [], []
@@ -126,6 +140,22 @@ class PanelTests(unittest.TestCase):
         summary = aggregate(reports, canonical)["summary"]
         self.assertEqual(summary["joint_pass_count"], 8)
         self.assertEqual(summary["equal_clip_means"]["mean_hoi_reward_per_step"], 39.5)
+        self.assertNotIn("reward_terms_per_step", summary)  # Historical reports had no decomposition.
+        for report in reports:
+            for case in report["cases"]:
+                terms = dict.fromkeys(REWARD_TERMS, 0.)
+                terms.update(joint_accel=-.5, body_global=case["canonical_index"] + .5)
+                case["reward_terms_per_step"] = terms
+            report["summary"] = summarize(report["cases"])
+        result = aggregate(reports, canonical)
+        components = result["summary"]["reward_terms_per_step"]
+        self.assertEqual(components["body_global"], 40.)  # Equal clips despite different lengths.
+        self.assertEqual(sum(components.values()), 39.5)
+        self.assertEqual(result["by_asset"][ASSETS[0]]["reward_terms_per_step"]["body_global"], 5.)
+        missing = copy.deepcopy(reports)
+        del missing[0]["cases"][0]["reward_terms_per_step"]
+        with self.assertRaisesRegex(ValueError, "incomplete"):
+            aggregate(missing, canonical)
         for key, value in (("id", "duplicate"), ("scored_frames", 0), ("canonical_index", 3)):
             invalid = copy.deepcopy(reports)
             invalid[0]["cases"][0][key] = value
