@@ -16,7 +16,7 @@ from .rewards import MAX_POSITIVE_REWARD, reward
 
 class HOISim(TrackingSim):
     def __init__(self, sim_cfg, num_envs, motion, mdp, asset, output, *, eval_mode=False,
-                 max_episode_steps=500):
+                 max_episode_steps=500, v11_reward=None):
         if not eval_mode and (not motion.for_training or motion.partition != 'train'):
             raise ValueError('Physical training refuses Protected eval reference libraries')
         import isaaclab.sim as sim_utils
@@ -28,6 +28,7 @@ class HOISim(TrackingSim):
         if not len(self.compatible):
             raise ValueError('No train motions for this fixed worker asset')
         self._object_ready = False
+        self.v11_reward = v11_reward
         self.object_solver_report = None
         self.object_solver_checks = 0
         usd = prepare_object_usd(asset, Path(output) / 'object_asset')
@@ -57,7 +58,13 @@ class HOISim(TrackingSim):
                                               self.N, self.device, enabled=not eval_mode)
         self._object_ready = True
         self.reset(torch.arange(self.N, device=self.device), self.f.clone())
-        self.G_max = MAX_POSITIVE_REWARD / (1 - self.gamma)
+        max_step_reward = MAX_POSITIVE_REWARD
+        if v11_reward is not None:
+            from .v11_contacts import HandObjectContacts
+            from .v11_reward import MAX_STEP_REWARD
+            self.hand_contacts = HandObjectContacts(self)
+            max_step_reward = MAX_STEP_REWARD
+        self.G_max = max_step_reward / (1 - self.gamma)
         self.verify_dynamic_object()
 
     def verify_dynamic_object(self):
@@ -114,7 +121,10 @@ class HOISim(TrackingSim):
             raise FloatingPointError('Nonfinite combined GMT/residual action')
         S0, previous = self.state(), self.a_prev.clone()
         target = self.default_q + self.xi[:,1:30] + self.alpha * action
-        self.physics.step_target(target)
+        if self.v11_reward is None:
+            self.physics.step_target(target)
+        else:
+            contact, contact_valid = self.hand_contacts.step(target)
         if self._check_object_after_step:
             from .native_checks import audit_object_solver
             self.object_solver_report = audit_object_solver(self)
@@ -123,7 +133,13 @@ class HOISim(TrackingSim):
         S1, O1, f1 = self.state(), self.object_state(), self.f+1
         if any(not torch.isfinite(x).all() for x in (*S1,*O1)):
             raise FloatingPointError('Nonfinite physical HOI state')
-        r, terms = reward(self.mdp,S1,O1,f1,action,previous,self.points,S0[5])
+        if self.v11_reward is None:
+            r, terms = reward(self.mdp,S1,O1,f1,action,previous,self.points,S0[5])
+        else:
+            from .rewards import object_distance
+            r, terms = self.v11_reward(self.mdp, S1, O1, f1, action, previous, contact, contact_valid)
+            # Keep the baseline failure criterion for the reward-only comparison.
+            terms['object_surface_error_m'] = object_distance(O1, self.motion.object_ref(f1), self.points)
         term = self.mdp.termination(S1,f1) | (terms['object_surface_error_m'] > .3)
         trunc = (f1 >= self.motion.clip_end[self.motion.clip_id[self.f]]) | (self.ep_step+1 >= self.max_episode_steps)
         if not torch.isfinite(r).all():

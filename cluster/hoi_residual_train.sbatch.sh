@@ -26,6 +26,10 @@ esac
 # For eight dedicated GPUs, set HOI_SHARED_GPU=0 and submit with
 # --gres=gpu:l40:8. The default keeps eight asset ranks on one L40.
 ITERATIONS=${3:-100000}
+REWARD_ARGS=()
+if [[ $# -gt 3 ]]; then
+  REWARD_ARGS=(--experiment-config "$4" --v11-train-bundle "${5:?Specify the v1.1 training bundle}")
+fi
 RUN="$ROOT/train_${SLURM_JOB_ID:?Use the scheduler}"
 test ! -e "$RUN"
 test -f "$GMT_CHECKPOINT"
@@ -54,6 +58,6 @@ python -m torch.distributed.run --standalone --nnodes=1 --nproc_per_node=8 \
   --asset-bundle "$ROOT/input/assets/assets.json" \
   --shape-bank "$SHAPE_BANK" \
   --gmt-checkpoint "$GMT_CHECKPOINT" --gmt-iteration "$GMT_ITERATION" \
-  --output "$RUN" --iterations "$ITERATIONS" --num-envs 512 "${EXECUTION_ARGS[@]}"
+  --output "$RUN" --iterations "$ITERATIONS" --num-envs 512 "${EXECUTION_ARGS[@]}" "${REWARD_ARGS[@]}"
 sha256sum --check "$ROOT/train_cache_${SLURM_JOB_ID}/source.sha256" > "$ROOT/train_cache_${SLURM_JOB_ID}/source_unchanged.txt"
 sha256sum --check "$ROOT/train_cache_${SLURM_JOB_ID}/inputs.sha256" > "$ROOT/train_cache_${SLURM_JOB_ID}/inputs_unchanged.txt"

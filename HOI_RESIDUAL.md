@@ -315,6 +315,28 @@ failure、物体姿态及机器人误差，不把姿态误差阈值称作抓取�
 实现烟测只允许 `--partition train --smoke-eval`；Protected 集不用于调通代码。
 原始 rollout 未导出，报告明确保存的是逐动作数值汇总。
 
+### v1.1 奖励对照
+
+`configs/hoi_residual_v11_reward.json` 选择 `hoi/v1.1-observation-matching@66d9184` 的完整
+14 项训练奖励。原来的训练命令默认使用 ResMimic 奖励。对照实验沿用 GMT、残差观测、
+PPO 参数、域随机、采样算法和 30 cm 物体表面误差早停。采样器的回报归一化上限按
+奖励定义从每步 0.384 调为 0.15。按 clip 的 SHA、资产名称和帧数匹配 v1.1 的训练接触标签；
+实际接触来自 4 个 5 ms 物理子步的左右手–物体法向冲量。
+
+以下两个 Slurm 命令使用独立实验根目录，`ROOT/input` 指向与基线相同的输入，
+`SOURCE` 是这次对照的冻结源码。先运行 smoke，再提交正式训练。
+
+```bash
+CFG="$SOURCE/configs/hoi_residual_v11_reward.json"
+BUNDLE=/mnt/projects/ll/tianzizh/supermimic_hoi_v1_development_20261023_15/results/contact5_ultrafoot_validation_20261023_01/bundle_train/bundle.json
+sbatch "$SOURCE/cluster/hoi_residual_smoke.sbatch.sh" "$ROOT" "$SOURCE" all "$CFG" "$BUNDLE"
+sbatch "$SOURCE/cluster/hoi_residual_train.sbatch.sh" "$ROOT" "$SOURCE" 100000 "$CFG" "$BUNDLE"
+```
+
+每个 rank 的 `metrics.jsonl` 保留 14 项已乘权重和控制步长的逐项均值。
+`reward_terms_by_asset` 对应该 rank 的资产，`reward_terms` 是全局均值，各项之和等于
+`reward_mean`。正式对比使用相同的 HOI80 通过率、物体误差和固定评测奖励。
+
 设计参考：[ResMimic repository](https://github.com/amazon-far/ResMimic)。
 本新增实现没有复制其 simulator/PD 源码。若后续直接搬运上游文件，应保留根 Apache-2.0
 `LICENSE` / `NOTICE`，以及 `rsl_rl`、`legged_gym` 各自 BSD-3-Clause 文件头与许可证。

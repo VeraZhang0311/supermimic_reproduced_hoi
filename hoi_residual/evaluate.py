@@ -25,8 +25,9 @@ def validate_metadata(checkpoint, *, architecture, gmt_metadata, manifest_sha256
     if (checkpoint.get("shape_bank_sha256") != shape_metadata['bank_sha256'] or
             checkpoint.get("shape_contract") != shape_metadata['contract']):
         raise ValueError("residual checkpoint FPS128 shape bank mismatch")
-    from .contract import implementation_contract
-    if checkpoint.get("residual_contract") != implementation_contract():
+    from .contract import compatible_for_evaluation
+    profile = checkpoint.get("experiment", {}).get("reward_profile", "resmimic")
+    if not compatible_for_evaluation(checkpoint.get("residual_contract"), profile):
         raise ValueError("residual checkpoint learning implementation identity mismatch")
     if checkpoint.get("architecture") != architecture:
         raise ValueError("residual network/observation architecture mismatch")
@@ -64,6 +65,31 @@ def _write_json(path, value):
     with Path(path).open("x", encoding="utf-8") as stream:
         json.dump(value, stream, ensure_ascii=False, indent=2, allow_nan=False)
         stream.write("\n")
+
+
+def frozen_residual(checkpoint_path, device, **identity):
+    """Load the residual policy and RMS using the exact training identities."""
+    import torch
+    from .data import sha256_file
+    from .features import ORACLE_DIM, SCHEMA
+    from .policy import ResidualActorCritic
+
+    policy = ResidualActorCritic(ORACLE_DIM, schema=SCHEMA).to(device)
+    digest = sha256_file(checkpoint_path)
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    if sha256_file(checkpoint_path) != digest:
+        raise RuntimeError("residual checkpoint changed during read")
+    validate_metadata(checkpoint, architecture=policy.architecture(), **identity)
+    weights = checkpoint.get("residual")
+    expected = policy.state_dict()
+    if not isinstance(weights, dict) or set(weights) != set(expected):
+        raise ValueError("residual tensor keys mismatch")
+    for name, value in weights.items():
+        if (not isinstance(value, torch.Tensor) or value.shape != expected[name].shape
+                or value.dtype != expected[name].dtype or not bool(torch.isfinite(value).all())):
+            raise ValueError(f"nonfinite/invalid residual tensor: {name}")
+    policy.load_state_dict(weights, strict=True)
+    return policy.eval().requires_grad_(False), checkpoint, digest
 
 
 def summarize(cases):
@@ -177,9 +203,9 @@ def run_asset(args, launch_simulation):
     from .assets import load_assets
     from .data import UltraMotionLib, sha256_file
     from .env import HOISim
-    from .features import ORACLE_DIM, SCHEMA, observation_contract
+    from .features import observation_contract
     from .shape import load_shape_bank
-    from .policy import FrozenGMT, ResidualActorCritic
+    from .policy import FrozenGMT
     from supermimic.env import make_sim
     from supermimic.kinematics import G1Kinematics
     from supermimic.privileged import PrivilegedFeatures, RobotKinematics38, checkpoint_contract
@@ -203,26 +229,10 @@ def run_asset(args, launch_simulation):
     networks.AMP_DTYPE = torch.bfloat16 if gmt.metadata["source_amp"] == "bf16" else None
     shape_bank, shape_metadata = load_shape_bank(args.shape_bank,args.asset_bundle)
     shape_points = shape_bank[args.asset].to(device)
-    policy = ResidualActorCritic(ORACLE_DIM, schema=SCHEMA).to(device)
-    checkpoint_sha = sha256_file(args.checkpoint)
-    checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
-    if sha256_file(args.checkpoint) != checkpoint_sha:
-        raise RuntimeError("residual checkpoint changed during read")
-    validate_metadata(checkpoint, architecture=policy.architecture(), gmt_metadata=gmt.metadata,
-                      manifest_sha256=motion.manifest_sha256, object_assets=motion.object_assets,
-                      asset_bundle_sha256=sha256_file(args.asset_bundle), selected_asset=motion.object_assets[args.asset],
-                      shape_metadata=shape_metadata)
-    if not isinstance(checkpoint.get("residual"), dict):
-        raise ValueError("missing residual weights/RMS state")
-    expected_state = policy.state_dict()
-    if set(checkpoint["residual"]) != set(expected_state):
-        raise ValueError("residual tensor keys mismatch")
-    for key, value in checkpoint["residual"].items():
-        if (not isinstance(value, torch.Tensor) or value.shape != expected_state[key].shape
-                or value.dtype != expected_state[key].dtype or not bool(torch.isfinite(value).all())):
-            raise ValueError(f"nonfinite/invalid residual tensor: {key}")
-    policy.load_state_dict(checkpoint["residual"], strict=True)
-    policy.eval().requires_grad_(False)
+    policy, checkpoint, checkpoint_sha = frozen_residual(
+        args.checkpoint, device, gmt_metadata=gmt.metadata, manifest_sha256=motion.manifest_sha256,
+        object_assets=motion.object_assets, asset_bundle_sha256=sha256_file(args.asset_bundle),
+        selected_asset=motion.object_assets[args.asset], shape_metadata=shape_metadata)
     before = {key: value.detach().cpu().clone() for key, value in policy.state_dict().items()}
     assets = {entry["object_asset"]: entry for entry in load_assets(args.asset_bundle)}
     asset = dict(assets[motion.object_assets[args.asset]], asset_id=args.asset)
@@ -251,6 +261,8 @@ def run_asset(args, launch_simulation):
                   "partition": args.partition, "asset": asset["object_asset"], "checkpoint_sha256": checkpoint_sha,
                   "iteration": checkpoint["iteration"], "gmt_checkpoint_sha256": gmt.metadata["checkpoint_sha256"],
                   "checkpoint_training_smoke": checkpoint.get("smoke", False),
+                  "training_reward_profile": checkpoint.get("experiment", {}).get("reward_profile", "resmimic"),
+                  "evaluation_reward_profile": "resmimic",
                   "manifest_sha256": motion.manifest_sha256, "manifest_content_sha256": motion.manifest["content_sha256"],
                   "asset_bundle_sha256": sha256_file(args.asset_bundle), "data_selection": motion.selection_contract,
                   "residual_contract": checkpoint["residual_contract"], "warp_runtime": warp_runtime,
@@ -313,6 +325,8 @@ def main():
                                       "scope": "train-only evaluation implementation smoke" if args.smoke_eval else "protected evaluation",
                                       "assets": [report["asset"] for report in reports], "summary": summarize(cases),
                                       "checkpoint_sha256": reports[0]["checkpoint_sha256"],
+                                      "training_reward_profile": reports[0]["training_reward_profile"],
+                                      "evaluation_reward_profile": reports[0]["evaluation_reward_profile"],
                                       "normalizer_updates": 0, "optimizer_updates": 0,
                                       "full_duration_after_failure": True, "asset_reports": [str(root / f"asset_{i:02d}" / "report.json") for i in range(8)]})
 

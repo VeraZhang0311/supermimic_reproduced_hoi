@@ -18,6 +18,10 @@ SHAPE_BANK=${HOI_SHAPE_BANK:-$ROOT/input/shape_bank_v2.json}
 GMT_CHECKPOINT=${HOI_GMT_CHECKPOINT:-$ROOT/input/ckpt_004000.pt}
 GMT_ITERATION=${HOI_GMT_ITERATION:-4000}
 SELECTION=${3:-all}
+REWARD_ARGS=()
+if [[ $# -gt 3 ]]; then
+  REWARD_ARGS=(--experiment-config "$4" --v11-train-bundle "${5:?Specify the v1.1 training bundle}")
+fi
 case "$SELECTION" in
   all) ASSETS=(0 1 2 3 4 5 6 7); STEPS=32;;
   [0-7]) ASSETS=("$SELECTION"); STEPS=24;;
@@ -64,7 +68,7 @@ for asset in "${ASSETS[@]}"; do
   python -m hoi_residual.train \
     --manifest "$ROOT/input/ultra_manifest.json" \
     --asset-bundle "$ROOT/input/assets/assets.json" \
-    --shape-bank "$SHAPE_BANK" \
+    --shape-bank "$SHAPE_BANK" "${REWARD_ARGS[@]}" \
     --gmt-checkpoint "$GMT_CHECKPOINT" --gmt-iteration "$GMT_ITERATION" \
     --output "$RUN/asset_${asset}" --asset "$asset" --smoke \
     --num-envs 8 --rollout-steps "$STEPS" --iterations 2 --epochs 5 --minibatches 4 \

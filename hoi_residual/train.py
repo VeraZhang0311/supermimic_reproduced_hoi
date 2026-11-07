@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import time
 
 
@@ -19,7 +20,24 @@ def write_json(path, data):
         json.dump(data, stream, indent=2, default=str, allow_nan=False)
 
 
+def reward_experiment(config_path, bundle_path):
+    config = (json.loads(Path(config_path).read_text(encoding='utf-8'))
+              if config_path else {'reward_profile': 'resmimic'})
+    if config == {'reward_profile': 'resmimic'} and bundle_path is None:
+        return config
+    if (not isinstance(config, dict) or config.get('reward_profile') != 'hoi_v1_1'
+            or set(config) != {'reward_profile', 'v11_bundle_content_sha256'}
+            or not isinstance(config['v11_bundle_content_sha256'], str)
+            or not re.fullmatch('[0-9a-f]{64}', config['v11_bundle_content_sha256'])):
+        raise ValueError('expected a supported reward experiment config and its matching inputs')
+    if bundle_path is None or not Path(bundle_path).is_file():
+        raise ValueError('hoi_v1_1 requires --v11-train-bundle pointing to the prepared training bundle.json')
+    return config
+
+
 def run(args, launch_simulation):
+    experiment = reward_experiment(args.experiment_config, args.v11_train_bundle)
+    profile = experiment['reward_profile']
     from .runtime import configure_warp_forward_only
     warp_runtime = configure_warp_forward_only()
     import torch
@@ -91,9 +109,16 @@ def run(args, launch_simulation):
     ppo = PPO(policy,PPOConfig(rollout_steps=args.rollout_steps,epochs=args.epochs,
                               minibatches=args.minibatches))
     asset_bundle_sha256 = file_sha256(args.asset_bundle)
-    residual_contract = implementation_contract()
+    residual_contract = implementation_contract(profile)
     assets = {a['object_asset']:a for a in load_assets(args.asset_bundle)}
     asset = dict(assets[motion.object_assets[asset_id]], asset_id=asset_id)
+    v11_reward = None
+    reward_inputs = {}
+    if profile == 'hoi_v1_1':
+        from .v11_reward import TERM_NAMES, V11Reward
+        v11_reward = V11Reward(motion, asset, args.v11_train_bundle,
+                               expected_bundle_content_sha256=experiment['v11_bundle_content_sha256'])
+        reward_inputs = v11_reward.contract
     mdp = MDP(kin,motion,torch.tensor(default_joint_pos_list(),device=device))
     cfg = make_sim(device,args)
     # Allocation capacity only: the 121/134-hull ULTRA objects require more
@@ -103,6 +128,7 @@ def run(args, launch_simulation):
     write_json(output/'config.json',{'args':vars(args),'rank':rank,'world_size':world,
         'asset':asset['object_asset'],'asset_bundle_sha256':asset_bundle_sha256,'execution':execution,
         'gmt':gmt.metadata,'network':policy.architecture(),
+        'experiment':experiment,'reward_inputs':reward_inputs,
         'residual_contract':residual_contract,'warp_runtime':warp_runtime,
         'oracle_blocks':BLOCKS,'observation_contract':observation_contract(),
         'shape':shape_metadata,'ppo':asdict(ppo.config),'domain_randomization':DR_CONTRACT,
@@ -112,7 +138,7 @@ def run(args, launch_simulation):
         'world_model_constructed':False})
     with launch_simulation(cfg,args):
         env = HOISim(cfg,args.num_envs,motion,mdp,asset,output,
-                     max_episode_steps=8 if args.smoke else 500)
+                     max_episode_steps=8 if args.smoke else 500, v11_reward=v11_reward)
         # Smoke forces a timeout to exercise final-state bootstrap and reset.
         env.refresh()
         state = env.state()
@@ -162,10 +188,14 @@ def run(args, launch_simulation):
                     norm_data = None
                 rows = {k:[] for k in ('oracle','base_actions','actions','log_probs','values','rewards',
                                        'terminated','truncated','next_values')}
+                if v11_reward is not None:
+                    reward_terms = torch.zeros(len(TERM_NAMES), device=device)
                 for tick in range(args.rollout_steps):
                     sample = policy.sample(oracle,base,shape_points)
                     combined = clamp_action(base+sample['actions'])
                     out = env.step(combined)
+                    if v11_reward is not None:
+                        reward_terms += torch.stack([out['terms'][key].detach().mean() for key in TERM_NAMES])
                     if robot_physics_before is None:
                         robot_physics_before = env.physics.readback()
                     qprev,qdprev = out['previous_q'],out['previous_qd']
@@ -218,6 +248,16 @@ def run(args, launch_simulation):
                              if batch.oracle.shape[0] > first else None)
                 metrics.update(iteration=iteration,mean_reward=float(batch.rewards.mean()),
                                elapsed_seconds=time.monotonic()-started)
+                if v11_reward is not None:
+                    means = (reward_terms / args.rollout_steps).cpu()
+                    metrics['reward_terms_by_asset'] = dict(zip(TERM_NAMES, means.tolist()))
+                    if world > 1:
+                        means = means.to('cpu' if args.shared_gpu else device)
+                        dist.all_reduce(means)
+                        means /= world
+                    metrics['reward_terms'] = dict(zip(TERM_NAMES, means.tolist()))
+                    if abs(sum(metrics['reward_terms'].values()) - metrics['reward_mean']) > 1e-5:
+                        raise RuntimeError('weighted v1.1 reward terms do not sum to the PPO rollout reward')
                 # Only oracle/base inputs are needed for the next RMS update.
                 # Keeping the entire last batch alive would compete with Warp.
                 del batch
@@ -233,6 +273,7 @@ def run(args, launch_simulation):
                             'gmt':gmt.metadata,'manifest_sha256':motion.manifest_sha256,
                             'asset_bundle_sha256':asset_bundle_sha256,'domain_randomization':DR_CONTRACT,
                             'residual_contract':residual_contract,'warp_runtime':warp_runtime,
+                            'experiment':experiment,'reward_inputs':reward_inputs,
                             'observation_contract':observation_contract(),
                             'shape_bank_sha256':shape_metadata['bank_sha256'],'shape_contract':shape_metadata['contract'],
                             'capacity':{'nconmax':512,'njmax':2048},
@@ -265,6 +306,7 @@ def run(args, launch_simulation):
             if len(set(rank_hashes)) != 1:
                 raise AssertionError('Distributed residual parameters/RMS diverged between assets')
         report = {'passed':True,'scope':'real IsaacLab/Newton/MuJoCo-Warp residual PPO smoke' if args.smoke else 'training',
+            'experiment':experiment,'reward_inputs':reward_inputs,
             'execution':execution,'synchronized_policy_sha256':policy_sha256,
             'asset':asset['object_asset'],'selected_train_clips':len(motion.names),
             'iterations':args.iterations,'transitions':transitions,'resets':resets,'timeouts':timeout_count,
@@ -291,6 +333,8 @@ def main():
     configure_warp_forward_only()
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--manifest',required=True)
+    parser.add_argument('--experiment-config',help='reward-only experiment JSON (default: ResMimic)')
+    parser.add_argument('--v11-train-bundle',help='prepared v1.1 train bundle with contact labels and palm geometry')
     parser.add_argument('--asset-bundle',required=True)
     parser.add_argument('--shape-bank',required=True,help='verified v1.1 FPS128 bank for the bound object catalog')
     parser.add_argument('--gmt-checkpoint',required=True)
