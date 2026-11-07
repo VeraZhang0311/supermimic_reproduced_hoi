@@ -1,4 +1,7 @@
 from dataclasses import asdict
+from copy import deepcopy
+import hashlib
+import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
@@ -7,6 +10,7 @@ from unittest.mock import patch
 import torch
 
 from hoi_residual.data import sha256_file
+from hoi_residual.contract import compatible_for_evaluation, implementation_contract
 from hoi_residual.policy import ResidualActorCritic
 from hoi_residual.ppo import PPO, PPOConfig
 from hoi_residual.resume import checkpoint_paths, restore_training, save_checkpoint
@@ -98,3 +102,57 @@ class ResumeTests(unittest.TestCase):
         self.assertEqual(torch.load(paths[0],weights_only=True)["iteration"], 110)
         self.assertEqual(checkpoint_paths(self.root, 111, 300, 100, 10), [])
         self.assertEqual(checkpoint_paths(self.root, 110, 300, 100, 0), [])
+
+    def test_v11_pre_resume_checkpoint_binds_objective_and_contact_sources(self):
+        live = implementation_contract("hoi_v1_1")
+        old = deepcopy(live)
+        files = old["implementation_sha256"]
+        for name in ("resume.py", "capacity.py"):
+            del files[name]
+        for name in ("contract.py", "env.py", "train.py"):
+            files[name] = "older"
+        self.ck.update(experiment={"reward_profile":"hoi_v1_1"}, reward_inputs={"hand_labels":"fixture"},
+                       residual_contract=old)
+        for key in ("ppo_updates", "num_envs_per_rank", "seed"):
+            del self.ck[key]
+        implementation_sha = hashlib.sha256(json.dumps(old, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        path = self.root / "old.pt"
+        torch.save(self.ck, path)
+        hashed = sha256_file(path)
+        identity = {**self.identity, "residual_contract":live, "experiment":self.ck["experiment"],
+                    "reward_inputs":self.ck["reward_inputs"]}
+        def restore(identity):
+            policy, ppo = self.make()
+            return restore_training(path, hashed, policy=policy, ppo=ppo, identity=identity,
+                                    total_iterations=2, num_envs=512, seed=0, capacity=self.capacity)
+        with self.assertRaisesRegex(ValueError, "implementation"):
+            restore(identity)
+        with patch.dict("hoi_residual.resume._LEGACY_PARENTS", {hashed: (1, implementation_sha)}):
+            self.assertTrue(restore(identity)["legacy_migration"])
+            for key, replacement in (("reward_inputs", {"hand_labels":"other"}), ("experiment", {"reward_profile":"resmimic"})):
+                with self.subTest(key=key), self.assertRaisesRegex(ValueError, key):
+                    restore({**identity,key:replacement})
+            for name in ("v11_reward.py", "v11_contacts.py"):
+                changed = deepcopy(live)
+                changed["implementation_sha256"][name] = "different source"
+                with self.subTest(name=name), self.assertRaisesRegex(ValueError, "implementation"):
+                    restore({**identity, "residual_contract":changed})
+
+    def test_previous_protected_loaders_preserve_strict_training_and_evaluation(self):
+        current = implementation_contract()
+        old = deepcopy(current)
+        old["implementation_sha256"].update({
+            "contract.py":"98e8d8a2dc3571b03cad1a314b0733f1c778e31a9b068741f14746f9da2255e0",
+            "resume.py":"3b65ab2367c927dd811fb3d72d7e75f197ef4ea72823988f82aca64dda7cd81a",
+        })
+        self.ck["residual_contract"] = old
+        identity = {**self.identity, "residual_contract":current}
+        self.assertTrue(compatible_for_evaluation(old,"resmimic"))
+        self.assertFalse(self.load(identity=identity)[2]["legacy_migration"])
+        del self.ck["ppo_updates"]
+        with self.assertRaisesRegex(ValueError, "PPO configuration"):
+            self.load(identity=identity)
+        old["implementation_sha256"]["ppo.py"] = "other"
+        self.assertFalse(compatible_for_evaluation(old,"resmimic"))
+        with self.assertRaisesRegex(ValueError, "implementation"):
+            self.load(identity=identity)

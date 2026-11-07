@@ -11,20 +11,28 @@ from tempfile import NamedTemporaryFile
 
 import torch
 
+from .contract import compatible_protected_implementation
 from .data import sha256_file
 
 
 LEGACY_BASELINE_CHECKPOINT = "439eca2b7b819914b7cbb318a124fbd94642ec1c566c564d170882143d07e531"
 LEGACY_BASELINE_IMPLEMENTATION = "471e9be4e34aa5d94ec9b569999d30944229d6a1794ae36915831a836bc47e9a"
+LEGACY_V11_CHECKPOINT = "56f21317d891cab8bc48fe276594d29c78e1bbee7247fdde774f4f3919ef8f30"
+LEGACY_V11_IMPLEMENTATION = "c83896ec3d7f826ae2fbffa9441eda6eee11107c93d5108ca3ee8b2b5c924048"
+_LEGACY_PARENTS = {
+    LEGACY_BASELINE_CHECKPOINT: (600, LEGACY_BASELINE_IMPLEMENTATION),
+    LEGACY_V11_CHECKPOINT: (1800, LEGACY_V11_IMPLEMENTATION),
+}
 
 
 def _known_legacy(checkpoint, digest, current):
-    """The only cross-version training migration is the measured 1509634 parent."""
-    if digest != LEGACY_BASELINE_CHECKPOINT or checkpoint.get("iteration") != 600:
+    """Recognize the two audited pre-resume parents by checkpoint and implementation."""
+    parent = _LEGACY_PARENTS.get(digest)
+    if parent is None or checkpoint.get("iteration") != parent[0]:
         return False
     old = checkpoint.get("residual_contract", {})
     old_hash = hashlib.sha256(json.dumps(old, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-    if old_hash != LEGACY_BASELINE_IMPLEMENTATION or old.get("schema") != current.get("schema"):
+    if old_hash != parent[1] or old.get("schema") != current.get("schema"):
         return False
     old_files, files = old["implementation_sha256"], current["implementation_sha256"]
     reviewed = {"contract.py", "env.py", "train.py"}
@@ -72,7 +80,7 @@ def restore_training(path, expected_sha256, *, policy, ppo, identity, total_iter
     if not isinstance(ck, dict) or ck.get("schema") != "hoi_residual_ppo_teacher_v2":
         raise ValueError("unsupported resume checkpoint schema")
     legacy = _known_legacy(ck, digest, identity["residual_contract"])
-    if not legacy and ck.get("residual_contract") != identity["residual_contract"]:
+    if not legacy and not compatible_protected_implementation(ck.get("residual_contract"), identity["residual_contract"]):
         raise ValueError("resume implementation identity mismatch")
     iteration = ck.get("iteration")
     if type(iteration) is not int or not 0 < iteration < total_iterations:

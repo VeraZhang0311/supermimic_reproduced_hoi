@@ -17,6 +17,24 @@ FILES = ("assets.py", "contract.py", "data.py", "distributed.py", "env.py", "fea
          "native_checks.py", "policy.py", "ppo.py", "randomization.py",
          "rewards.py", "runtime.py", "shape.py", "train.py", "capacity.py", "resume.py")
 
+# The first protected trainer already saved complete resume metadata. This
+# migration changes only the two modules which authenticate older checkpoints.
+_PREVIOUS_PROTECTED_LOADERS = {
+    "contract.py": "98e8d8a2dc3571b03cad1a314b0733f1c778e31a9b068741f14746f9da2255e0",
+    "resume.py": "3b65ab2367c927dd811fb3d72d7e75f197ef4ea72823988f82aca64dda7cd81a",
+}
+
+
+def compatible_protected_implementation(stored, current):
+    if stored == current:
+        return True
+    if not isinstance(stored, dict) or stored.keys() != current.keys() or stored.get("schema") != SCHEMA:
+        return False
+    files = current["implementation_sha256"]
+    if not _PREVIOUS_PROTECTED_LOADERS.keys() <= files.keys():
+        return False
+    return stored.get("implementation_sha256") == {**files, **_PREVIOUS_PROTECTED_LOADERS}
+
 
 def implementation_contract(reward_profile="resmimic"):
     directory = Path(__file__).resolve().parent
@@ -32,7 +50,7 @@ def implementation_contract(reward_profile="resmimic"):
 
 def compatible_for_evaluation(stored, reward_profile):
     current = implementation_contract(reward_profile)
-    if stored == current:
+    if compatible_protected_implementation(stored, current):
         return True
     # Both earlier runs predate resumable PPO and configurable EPA scratch.
     # Permit only the exact published source bundles through this migration.
