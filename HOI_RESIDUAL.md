@@ -342,6 +342,14 @@ sbatch "$SOURCE/cluster/hoi_residual_train.sbatch.sh" "$ROOT" "$SOURCE" 100000 "
 物体通过 3/80，联合通过 3/80。三条联合通过的轨迹均来自原尺寸 largebox。
 物体表面误差按轨迹等权平均为 40.56 cm。[W&B 评测记录](https://wandb.ai/tianzizh-university-of-pennsylvania/hoi-residual-ppo-teacher/runs/hoi-1510679)
 
+同一面板上，`1510679` 的第 1800 轮人体通过 80/80，物体和联合均通过 7/80，
+物体表面平均误差为 32.48 cm。该训练在第 1866 轮后触发 `EPA_HORIZON`。
+恢复作业 `1511613` 使用第 1800 轮的 `checkpoint_001800.pt`
+（SHA-256 `56f21317d891cab8bc48fe276594d29c78e1bbee7247fdde774f4f3919ef8f30`）。
+PPO 从第 1801 轮继续，8 个资产共享一张 L40，EPA 容量为 64。每 10 轮写入滚动恢复文件，
+每 100 轮保留编号 checkpoint。HOI80 按总轮数每 1000 轮评一次，首次是第 2000 轮。
+原作业和恢复作业的 1801–1866 轮属于两个独立运行。[恢复作业的 W&B 记录](https://wandb.ai/tianzizh-university-of-pennsylvania/hoi-residual-ppo-teacher/runs/hoi-1511613)
+
 ### 基线 checkpoint 恢复与碰撞保护
 
 基线作业 1509634 在第 688 轮采样时触发原生 `EPA_HORIZON` 标志。
