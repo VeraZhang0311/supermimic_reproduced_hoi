@@ -1,19 +1,67 @@
 import copy
+import hashlib
+import json
 from importlib.util import find_spec
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import unittest
+import xml.etree.ElementTree as ET
 
 import numpy as np
 import torch
 
 from hoi_residual.data import ASSETS
-from hoi_residual.evaluate_hoi80 import REWARD_TERMS, _verified_protocol, aggregate, collect, score_lane, summarize
+from hoi_residual.evaluate_hoi80 import (REWARD_TERMS, _audit_panel_fk, _verified_protocol, _virtual_scorer,
+                                        aggregate, collect, score_lane, summarize)
 from supermimic.mdp import clamp_action
 
 
 class PanelTests(unittest.TestCase):
+    @unittest.skipUnless(find_spec("hoi_zero_shot"), "canonical03 helper package required for PHC39 FK")
+    def test_asset_capture_order_and_all_eight_real_fk_preflight(self):
+        from hoi_zero_shot.metrics import LEGACY_BODY_NAMES
+        from supermimic.privileged import RobotKinematics38
+        from supermimic.robot_metadata import G1_JOINT_NAMES, URDF_PATH
+        tree = ET.parse(URDF_PATH)
+        root = tree.getroot()
+        for node in list(root):
+            if ((node.tag == "link" and node.get("name") in ("LL_FOOT", "LR_FOOT"))
+                    or (node.tag == "joint" and node.find("child").get("link") in ("LL_FOOT", "LR_FOOT"))):
+                root.remove(node)
+        for name, parent in (("left_rubber_hand", "left_wrist_yaw_link"),
+                             ("right_rubber_hand", "right_wrist_yaw_link"), ("d435_link", "torso_link")):
+            ET.SubElement(root, "link", name=name)
+            joint = ET.SubElement(root, "joint", name=name+"_fixed", type="fixed")
+            ET.SubElement(joint, "parent", link=parent)
+            ET.SubElement(joint, "child", link=name)
+        urdf_order = [link.get("name") for link in root.findall("link")]
+        self.assertNotEqual(urdf_order, list(LEGACY_BODY_NAMES))
+        metadata = {"body_names":list(LEGACY_BODY_NAMES), "dof_names":list(G1_JOINT_NAMES)}
+        panel = {"assets":{a:{"metadata":copy.deepcopy(metadata)} for a in ASSETS}, "robot_joint_names":list(G1_JOINT_NAMES)}
+        def states(frames):
+            p = torch.zeros(len(frames), 3)
+            q = torch.sin(torch.arange(29)*.12 + frames[:, None])
+            return p, torch.eye(3).expand(len(frames),3,3), p, p, q, q
+        with TemporaryDirectory() as tmp:
+            urdf, manifest = Path(tmp)/"legacy.urdf", Path(tmp)/"panel.json"
+            tree.write(urdf)
+            manifest.write_text(json.dumps(panel))
+            motion = SimpleNamespace(legacy_urdf_path=urdf, legacy_urdf_sha256=hashlib.sha256(urdf.read_bytes()).hexdigest(),
+                legacy_body_names=urdf_order, legacy_joint_names=list(G1_JOINT_NAMES),
+                canonical_manifest_path=manifest, manifest_sha256=hashlib.sha256(manifest.read_bytes()).hexdigest(),
+                ref_state=states, cases=[{"object_asset":asset} for asset in ASSETS],
+                clip_start=torch.arange(8)*3, clip_end=torch.arange(8)*3+2)
+            audit = _audit_panel_fk(motion, RobotKinematics38())
+            self.assertEqual(list(audit), list(ASSETS))
+            self.assertTrue(all(a["passed"] and a["common_count"] == 36 and a["sampled_states"] == 3 for a in audit.values()))
+            panel["assets"][ASSETS[-1]]["metadata"]["body_names"] = urdf_order
+            with self.assertRaisesRegex(ValueError, "canonical39 body order"):
+                _virtual_scorer(motion, panel, ASSETS[-1], "cpu")
+            panel["assets"][ASSETS[1]]["metadata"]["dof_names"] = list(reversed(G1_JOINT_NAMES))
+            with self.assertRaisesRegex(ValueError, "DOF order"):
+                _virtual_scorer(motion, panel, ASSETS[1], "cpu")
+
     def two_lanes(self):
         class Env:
             device, N = "cpu", 2

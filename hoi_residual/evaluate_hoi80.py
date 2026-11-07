@@ -7,6 +7,7 @@ checkpoint's own code. Run one fresh simulator process per object asset.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 import subprocess
@@ -41,6 +42,47 @@ def _verified_protocol():
         if sha256_file(package / name) != digest:
             raise ValueError(f"canonical HOI80 evaluator implementation differs: {name}")
     return expected
+
+
+def _panel_manifest(motion):
+    raw = Path(motion.canonical_manifest_path).read_bytes()
+    if hashlib.sha256(raw).hexdigest() != motion.manifest_sha256:
+        raise ValueError("canonical HOI80 manifest changed after motion binding")
+    return json.loads(raw)
+
+
+def _virtual_scorer(motion, panel, asset, device):
+    from hoi_zero_shot.metrics import VirtualPHC
+
+    # Benchmark tensors store capture-order markers. URDF link declaration
+    # order contains the same names but indexes a different body at column 1.
+    meta = panel["assets"][asset]["metadata"]
+    bodies, dofs = meta["body_names"], meta["dof_names"]
+    if set(bodies) != set(motion.legacy_body_names):
+        raise ValueError(f"canonical marker names differ from the bound URDF for {asset}")
+    if dofs != motion.legacy_joint_names or dofs != panel["robot_joint_names"]:
+        raise ValueError(f"canonical DOF order differs from the policy state for {asset}")
+    scorer = VirtualPHC(motion.legacy_urdf_path, bodies, dofs, device)
+    if scorer.identity["urdf_sha256"] != motion.legacy_urdf_sha256:
+        raise ValueError("canonical scoring URDF changed after motion binding")
+    return scorer
+
+
+def _audit_panel_fk(motion, teacher_kin):
+    panel = _panel_manifest(motion)
+    audits = {}
+    for asset in ASSETS:
+        scorer = _virtual_scorer(motion, panel, asset, "cpu")
+        lanes = [i for i, case in enumerate(motion.cases) if case["object_asset"] == asset]
+        # An asset-filtered preflight still checks every metadata/URDF binding.
+        # The shared robot FK can use a selected motion from a different asset.
+        sample = lanes or [0]
+        start, end = motion.clip_start[sample], motion.clip_end[sample]
+        frames = torch.cat((start, (start + end) // 2, end)).unique()
+        state = motion.ref_state(frames)
+        common = scorer.audit_common_positions(scorer(state), teacher_kin.forward(state)[0], teacher_kin.body_names)
+        audits[asset] = {**common, "sampled_states": len(frames), "asset_clips": len(lanes)}
+    return audits
 
 
 @torch.no_grad()
@@ -215,13 +257,15 @@ def preflight(args):
 
     protocol_files = _verified_protocol()
     motion = Canonical80Motion(args.manifest, args.canonical, G1Kinematics("cpu"), "cpu", asset=args.asset)
-    gmt, policy, points, _, identity = load_teacher(args, motion, RobotKinematics38(device="cpu"), "cpu")
+    teacher_kin = RobotKinematics38(device="cpu")
+    marker_audits = _audit_panel_fk(motion, teacher_kin)
+    gmt, policy, points, _, identity = load_teacher(args, motion, teacher_kin, "cpu")
     gmt.assert_unchanged()
     if policy.training or any(p.requires_grad for p in policy.parameters()):
         raise RuntimeError("preflight residual must be frozen in eval mode")
     result = dict(identity, protocol_files_sha256=protocol_files, device="cpu",
                   clips=len(motion.cases), control_steps=int((motion.clip_len - 1).sum()),
-                  shape_points=list(points.shape), physical_steps=0)
+                  shape_points=list(points.shape), virtual39_fk_by_asset=marker_audits, physical_steps=0)
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=False)
     _write_json(output / "preflight.json", result)
@@ -230,7 +274,6 @@ def preflight(args):
 
 def worker(args, launch_simulation):
     from hoi_zero_shot.data import Canonical80Motion
-    from hoi_zero_shot.metrics import VirtualPHC
     from hoi_zero_shot.native import NativeSceneAuditor, initialize_canonical_object
     from .assets import load_assets
     from .env import HOISim
@@ -254,7 +297,7 @@ def worker(args, launch_simulation):
     privileged = PrivilegedFeatures(teacher_kin, motion)
     gmt, policy, bank, residual_before, identity = load_teacher(args, motion, teacher_kin, device)
     points = bank[args.asset].to(device)
-    virtual = VirtualPHC(motion.legacy_urdf_path, motion.legacy_body_names, motion.legacy_joint_names, device)
+    virtual = _virtual_scorer(motion, _panel_manifest(motion), asset_name, device)
     assets = {entry["object_asset"]: entry for entry in load_assets(args.asset_bundle)}
     asset = dict(assets[asset_name], asset_id=args.asset)
     mdp = MDP(kin, motion, torch.tensor(default_joint_pos_list(), device=device))
