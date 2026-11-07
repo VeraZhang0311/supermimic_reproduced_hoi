@@ -337,6 +337,11 @@ sbatch "$SOURCE/cluster/hoi_residual_train.sbatch.sh" "$ROOT" "$SOURCE" 100000 "
 `reward_terms_by_asset` 对应该 rank 的资产，`reward_terms` 是全局均值，各项之和等于
 `reward_mean`。正式对比使用相同的 HOI80 通过率、物体误差和固定评测奖励。
 
+2026-11-07，v1.1 对照训练 `1510679` 的第 1300 轮 checkpoint 完成了固定 HOI80
+评测（L40 作业 `1511413`，8 种资产、80 条轨迹、23,718 个控制步）。人体通过 79/80，
+物体通过 3/80，联合通过 3/80。三条联合通过的轨迹均来自原尺寸 largebox。
+物体表面误差按轨迹等权平均为 40.56 cm。[W&B 评测记录](https://wandb.ai/tianzizh-university-of-pennsylvania/hoi-residual-ppo-teacher/runs/hoi-1510679)
+
 ### 基线 checkpoint 恢复与碰撞保护
 
 基线作业 1509634 在第 688 轮采样时触发原生 `EPA_HORIZON` 标志。
@@ -349,6 +354,11 @@ PPO checkpoint。恢复模式默认将每对凸体的 EPA 边容量从 24 提高
 actor、critic、shape encoder、归一化统计、Adam 和 PPO 更新计数从 checkpoint 载入。
 旧 checkpoint 未保存仿真状态、下一次归一化所需的 rollout、采样课程和各 rank 的随机流，
 新进程会重新初始化这些状态。两个作业的同轮数记录分别保存在各自的目录和 W&B run。
+
+2026-11-07，原版 ResMimic 奖励的恢复作业 `1510748` 主动停训，8 个 rank 最后一次完整记录均为
+第 1779 轮。最后的编号归档为 `checkpoint_001700.pt`。第 1770 轮的滚动恢复文件保存在
+`/mnt/projects/ll/tianzizh/hoi_residual_resmimic_resume600_20261107_01/train_1510748/recovery_latest.pt`，
+SHA-256 为 `58ef115668b3be3757a56330b61c3a4f6cf418b29426a243acd7bca1f7a10e26`。[W&B 训练记录](https://wandb.ai/tianzizh-university-of-pennsylvania/hoi-residual-ppo-teacher/runs/hoi-1510748)
 
 设计参考：[ResMimic repository](https://github.com/amazon-far/ResMimic)。
 本新增实现没有复制其 simulator/PD 源码。若后续直接搬运上游文件，应保留根 Apache-2.0
