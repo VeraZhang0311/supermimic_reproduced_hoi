@@ -28,10 +28,24 @@ export MPLCONFIGDIR="$ATTEMPT/cache/mpl" TORCHINDUCTOR_CACHE_DIR="$ATTEMPT/cache
 export TMPDIR="$ATTEMPT/tmp"
 mkdir -p "$WARP_CACHE_PATH" "$CUDA_CACHE_PATH" "$MPLCONFIGDIR" "$TORCHINDUCTOR_CACHE_DIR" "$TMPDIR"
 cd "$CODE"
-mapfile -t FIELDS < <(python -c 'import sys,json; r=json.load(open(sys.argv[1])); print(r["checkpoint"],r["sha256"],r["iteration"],sep="\n")' "$REQUEST")
-[[ ${#FIELDS[@]} -eq 3 ]]
+mapfile -t FIELDS < <(python -c '
+import json, sys
+with open(sys.argv[1]) as f:
+    receipt = json.load(f)
+values = [receipt["checkpoint"], receipt["sha256"], receipt["iteration"]]
+if "expected_training" in receipt:
+    binding = receipt["expected_training"]
+    values.extend([binding["reward_profile"], binding["epa_horizon"]])
+print(*values, sep="\n")
+' "$REQUEST")
+EXPECTED=()
+case ${#FIELDS[@]} in
+  3) ;;  # Previously dispatched checkpoint without a training config binding.
+  5) EXPECTED=(--expected-training-reward-profile "${FIELDS[3]}" --expected-epa-horizon "${FIELDS[4]}");;
+  *) echo "Incomplete HOI80 dispatch receipt" >&2; exit 1;;
+esac
 exec python -m hoi_residual.evaluate_hoi80 --checkpoint "${FIELDS[0]}" --checkpoint-sha256 "${FIELDS[1]}" \
     --iteration "${FIELDS[2]}" --gmt-checkpoint "$ROOT/input/ckpt_004000.pt" \
     --manifest "$ROOT/input/ultra_manifest.json" --canonical "$CANONICAL" \
     --asset-bundle "$ROOT/input/assets/assets.json" --shape-bank "$ROOT/input/shape_bank_v2.json" \
-    --output "$ATTEMPT/results" --device cuda:0
+    --output "$ATTEMPT/results" --device cuda:0 "${EXPECTED[@]}"

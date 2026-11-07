@@ -247,6 +247,11 @@ def load_teacher(args, motion, teacher_kin, device):
                 "gmt_iteration": gmt.metadata["iteration"], "canonical_manifest_sha256": motion.manifest_sha256,
                 "ultra_manifest_sha256": motion.selection_contract["ultra_manifest_sha256"],
                 "asset_catalog_sha256": catalog_sha, "shape_bank_sha256": shape["bank_sha256"]}
+    if (args.expected_training_reward_profile is not None and
+            identity["training_reward_profile"] != args.expected_training_reward_profile):
+        raise ValueError("HOI80 checkpoint training reward profile differs from its dispatch receipt")
+    if args.expected_epa_horizon is not None and identity["capacity"].get("epa_horizon", 24) != args.expected_epa_horizon:
+        raise ValueError("HOI80 checkpoint EPA horizon differs from its dispatch receipt")
     return gmt, policy, bank, residual_before, identity
 
 
@@ -372,6 +377,8 @@ def main():
         parser.add_argument("--" + name, required=True)
     parser.add_argument("--iteration", type=int, required=True)
     parser.add_argument("--gmt-iteration", type=int, default=4000)
+    parser.add_argument("--expected-training-reward-profile", choices=("resmimic", "hoi_v1_1"))
+    parser.add_argument("--expected-epa-horizon", type=int)
     parser.add_argument("--asset", type=int, choices=range(8))
     parser.add_argument("--preflight", action="store_true", help="CPU model/data checks, writes preflight.json")
     if "--preflight" in sys.argv:
