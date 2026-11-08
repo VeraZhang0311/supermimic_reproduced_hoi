@@ -743,3 +743,66 @@ The clear figures use the same original saved poses, with shoe artwork in
 gray, physical capsules in green and the implicated convex leg segment in
 orange. Original scheduled6000 result SHA is still `e0fe62ee…b21271`;
 tables1512413 retained its original start time and restart0.
+
+## Foot/table stiffness A/B: checkpoint6000, sub3_smalltable_027
+
+User-authorized independent A10 job **1517402** completed with exit0 in11m03s.
+It used the original frozen `source_eval01`, the unchanged6000 checkpoint
+pair, and fresh seed0 deterministic closed-loop policy processes for A/B.
+Both ran the full255 controls /5.10s without resets after failure or training
+updates. The policy/RMS tensors and initial snapshots matched exactly.
+
+**A** retains foot/table contact `solref=(.02,1)`; **B** changes only the
+time-constant component of actual foot/table contacts to`.01`. Solimp,
+friction, damping ratio and every hand, foot/ground and other contact remain
+unchanged. The private callback is composed inside the existing hand owner;
+no model geom/material arrays or shared source/environment are patched.
+CPU/CUDA contact checks and CUDA graph replay confirm A's bitwise no-op,
+B's pair isolation and preserved hand friction/normal response. Full-clip
+auditing found zero unrelated solref/damping changes; B changed all107
+observed foot/table contact samples and zero of27774 other samples.
+
+All robot link/object native poses were saved every5ms (1021 states), plus
+256 states and physical reference poses at50Hz for video. Penetration is
+queried against the actual exported collision model, over both feet and all
+44 object components. Initial/final native model hashes, initial GPU geom
+fields, policy tensors and initial snapshot hashes match across A/B.
+
+| Metric | A:20ms | B:10ms |
+| --- | ---: | ---: |
+| Maximum penetration at200Hz |23.7903mm|13.9211mm|
+| Mean penetration across recorded states |3.27858mm|0.07962mm|
+| Sampled time above1mm (state count ×5ms) |0.935s|0.065s|
+| Sampled time above10mm |0.820s|0.015s|
+| Integrated penetration |16.7372mm·s|0.40645mm·s|
+| Normalized return |0.46119|0.42498|
+| Failure triggered |no|no|
+
+The maximum drops41.48% and sustained penetration drops substantially, but
+B still has a13.9mm transient peak at1.96s. Both trials retain tracking-quality
+fraction0.17647 and B's reward is lower. This single-clip result is not a
+complete collision fix or evidence of a training improvement. The original
+22-case evaluation/video is retained; fresh simulation reruns are not claimed
+bitwise identical to that earlier video.
+
+Independent CPU job **1517426** checks all geom pairs at each variant's
+maximum, without bounding-sphere pruning, then verifies penetration with a
+separate SciPy Minkowski-hull/capsule calculation. Errors are below9e-6mm.
+Actual CUDA contact forces were recorded in this successful A10 experiment;
+the previous2080Ti failure is not used as an evaluation result.
+
+Experiment helpers are in `tools/tables_contact_ab/`; their frozen cluster
+snapshot is `contact_ab_helpers_01`, archive SHA256
+`96abf8d3a79e8250d5ad9415650f08784a1b2252d6def40845d15cb7a4be24c0`.
+The independent measurement verifier has its own SHA in its result receipt.
+Cluster outputs: tables root `contact_ab_6000_sub3_01`. Original source,
+checkpoint pair, scheduled6000 result and experiment helper SHA checks all
+passed. Tables1512413 and Ultra1516579 retained their RUNNING state, original
+start time, node, allocation and restart0. No W&B writes were made.
+
+Delivery: `results/tables6000_sub3_contact_AB_20261108`. Paired full-body and
+foot/table close-up videos use the same fixed world camera per view, original
+artwork and reference ghosts. A quarter-speed close-up uses those same saved
+frames. All videos fully decode; rendering uses zero simulation steps or
+policy inferences. Raw poses/contact traces stay on the cluster. B has not
+been deployed to either running training job.
