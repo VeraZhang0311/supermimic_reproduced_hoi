@@ -47,6 +47,15 @@ source_memory01/formal_02作业1514391已实际失败：10次WM反传通过，H3
 公共batch本身可被所属组抢占；其normal不能抢占tables的ll-med。已核验tables仍RUNNING、restart=0。
 最新回执为Ultra根目录queue_status_latest.json；队列操作完整记录在queue_candidates_20261108_01/。
 
+11月8日启动前按用户要求增加HOI80原生逐帧保存，代码13fcab8，冻结source_hoi80_trajectories_01。
+1516579临时hold后已恢复原作业排队；source_two_l40_01作为版本入口指向新快照，旧目录原样归档为
+source_two_l40_01_before_trajectory_recording。作业号/提交时间与2×L40请求保留；hold可能重置Slurm计龄时间。
+集群179项CPU回归通过，原生GPU1517257完成4步/5帧保存验收；不是正式HOI80或两卡capacity验收。
+每2000轮完整80条均保存38-link/物体/参考位姿、动作和50Hz时间轴，23798状态帧，失败后不截断。
+eval仍只写所属训练run；物理、网络、奖励、观测、标签、500轮warmup和完整global batch不变。
+部署回执hoi80_trajectory_update_01/installed.json；tables1512413原始启动时间及restart0未变。
+Tables6000的22条视频已由独立A10作业1517200完成，原始评测及W&B指标未覆盖，交付见TABLES.md末节。
+
 ## HOI residual 扩展入口
 
 当前独立开发分支为 `codex/hoi-residual-ppo-teacher`。新增 `hoi_residual/`，

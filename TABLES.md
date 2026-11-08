@@ -640,3 +640,45 @@ policy/RMS/statistics and owns no simulation step or optimizer. Networks,
 observations, rewards, physics, data, learning batches and evaluation scoring
 remain unchanged. W&B continues receiving the same scalar `eval/*` metrics
 on the owning training run; raw trajectories and videos stay on the cluster.
+
+Deployment before Ultra starts: code revision **13fcab8**, frozen independently
+at `source_hoi80_trajectories_01`. The existing pending job **1516579** was
+temporarily held while its entry `source_two_l40_01` became a symlink to that
+tested snapshot, then released. The old source's exact bytes remain under
+`source_two_l40_01_before_trajectory_recording`. No cancellation/re-submission
+or duplicate run was used. The original job ID/submission time and two-L40
+request remain; eligibility/accrual timestamps may be reset by Slurm's hold.
+
+All **179** tables CPU tests passed on the cluster (1517256), and again on
+node-local scratch (1517274). Native GPU job **1517257** completed a four-control
+interval / five-state-frame save/load/integrity smoke with the real38-link
+robot. It made zero policy inferences/optimizer updates/W&B runs. The629-step
+CPU case verifies complete post-failure recording and exact policy/RMS/RNG and
+metric equivalence with recording disabled. This is an IO validation, not a
+full80 policy evaluation or a two-L40 training-capacity claim; the original
+eight-rank zero-update capacity prerequisite still applies at allocation.
+All147 unchanged existing files, including learning/physics/configuration,
+were checked byte-for-byte. CPU launch readthrough also preserved the original
+global4096/WM2048/policy4096/H32/warmup500 and eight ranks over two GPUs.
+
+Deployment receipt: Ultra root `hoi80_trajectory_update_01/installed.json`.
+Tables1512413 retained its original start time and restart0 throughout.
+
+## Checkpoint6000 protected22 video delivery
+
+The original scheduled22-case result remains unchanged (SHA256
+`e0fe62eec9c8dd6d15884bcb3551a322ef505fc0e5fafb5c4aab39a51db21271`).
+Independent A10 job **1517200** recorded the same frozen6000 checkpoint pair
+under `videos_6000_01`, without policy/RMS/training updates or W&B writes.
+All22 complete clips were rendered from saved native38-link/object poses,
+with separately recorded physical reference poses:6504 states,6482 controls,
+720p50,130.08 seconds. There is no actual-state FK reconstruction or physics
+stepping during rendering. Contact simulation is not claimed bitwise
+deterministic; both original evaluation and visualization rerun survived19/22.
+The original scheduled W&B metrics were retained.
+
+The all22, largetable, smalltable and22 individual videos plus gallery/previews
+were delivered to local `results/tables_checkpoint6000_protected22_20261108`.
+Checks include full video decoding, every clip/bundle checksum,66 preview
+edge checks, all-frame camera projections and unchanged source/checkpoints/
+original evaluation. Raw native recordings remain on the cluster.
