@@ -582,3 +582,33 @@ There is no new W&B run yet. Tables job1512413/run44ad3b72 remains running with
 restart count0. Deployment/status receipts: `two_l40_submission.json` and
 `two_l40_status.json` under the Ultra campaign root. Thirteen CPU routing and
 launch tests passed; two-card native capacity and formal training remain pending.
+
+## Earlier public-queue candidate
+
+On November8, the user requested an earlier two-L40 queue without affecting
+tables. The account is authorized for `ll-med` and `normal`; other groups'
+owner QoS values and `ll-high` are unavailable. Public `batch` adds the eight
+real L40 cards at `dj-l40-0` beyond the three Liu nodes. All eligible L40 cards
+were allocated when inspected; there was no immediately idle two-card slot.
+
+Existing job **1516579** was moved to **batch**, preserving its original
+09:22:21 submission/eligibility/accrual timestamps, two L40s, 32 CPUs, 192 GiB,
+96-hour allocation and frozen source. No second training candidate was made.
+The scheduler requested QoS list is `normal,ll-med`; only **normal** is
+admitted by batch, with normal first. This valid configuration was observed
+across scheduler cycles with reason **Priority**. A mixed-partition candidate
+was not retained because it displayed a partition/QoS permission conflict.
+
+At **November8 10:48 America/New_York**, the actual job's tentative start is
+**November11 07:27:31 America/New_York**, compared with the original Liu-only
+**November14 22:51:49**. The estimate can change. Public batch is preemptible
+by its resource owner; it cannot preempt the tables job's `ll-med` allocation.
+Tables **1512413** remains running, original start time and restart count0
+unchanged. All151 frozen source files were reverified, the global training
+configuration and existing label cache remain unchanged, and the GPU probe
+and new W&B run have not started. The owning-run HOI80 chain is unchanged.
+
+Current receipt: `queue_status_latest.json`; full before/after records and
+resource/source checks: `queue_candidates_20261108_01/verified.json`, under
+the Ultra campaign root. The original `two_l40_submission.json` remains the
+historical submission receipt, rather than being overwritten after migration.

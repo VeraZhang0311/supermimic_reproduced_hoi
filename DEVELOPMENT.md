@@ -41,6 +41,11 @@ source_memory01/formal_02作业1514391已实际失败：10次WM反传通过，H3
 两卡任务已提交为1516579，独立source_two_l40_01/formal_03，冻结提交f3c533b；146份Python/调度文件与上次逐字节相同。
 11月8日09:23美东核验仍在Priority排队，Slurm暂估11月14日22:51:49；GPU验证和新W&B run均尚未开始。
 13项分卡/启动CPU回归通过；完整HOI80继续写回所属训练run。tables原作业restart=0且W&B正常running。
+11月8日10:48美东按用户要求核查其他队列后，已将同一1516579切至公共batch，normal为首个可用QoS。
+最新有效状态为PENDING/Priority，暂估11月11日07:27:31；原11月14日晚是Liu队列的旧估计。
+作业号、提交/计龄时间、2×L40、32CPU/192GiB/96h及冻结源码均保留，未另起重复训练。
+公共batch本身可被所属组抢占；其normal不能抢占tables的ll-med。已核验tables仍RUNNING、restart=0。
+最新回执为Ultra根目录queue_status_latest.json；队列操作完整记录在queue_candidates_20261108_01/。
 
 ## HOI residual 扩展入口
 
