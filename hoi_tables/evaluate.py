@@ -63,7 +63,7 @@ def validate_source_compatibility(training_source, evaluation_source=None):
     runtime = Path(evaluation_source or Path(__file__).resolve().parents[1]).resolve()
     manifest_path = source/"SOURCE_MANIFEST.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if manifest.get("branch") != "hoi-retarget/tables-v1.0" or not manifest.get("files"):
+    if manifest.get("branch") not in ("hoi-retarget/tables-v1.0", "hoi-retarget/tables-boxes-v1.0") or not manifest.get("files"):
         raise ValueError("Invalid frozen tables source manifest")
     scientific = {}
     for name, expected in manifest["files"].items():

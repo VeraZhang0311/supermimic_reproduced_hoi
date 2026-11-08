@@ -1,9 +1,13 @@
-# Privileged tables teacher
+# Privileged tables and Ultra boxes teacher
 
-Branch `hoi-retarget/tables-v1.0` starts at
+Branch `hoi-retarget/tables-boxes-v1.0` (renamed from `hoi-retarget/tables-v1.0`) starts at
 `codex/hoi-residual-ppo-teacher@78cd5b2c3530f9aa47b0c944436e59d5dc054093`.
 The existing `supermimic/` and `hoi_residual/` implementations are unchanged.
-The new entry point is `python -m hoi_tables.train`.
+The entry point is `python -m hoi_tables.train`. Profiles are
+`configs/hoi_tables_v1.json` and `configs/hoi_ultra_boxes_v1.json`.
+Both publish periodic evaluation into their owning training W&B run under
+`eval/*`; neither creates an evaluation W&B run. The existing tables training
+job continues unchanged. Ultra training has not been submitted.
 
 ## Scientific contract
 
@@ -35,7 +39,7 @@ The new entry point is `python -m hoi_tables.train`.
   updates without a quality gate. Original H32, layer sizes, batch settings,
   optimizers and UTD 0.4 are retained. Each iteration collects an accumulated
   1/UTD native control steps.
-- Two equal asset workers update one shared model. Gradients are averaged
+- Tables use two equal asset workers to update one shared model. Gradients are averaged
   before clipping, real-data RMS moments and contact counts are synchronized,
   and final full model/RMS hashes must agree. Global batch/environment counts
   are divided evenly across workers. Shared single-GPU mode uses CPU Gloo
@@ -250,93 +254,154 @@ Shared `supermimic/` and `hoi_residual/` remain unchanged.
 - Private W&B project `hoiretarget-tables`, run `44ad3b72`, name
   `tables_v1-20261107-170411`:
   https://wandb.ai/tianzizh-university-of-pennsylvania/hoiretarget-tables/runs/44ad3b72
-- Last verified scheduler state: **PENDING / Priority**. All 24 L40 cards were
-  allocated; scheduler estimated start **2026-11-07 20:04 America/New_York**.
-  This estimate can change. No formal_03 optimizer updates were observed yet.
-- Once allocated, the launcher automatically executes its complete production
-  native preflight before constructing fresh formal training processes. The
-  sidecar resumes the registered run and uploads actual paired-rank metrics.
-- CPU job `1512428` additionally invokes the real official reference kernel
-  with 40,000 scaled tensors per table, without requesting a GPU. Its last
-  observed state was running; subsequent SSH connections timed out, so no
-  result is claimed here. The GPU path is accepted only by the scheduled
-  formal native preflight, not by this CPU check.
+- Training job `1512413` is running on two L40s. Its scheduler start time is
+  `2026-11-07T17:52:17`, with zero restarts. The complete production capacity
+  probe passed before fresh training processes were constructed.
+- Same-run server verification found continuous unique training iterations
+  1 through 1242, including 73 events from the new unified writer; the run is
+  running. This is a verification snapshot, not a live iteration counter.
+- Training remains on immutable `source_train03`. Logging is supplied by the
+  separate CPU-only source `source_unified01`, job `1513706`; GPU evaluation
+  continues to use `source_eval01`. No model-training process was restarted.
 - Local submission and registration receipts:
   `.cache/source_train03/evidence/`; cluster receipt: `formal03_submission.json`.
 
-## Independent periodic protected evaluation
+## Periodic evaluation in the owning training run
 
-The user subsequently requested complete protected evaluation every 2000
-training iterations, attached to the existing job without restarting it.
-`hoi_tables.evaluate` reads both corresponding rank checkpoints and checks
-their iteration, complete model/RMS equality, schema, physics, reward, source
-and data identities before loading the frozen direct policy. It constructs no
-learner, optimizer or replay. Every original scientific Python file in the new
-evaluation snapshot must match `source_train03` byte for byte.
+`hoi_tables.eval_monitor.Supervisor` schedules full protected22 rollouts every
+2000 checkpoint iterations, from 2000 through 20000. It waits for both atomic
+rank checkpoint files, dispatches one A10 evaluation at a time, and preserves
+milestones if evaluation queues fall behind. Submission intentions and result
+hashes are durable; lost scheduler replies are reconciled without duplicate
+jobs. Failed evaluation stops further dispatch while training telemetry keeps
+running. Available milestones are drained after training exits.
 
-Each evaluation covers all **22 protected clips**, eleven per table, from
-their original first frame to last frame: **6482 control intervals** total,
-longest clip **411 intervals**. It uses nominal physical parameters, fixed seed
-zero and deterministic policy actions without exploration or statistics
-updates. Failures are recorded using the unchanged tables termination rule;
-physics and scoring continue to the exact clip end without failure resets.
-Success means no termination flag during the complete clip. Tracking quality
-is reported separately using the existing geometric quality thresholds.
+Each evaluation covers all 22 protected clips (eleven per table), all **6482
+control intervals / 6504 states**, without failure resets. The longest clip
+has 411 intervals. Policy actions are deterministic; nominal physical
+parameters and seed zero are used. No optimizer, RMS, replay or RSI updates
+occur. Complete checkpoint, model/RMS, physics, reward, data and source
+identities are checked before and after evaluation. Success records survival
+under the existing tables termination rule; tracking metrics are separate.
 
-`hoi_tables.eval_monitor` runs in a separate CPU allocation. It waits for both
-atomic `checkpoint_002000.pt` files, then repeats at 4000 through 20000. It
-submits one A10 evaluation at a time, preserves queued milestones and validates
-full coverage and immutable hashes before publication. Scheduler submission
-intents and results are durable; a lost submission reply is reconciled by job
-identity instead of issuing another job. An evaluation failure is recorded
-and stops further submissions. If training exits early, available milestones
-are drained and missing milestones are recorded explicitly.
+`hoi_tables.unified_monitor` is the only W&B SDK writer after registration.
+It resumes the **owning training run**, merges native training JSONL and
+validated evaluation reports, and uses explicit axes `iteration` and
+`eval/iteration`. SDK steps are monotonic transport counters; checkpoint
+iterations are never used as SDK steps for this merged stream. Semantic event
+IDs, durable outbox records, server acknowledgements and the existing writer
+locks protect restart/handoff behavior. Evaluation does not overwrite training
+stage or status. Tables and Ultra use this same ownership protocol.
 
-The W&B writer owns a separate eval-only run in `hoiretarget-tables`, linked
-to parent run `44ad3b72`. Only scalar results and curated identity metadata are
-uploaded, with `eval/iteration` as the checkpoint axis. The existing training
-writer, training source and training process are left intact. The personal
-workspace receives eight plots under `08 Protected Eval - 22 Complete Clips`;
-large and small table results remain in separate plots. A full-22 validation
-using checkpoint 500 is explicitly marked smoke and cannot be published as a
-scheduled evaluation point.
+For current tables training, all `eval/*` scalars go to run **44ad3b72** in
+`hoiretarget-tables`. The project workspace has a manual protected-eval section
+with large/small table plots separated and automatic chart creation disabled.
+The former independent eval watcher `1513606` was canceled before dispatch;
+its empty W&B run `788bbb03` was verified empty and deleted. Its durable
+evaluation ledger `protected_eval_2000_01` is reused by unified job `1513706`.
+Only the old logging process and its SDK child were stopped during handoff;
+the launcher and both original trainer PID/start-time pairs were preserved.
 
-Deployment receipts for this attachment:
+Validated deployment evidence:
 
-- All **108 tables CPU tests** passed; the 11 evaluator tests also passed
-  inside the native Linux allocation.
-- Separate frozen source `source_eval01`, 134 files; archive SHA256
-  `1faeef8089a29c4f16429bb518af556b35ab7fadd5742bc4a4f383c329b7c3f4`.
-  Evaluation executable-tree SHA256:
+- A10 job `1513451` completed the full protected22 rollout at checkpoint 500,
+  explicitly marked smoke and excluded from scheduled evaluation publication.
+- Policy/RMS SHA256 before and after:
+  `f832ad858a7c77ddfa1a51519547dbe15b7966e61ccd01d47dc5bf547f75a824`.
+- Aggregate smoke report SHA256:
+  `28039232a7559ee0807bb94407f055e8d02dc9295c4822bf25abe53af013cf4b`.
+- Unchanged GPU evaluator source `source_eval01`, 134 files; archive SHA256
+  `1faeef8089a29c4f16429bb518af556b35ab7fadd5742bc4a4f383c329b7c3f4`;
+  executable-tree SHA256
   `2aacd7af53e30f1c9a39b02d7d704165469e9c1c76429a4229c0ce3ee773d949`.
-- Full-22 native validation: A10 job `1513451`, directory
-  `protected_eval_smoke500_01`. It reads checkpoint 500 and is not a
-  scheduled W&B result.
-- Periodic CPU watcher: job `1513606`, with `afterok:1513451` dependency;
-  control/output root `protected_eval_2000_01`. Training remains job
-  `1512413`, parent W&B run `44ad3b72`.
-- Eval-only W&B run:
-  https://wandb.ai/tianzizh-university-of-pennsylvania/hoiretarget-tables/runs/788bbb03
-  Its server configuration binds the parent, all input hashes, the evaluation
-  source, 2000-iteration cadence and the protected22 protocol. Registration
-  creates no fake evaluation point. The eight-panel eval section has been
-  verified by server readback and automatic panel creation remains disabled.
-- Cluster receipts and old/new workspace backups: `protected_eval_attach01`;
-  local copies: `.cache/tables_eval_attach/evidence/`.
+- The logging snapshot passed 31 Linux tests. Server verification checked all
+  128 training, 134 evaluator and 137 logging manifest files unchanged.
+- Cluster evidence: `protected_eval_attach01/{same_run_server_verified,
+  legacy_writer_handoff,empty_eval_run_cleanup}.json`; unified state and outbox
+  are in `unified_logging_01`. No scheduled point exists before checkpoint 2000.
 
-Native validation and attachment are now verified. Job `1513451` exited zero;
-both asset reports and their aggregate cover 22 distinct protected clips,
-6482 controls and 6504 states with no failure resets. Policy/RMS hashes stayed
-identical across the complete evaluation; optimizer, normalizer, replay and
-RSI updates were zero. Both nominal native object/robot/contact/capacity
-audits passed. Source and checkpoint receipts revalidated after rollout.
-Aggregate report SHA256:
-`28039232a7559ee0807bb94407f055e8d02dc9295c4822bf25abe53af013cf4b`.
+## Ultra boxes configuration
 
-CPU watcher `1513606` is **RUNNING** and has published its ready handshake.
-Independent W&B server readback confirms eval run `788bbb03` is running with
-status `waiting_for_checkpoints`, interval 2000 and protected count 22. No
-scheduled evaluation point is published yet; the first comes from checkpoint
-2000 after its full rollout. Original training `1512413` was independently
-verified still running at iteration 1071 with the same start time, zero
-restarts and all frozen scientific source checksums intact.
+`configs/hoi_ultra_boxes_v1.json` selects canonical Ultra **train** data:
+**2651 motions / 381 source groups**, with eight exact metric assets:
+
+| Object | Scales |
+| --- | --- |
+| largebox | 080, 100 |
+| plasticbox | 080, 100 |
+| smallbox | 080, 100 |
+| suitcase | 080, 100 |
+
+`080` means the existing `*_080_080_080` asset and `100` the existing
+`*_100_100_100` asset. The adapter binds geometry and shape points by asset
+name, checks the existing hull/SDF/FPS128 identities, and applies no additional
+mesh scaling or geometry cooking. The established Ultra 60-to-50 Hz sampling
+protocol is retained. Tables retain their 30-to-50 Hz protocol.
+
+The current privileged GMT robot, motors, soft hands, joint friction, action
+definition, 313D WM input, 82D output, five contact heads, privileged actor /
+critic observations, 14 reward terms and optimization settings are unchanged.
+Training remains global4096/H32/WM batch2048/policy batch4096, 20k iterations,
+500 WM-only iterations and the existing adaptive RSI mixture. The 500-step
+training timeout is unchanged.
+
+The eight asset ranks share one model and synchronized statistics. Default
+`workers_per_gpu=1` requests eight L40s; an explicit value of two uses four L40s
+without changing the eight asset workers or global objective. The complete
+production zero-update capacity probe must pass before fresh formal models
+are constructed. Ultra capacity and full training have **not** been run.
+
+Reference-contact labels must be recomputed for the current calibrated hands.
+The old robot's contact labels cannot be reused. `hoi_tables.ultra` prepares
+2651 training references plus 80 evaluation references, with strict data,
+robot, geometry and implementation identities. These are reference labels,
+not policy rollouts. The configuration names a new cache destination; the
+full cache preparation has **not** been submitted.
+
+Every 2000 iterations, `hoi_tables.hoi80_monitor.Supervisor` binds all eight
+same-iteration checkpoints and runs the **complete canonical HOI80** panel.
+Its eight asset counts are **5,15,6,14,4,16,11,9**, with **23718 controls /
+23798 states**. The longest clip has **629 controls** and is evaluated in
+full, beyond the training timeout. These 80 source groups belong to Ultra
+validation and are a fixed development evaluation panel, not an independent
+test set.
+
+`evaluate_hoi80` uses the current direct policy and unchanged reward. It
+reuses the pinned canonical initialization and PHC39/object scoring helpers,
+not the residual teacher loader. Canonical human/object/joint pass rates are
+reported separately from TablesReward survival, under
+`eval/hoi80/{human_pass_rate,object_pass_rate,joint_pass_rate}`. Per-asset
+metrics use `eval/assets/<exact_asset>/...`. All evaluation data are logged
+into the corresponding **Ultra training run**, with `eval/iteration` as axis.
+GPU workers have W&B disabled and never register a run.
+
+The manual project workspace includes three canonical HOI80 plots in
+`09 Eval - HOI80`, initially collapsed; existing training and protected22
+panels are preserved. Automatic panel creation remains disabled.
+
+Final validation: **155 tables/Ultra CPU tests passed**, including owning-run
+logging/handoff, all-ten-milestone scheduling, eight-rank input/checkpoint
+contracts, full HOI80 duration, source freezing and launch preparation. All
+five new/updated scheduler scripts passed `bash -n`. Existing cluster Ultra
+geometry, shape and canonical inputs passed read-only binding checks. This
+does not constitute Ultra GPU capacity or policy-rollout validation.
+
+Future launch procedure, using an isolated committed checkout on GRASP:
+
+```bash
+SRC=/absolute/committed/hoi-retarget-tables
+CFG=$SRC/configs/hoi_ultra_boxes_v1.json
+CAMPAIGN=/mnt/projects/ll/tianzizh/hoi_direct_ultra_v1_01
+prep=$(sbatch --parsable "$SRC/cluster/hoi_ultra_prepare.sbatch.sh" "$SRC" "$CFG")
+sbatch --dependency=afterok:$prep --gres=gpu:l40:8 \
+  --output=/mnt/projects/ll/tianzizh/hoi_direct_ultra_v1_01-%j.log \
+  "$SRC/cluster/hoi_direct_train.sbatch.sh" "$CAMPAIGN" "$SRC" "$CFG"
+```
+
+The destination cache and campaign must be new. To select four GPUs, pass
+`--export=ALL,HOI_WORKERS_PER_GPU=2 --gres=gpu:l40:4` to the training submission.
+`hoi_tables.launch` freezes source, links existing inputs read-only, writes
+profile metadata, and rejects existing campaigns. The launcher requires a
+healthy owning-run logger **and** evaluation scheduler before starting the
+capacity probe. Existing runtimes and active tables sources remain read-only.
+These commands are documented entry points; no Ultra training was submitted.

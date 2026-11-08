@@ -32,7 +32,7 @@ SCHEMA_FIELDS = {"version", "wm_input_dim", "wm_output_dim", "wm", "wm_output", 
                  "shape_dim", "actor_critic_blocks", "base_action_input", "residual_action", "contact",
                  "contact_schema", "actuator_prediction", "v11_source"}
 HASH_FIELDS = {"source_sha256", "manifest_sha256", "asset_catalog_sha256", "shape_bank_sha256", "reference_contacts_sha256"}
-COUNT_FIELDS = {"train_clips", "protected_eval", "gpus", "total_env"}
+COUNT_FIELDS = {"train_clips", "protected_eval", "evaluation_clips", "train_source_groups", "asset_count", "gpus", "total_env"}
 TERM_NAMES = {"body_position", "body_orientation", "body_linear_velocity", "body_angular_velocity",
               "root_position", "root_orientation", "action_rate", "joint_limits", "object_position",
               "object_orientation", "object_linear_velocity", "object_angular_velocity", "hand_approach", "contact_match"}
@@ -80,8 +80,15 @@ def curated_config(metadata):
     for key in COUNT_FIELDS:
         if key in metadata and type(metadata[key]) is int and metadata[key] >= 0:
             result[key] = metadata[key]
-    if metadata.get("branch") == "hoi-retarget/tables-v1.0":
+    if metadata.get("branch") in ("hoi-retarget/tables-v1.0", "hoi-retarget/tables-boxes-v1.0"):
         result["branch"] = metadata["branch"]
+    experiment = metadata.get("experiment")
+    if isinstance(experiment, dict) and experiment.get("profile") in ("tables", "ultra"):
+        result["experiment"] = {"profile": experiment["profile"], "assets": _safe_schema(experiment["assets"]),
+                                "evaluation_kind": experiment["evaluation"]["kind"],
+                                "evaluation_every": experiment["evaluation"]["every"],
+                                "evaluation_on_training_run": True,
+                                "evaluation_role": "canonical_development80" if experiment["profile"] == "ultra" else "protected_tables22"}
     if metadata.get("from_scratch") is True:
         result["from_scratch"] = True
     if metadata.get("gpu_type") == "L40":

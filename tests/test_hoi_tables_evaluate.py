@@ -97,6 +97,21 @@ class PairTests(unittest.TestCase):
 
 
 class SourceTests(unittest.TestCase):
+    def test_renamed_branch_preserves_exact_scientific_source_guard(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp); source=root/"frozen"; runtime=root/"eval"
+            for base in (source,runtime):
+                (base/"hoi_tables").mkdir(parents=True)
+                (base/"hoi_tables/networks.py").write_bytes(b"unchanged direct teacher\n")
+            manifest={"branch":"hoi-retarget/tables-boxes-v1.0","files":{"hoi_tables/networks.py":evaluation.file_sha256(source/"hoi_tables/networks.py")}}
+            (source/"SOURCE_MANIFEST.json").write_text(json.dumps(manifest))
+            self.assertEqual(len(evaluation.validate_source_compatibility(source,runtime)["matched_scientific_files"]),1)
+            (runtime/"hoi_tables/networks.py").write_bytes(b"drift")
+            with self.assertRaisesRegex(ValueError,"scientific source"): evaluation.validate_source_compatibility(source,runtime)
+            manifest["branch"]="unrelated-branch"
+            (source/"SOURCE_MANIFEST.json").write_text(json.dumps(manifest))
+            with self.assertRaisesRegex(ValueError,"source manifest"): evaluation.validate_source_compatibility(source,runtime)
+
     def test_frozen_source_manifest_and_runtime_drift(self):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp); source=root/"frozen"; runtime=root/"eval"

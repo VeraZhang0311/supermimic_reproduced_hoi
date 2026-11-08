@@ -1,26 +1,15 @@
-"""Scheduler/W&B replay tests; no real scheduler, SDK, GPU or network calls."""
+"""SDK-free scheduler and owning-writer integration; no live service calls."""
+from contextlib import redirect_stderr
 import copy
+import io
 import json
 from pathlib import Path
 import subprocess
 from tempfile import TemporaryDirectory
-from types import SimpleNamespace
 import unittest
 import zipfile
 
 from hoi_tables import eval_monitor as monitor
-from tests.test_hoi_tables_telemetry import FakeWandb
-
-
-class EvalWandb(FakeWandb):
-    def __init__(self):
-        super().__init__()
-        self.definitions = []
-
-    def init(self, **kwargs):
-        run = super().init(**kwargs)
-        run.define_metric = lambda name, **values: self.definitions.append((name, values))
-        return run
 
 
 class FakeSlurm:
@@ -68,10 +57,11 @@ class EvalMonitorTests(unittest.TestCase):
         self.manifest.write_text(json.dumps({"clips": clips, "cache": {"sha256": "b"*64}}))
         (self.training/"run_metadata.json").write_text(json.dumps({"source_sha256": "a"*64,
                     "manifest_sha256": monitor.sha256(self.manifest), "global_config": {"wm_only_iters": 500}}))
-        (self.training/"wandb_registration.json").write_text(json.dumps({"id": "44ad3b72", "entity": monitor.ENTITY, "project": monitor.PROJECT}))
+        (self.training/"wandb_registration.json").write_text(json.dumps({
+            "id": "44ad3b72", "entity": monitor.ENTITY, "project": monitor.PROJECT,
+            "name": "tables_v1-20261107-test",
+            "metadata_sha256": monitor.sha256(self.training/"run_metadata.json")}))
         self.slurm = FakeSlurm()
-        self.sdk = EvalWandb()
-        self.args = dict(parent_run_id="44ad3b72", eval_id="eval-new01", name="tables_v1_eval-20261107-180000", wandb_module=self.sdk)
 
     def supervisor(self, **kwargs):
         return monitor.Supervisor(self.control, self.campaign, self.training, self.source, self.training_source,
@@ -137,6 +127,7 @@ class EvalMonitorTests(unittest.TestCase):
         self.checkpoints(2000)
         supervisor = self.supervisor(); supervisor.tick()
         request = self.slurm.jobs["100"]["request"]
+        self.assertEqual(monitor.main(["--validate-request", self.slurm.jobs["100"]["request_path"]]), 0)
         result = self.result(request)
         path = self.control/"result-test.json"
         path.write_text(json.dumps(result))
@@ -193,22 +184,26 @@ class EvalMonitorTests(unittest.TestCase):
         self.assertEqual(state["parent_training_exitcode"], 1)
         self.assertEqual(state["missing_milestones"], list(range(4000, 20001, 2000)))
 
-    def test_eval_run_is_independent_has_custom_axis_and_never_logs_fake_zero(self):
-        metadata_before = (self.training/"run_metadata.json").read_bytes()
-        registration = monitor.register(self.control, self.training, **self.args)
-        self.assertEqual(registration["parent_run_id"], "44ad3b72")
-        run = self.sdk.runs["eval-new01"]
-        self.assertEqual(run.logs, [])
-        self.assertEqual(self.sdk.init_calls[0]["resume"], "never")
-        self.assertIn(("eval/*", {"step_metric": "eval/iteration"}), self.sdk.definitions)
-        self.assertTrue(self.sdk.init_calls[0]["config"]["eval_only"])
-        self.assertNotIn(str(self.training), json.dumps(self.sdk.init_calls[0]["config"]))
-        self.assertEqual(metadata_before, (self.training/"run_metadata.json").read_bytes())
-        with self.assertRaises(ValueError):
-            monitor.register(self.control/"bad", self.training, **dict(self.args, eval_id="44ad3b72"))
+    def test_legacy_separate_run_entry_points_explicitly_reject_before_side_effects(self):
+        from tests.test_hoi_tables_unified_monitor import SDK
+        sdk = SDK()
+        for function in (monitor.register, monitor.monitor):
+            with self.assertRaisesRegex(RuntimeError, "owning training run"):
+                function(self.control, self.training, parent_run_id="44ad3b72",
+                         eval_id="obsolete-independent", wandb_module=sdk)
+        self.assertEqual(sdk.calls, [])
+        self.assertFalse(self.control.exists())
+        self.assertFalse(hasattr(monitor, "_run_identity"))
+        for args in ([], ["--register-only"], ["--eval-id", "obsolete-independent"]):
+            stderr = io.StringIO()
+            with redirect_stderr(stderr), self.assertRaises(SystemExit) as exited:
+                monitor.main(args)
+            self.assertEqual(exited.exception.code, 2)
+            self.assertIn("hoi_tables.unified_monitor", stderr.getvalue())
 
-    def test_modified_completed_result_is_not_uploaded_on_monitor_resume(self):
-        monitor.register(self.control, self.training, **self.args)
+    def test_modified_completed_result_is_rejected_by_owning_writer_on_resume(self):
+        from hoi_tables import unified_monitor
+        from tests.test_hoi_tables_unified_monitor import SDK
         self.checkpoints(2000)
         supervisor = self.supervisor(); supervisor.tick(); self.finish("100")
         (self.training/"training_exitcode").write_text("1")
@@ -217,32 +212,39 @@ class EvalMonitorTests(unittest.TestCase):
         result_path = Path(entry["result"])
         result = json.loads(result_path.read_text()); result["metrics"]["success_rate"] = .9
         result_path.write_text(json.dumps(result))
-        self.assertEqual(monitor.monitor(self.control, self.campaign, self.training, self.source, self.training_source,
-                                        slurm=self.slurm, sleep=lambda _: None, **self.args), 1)
-        self.assertEqual(self.sdk.runs["eval-new01"].logs, [])
+        sdk = SDK()
+        result = unified_monitor.monitor(self.campaign/"unified", self.training,
+                    assets=monitor.ASSETS, supervisor=self.supervisor(), eval_control=self.control,
+                    wandb_module=sdk, stop_requested=lambda: True)
+        self.assertEqual(result, 0)  # Evaluation errors do not silence the training writer.
+        self.assertEqual(sdk.new_logs, [])
+        self.assertEqual(sdk.summary["eval/status"], "failed")
+        self.assertEqual(sdk.calls[0]["id"], "44ad3b72")
+        self.assertEqual(sdk.calls[0]["resume"], "must")
+        self.assertEqual(len(self.slurm.calls), 1)
 
-    def test_all_ten_milestones_publish_once_and_finish_without_touching_parent(self):
-        monitor.register(self.control, self.training, **self.args)
+    def test_all_ten_milestones_complete_once_and_restart_keeps_scheduler_deduplicated(self):
         for iteration in monitor.MILESTONES: self.checkpoints(iteration)
         parent_files = {str(p): p.read_bytes() for p in self.training.rglob("*") if p.is_file()}
-        def advance(_):
+        supervisor = self.supervisor()
+        supervisor.tick()
+        for iteration in monitor.MILESTONES:
             running = [job for job, record in self.slurm.jobs.items() if record["state"] == "RUNNING"]
             self.assertEqual(len(running), 1)
+            self.assertEqual(self.slurm.jobs[running[0]]["request"]["iteration"], iteration)
             self.finish(running[0])
-            if self.slurm.jobs[running[0]]["request"]["iteration"] == 20000:
-                (self.training/"training_exitcode").write_text("0")
-        result = monitor.monitor(self.control, self.campaign, self.training, self.source, self.training_source,
-                                 slurm=self.slurm, sleep=advance, **self.args)
-        self.assertEqual(result, 0)
-        run = self.sdk.runs["eval-new01"]
-        self.assertEqual([step for step, _ in run.logs], list(monitor.MILESTONES))
+            if iteration == 20000: (self.training/"training_exitcode").write_text("0")
+            state = supervisor.tick()
+            self.assertEqual(state["evaluations"][str(iteration)]["status"], "complete")
+        self.assertTrue(state["finished"])
+        self.assertEqual(state["missing_milestones"], [])
+        self.assertEqual(state["failed_milestones"], [])
         self.assertEqual(len(self.slurm.calls), 10)
-        self.assertEqual(self.sdk.init_calls[1]["resume"], "must")
+        self.assertEqual(sorted(int(i) for i in state["evaluations"]), list(monitor.MILESTONES))
         for path, data in parent_files.items(): self.assertEqual(Path(path).read_bytes(), data)
-        # Re-open the same ledger/run: all complete results are deduplicated.
-        self.assertEqual(monitor.monitor(self.control, self.campaign, self.training, self.source, self.training_source,
-                                        slurm=self.slurm, sleep=lambda _: None, **self.args), 0)
-        self.assertEqual(len(run.logs), 10)
+        # Reopening the SDK-free ledger never submits a completed milestone again.
+        reopened = self.supervisor().tick()
+        self.assertTrue(reopened["finished"])
         self.assertEqual(len(self.slurm.calls), 10)
 
 

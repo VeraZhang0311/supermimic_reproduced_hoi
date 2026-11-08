@@ -7,6 +7,7 @@ the formal training process must initialize fresh models/RMS/replay afterward.
 from __future__ import annotations
 
 from contextlib import contextmanager
+from collections import Counter
 from copy import deepcopy
 import hashlib
 import math
@@ -53,7 +54,7 @@ def _bytes(tensor):
     return tensor.numel() * tensor.element_size()
 
 
-def _configuration(learner, replay, env, global_config, require_production):
+def _configuration(learner, replay, env, global_config, require_production, expected_assets, workers_per_gpu):
     local = learner.config
     local.validate(); global_config.validate()
     world = dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
@@ -67,8 +68,15 @@ def _configuration(learner, replay, env, global_config, require_production):
         expected = {"num_envs": 4096, "buffer_steps": 1000, "wm_batch": 2048, "pi_batch": 4096,
                     "wm_batches": 10, "wm_window": 8, "horizon": 32, "critic_epochs": 5,
                     "critic_minibatches": 4, "wm_only_iters": 500, "experiment_kind": "formal"}
-        if world != 2 or torch.device(learner.device).type != "cuda":
-            raise ValueError("Formal capacity validation requires two live CUDA/Gloo workers")
+        if world != len(expected_assets) or torch.device(learner.device).type != "cuda":
+            count = "two" if len(expected_assets)==2 else str(len(expected_assets))
+            raise ValueError(f"Formal capacity validation requires {count} live CUDA/Gloo workers, one per exact profile asset")
+        rank = dist.get_rank()
+        if (len(set(expected_assets)) != len(expected_assets) or type(workers_per_gpu) is not int
+                or workers_per_gpu < 1 or world % workers_per_gpu):
+            raise ValueError("Invalid profile asset/GPU topology")
+        if (env.asset.get("asset_id") != rank or env.asset.get("object_asset") != expected_assets[rank]):
+            raise ValueError("Capacity worker does not own its exact profile asset")
         if dist.get_backend() != "gloo":
             raise ValueError("Formal tables capacity validation requires the configured Gloo synchronization")
         for name, value in expected.items():
@@ -189,7 +197,8 @@ def _zero_step_adam(learner, telemetry):
         scratch.clear()
 
 
-def validate_capacity(learner, replay, env, global_config, *, require_production=True):
+def validate_capacity(learner, replay, env, global_config, *, require_production=True,
+                      expected_assets=("largetable","smalltable"), workers_per_gpu=1):
     """Exercise full WM/BPTT/critic gradients with zero original Adam.step calls.
 
     Success reports are gathered across the live Gloo workers. On a local
@@ -197,7 +206,7 @@ def validate_capacity(learner, replay, env, global_config, *, require_production
     torchrun supervisor can terminate a peer blocked in an earlier collective.
     ``require_production=False`` exists only for CPU contract unit fixtures.
     """
-    world = _configuration(learner, replay, env, global_config, require_production)
+    world = _configuration(learner, replay, env, global_config, require_production, expected_assets, workers_per_gpu)
     models = _models(learner)
     original_models = {name: {key: value.detach().cpu().clone() for key, value in module.state_dict().items()}
                        for name, module in models.items()}
@@ -220,6 +229,7 @@ def validate_capacity(learner, replay, env, global_config, *, require_production
     report = {"schema": "hoi_tables_full_allocation_capacity_v1", "passed": False,
               "production_configuration": require_production, "rank": dist.get_rank() if world > 1 else 0,
               "world_size": world, "hostname": socket.gethostname(), "slurm_job_id": os.environ.get("SLURM_JOB_ID"),
+              "profile_assets":list(expected_assets),"workers_per_gpu":workers_per_gpu,
               "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
               "scope": "real full-sized forward/backward and reserved Adam memory; no optimizer update or convergence claim",
               "global_config": global_config.to_dict(), "worker_config": learner.config.to_dict(),
@@ -305,9 +315,10 @@ def validate_capacity(learner, replay, env, global_config, *, require_production
         raise CapacityValidationError("A distributed tables capacity peer did not pass", report)
     if require_production:
         devices = [(p["hostname"], p["memory_peak_with_adam_reservations"]["uuid"]) for p in peers]
-        if all(uuid != "unavailable" for _, uuid in devices) and len(set(devices)) != world:
+        if all(uuid != "unavailable" for _, uuid in devices) and (
+                len(set(devices)) != world//workers_per_gpu or any(n!=workers_per_gpu for n in Counter(devices).values())):
             report["passed"] = False
-            raise CapacityValidationError("Formal capacity workers share one physical GPU", report)
+            raise CapacityValidationError("Formal capacity workers differ from the explicit physical GPU sharing topology", report)
     peaks = [p["memory_peak_with_adam_reservations"] for p in peers if p["memory_peak_with_adam_reservations"]["available"]]
     return {"schema": report["schema"], "passed": True, "world_size": world,
             "production_configuration": require_production, "optimizer_updates": 0,

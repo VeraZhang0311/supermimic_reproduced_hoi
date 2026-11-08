@@ -23,35 +23,45 @@ def _parameter_hash(module):
     return digest.hexdigest()
 
 
-def main():
+def build_parser():
     parser = argparse.ArgumentParser(__doc__)
-    parser.add_argument("--manifest", required=True)
-    parser.add_argument("--asset-bundle", required=True)
-    parser.add_argument("--shape-bank", required=True)
+    parser.add_argument("--experiment-config")
+    parser.add_argument("--profile", choices=("tables","ultra"))
+    parser.add_argument("--manifest")
+    parser.add_argument("--asset-bundle")
+    parser.add_argument("--geometry-bundle")
+    parser.add_argument("--shape-bank")
+    parser.add_argument("--canonical")
+    parser.add_argument("--helper-root")
+    parser.add_argument("--workers-per-gpu", type=int)
     parser.add_argument("--reference-contacts", help="Optional complete, identity-bound exact reference contact cache")
     parser.add_argument("--output", required=True)
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--capacity-only", action="store_true", help="Production-size zero-update memory/gradient validation")
-    parser.add_argument("--asset", type=int, choices=(0, 1))
-    parser.add_argument("--num-envs", type=int, default=4096, help="Global environment count across both asset workers")
-    parser.add_argument("--iterations", type=int, default=20000)
-    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--asset", type=int)
+    parser.add_argument("--num-envs", type=int, help="Global environment count across all asset workers")
+    parser.add_argument("--iterations", type=int)
+    parser.add_argument("--seed", type=int)
     parser.add_argument("--shared-gpu", action="store_true")
     parser.add_argument("--nconmax", type=int, default=512)
     parser.add_argument("--njmax", type=int, default=2048)
     parser.add_argument("--epa-horizon", type=int, default=64)
+    return parser
+
+
+def main():
+    parser = build_parser()
     args = parser.parse_args()
+    from .experiments import resolve_arguments
+    experiment, experiment_binding = resolve_arguments(args)
     if args.capacity_only and args.smoke:
         parser.error("Capacity validation uses the formal configuration, not smoke overrides")
     if not os.environ.get("SLURM_JOB_ID"):
         raise RuntimeError("Run GPU workloads through the scheduler")
     rank, world = int(os.environ.get("RANK", 0)), int(os.environ.get("WORLD_SIZE", 1))
-    if world not in (1, 2) or (not args.smoke and world != 2):
-        raise ValueError("Unified formal training requires exactly two equal asset workers")
-    if args.asset is not None and world != 1:
-        raise ValueError("Distributed workers select asset by rank")
-    if world == 1 and args.asset is None:
-        raise ValueError("Single-asset smoke requires --asset")
+    topology = experiment.topology(rank=rank, world=world, local_rank=int(os.environ.get("LOCAL_RANK",rank)),
+                                   workers_per_gpu=args.workers_per_gpu, shared_gpu=args.shared_gpu,
+                                   smoke=args.smoke, asset=args.asset)
     if args.num_envs % world:
         raise ValueError("Global environment count must divide equally between assets")
     for variable in ("WARP_CACHE_PATH", "TORCHINDUCTOR_CACHE_DIR"):
@@ -69,17 +79,17 @@ def main():
     from supermimic.mdp import MDP
     from supermimic.g1_physics import physics_contract
     from hoi_residual.capacity import capacity_profile, configure_capacity, capacity_readback
-    from .assets import load_assets, load_shape_bank
-    from .data import TableMotionLib
     from .config import TrainConfig
     from .networks import Policy, Critic, WorldModel, feature_schema
     from .learner import Learner
     from .replay import ReplayBuffer
-    from .reward import TablesReward
     from .env import TableSim
     from .distributed import (broadcast_models, bind_distributed_statistics, synchronize_gradients,
                               synchronize_contact_counts, state_hash)
-    device = "cuda:0" if args.shared_gpu or world == 1 else f"cuda:{rank}"
+    experiment.topology(rank=rank, world=world, local_rank=int(os.environ.get("LOCAL_RANK",rank)),
+                        workers_per_gpu=args.workers_per_gpu, shared_gpu=args.shared_gpu,
+                        smoke=args.smoke, asset=args.asset, visible_devices=torch.cuda.device_count())
+    device = f"cuda:{topology['device_index']}"
     torch.cuda.set_device(device)
     if world > 1:
         dist.init_process_group("gloo")
@@ -97,23 +107,24 @@ def main():
                          wm_batch=8*world, pi_batch=2*world, wm_only_iters=1,
                          critic_epochs=1, critic_minibatches=2, ckpt_every=3)
     global_config = config.validate()
+    if any(getattr(config,name)%world for name in ("num_envs","wm_batch","pi_batch")):
+        raise ValueError("Global environment and learning batches must divide equally across asset workers")
     config = replace(config, num_envs=args.num_envs//world,
                      wm_batch=config.wm_batch//world, pi_batch=config.pi_batch//world).validate()
     kin, teacher_kin = G1Kinematics(device), RobotKinematics38(device=device)
-    asset_id = rank if world == 2 else args.asset
-    motion = TableMotionLib(args.manifest, kin, device, partition="train", for_training=True,
-                            asset=asset_id, one_per_asset=args.smoke)
-    assets = load_assets(args.asset_bundle)
+    asset_id = topology["asset_id"]
+    motion = experiment.motion(args, kin, device, asset_id)
+    assets, hands = experiment.load_assets(args)
+    if tuple(assets[i]["object_asset"] for i in range(len(assets))) != experiment.assets:
+        raise ValueError("Dataset profile and exact asset catalog differ")
     asset = assets[asset_id]
-    points, shape_metadata = load_shape_bank(args.shape_bank, args.asset_bundle)
+    points, shape_metadata = experiment.load_shape(args)
     class Shapes:
         def __init__(self): self.bank = points.to(device)
         def points(self, ids): return self.bank[ids]
     shapes = Shapes()
     mdp = MDP(kin, motion, torch.tensor(default_joint_pos_list(), device=device))
-    catalog = json.loads(Path(args.asset_bundle).read_text())
-    hands = catalog["hands"]["geometry_cache"]
-    reward = TablesReward(mdp, assets, hands, reference_contacts=args.reference_contacts)
+    reward = experiment.reward(args, mdp, assets, hands)
     policy, wm, critic = (Policy(config.actor_hidden).to(device), WorldModel(config.wm_hidden, config.contact_hidden).to(device),
                           Critic(config.critic_hidden).to(device))
     if world > 1:
@@ -139,6 +150,12 @@ def main():
                 "asset_catalog_sha256": hashlib.sha256(Path(args.asset_bundle).read_bytes()).hexdigest(),
                 "shape_bank": shape_metadata, "smoke": args.smoke,
                 "schedule_scope": "smoke1WM+2joint" if args.smoke else "500WM_then_fixed_actor_critic"}
+    if experiment.name != "tables":
+        identity["experiment"] = {"profile":experiment.name,"assets":list(experiment.assets),
+                                  "workers_per_gpu":topology["workers_per_gpu"],
+                                  "geometry_bundle_sha256":hashlib.sha256(Path(args.geometry_bundle).read_bytes()).hexdigest(),
+                                  "config_binding":experiment_binding,
+                                  "evaluation":{"kind":experiment.evaluation,"every":2000,"owning_training_run":True}}
     _json(output/"config.json", identity)
     resets = 0
     collected_steps = 0
@@ -179,7 +196,8 @@ def main():
         from .capacity import validate_capacity, CapacityValidationError
         print(json.dumps({"rank":rank,"phase":"production_capacity_begin"}),flush=True)
         try:
-            report = validate_capacity(learner, replay, env, global_config)
+            report = validate_capacity(learner, replay, env, global_config,
+                                       expected_assets=experiment.assets, workers_per_gpu=topology["workers_per_gpu"])
         except CapacityValidationError as error:
             _json(output/"capacity_report.json", error.report)
             raise

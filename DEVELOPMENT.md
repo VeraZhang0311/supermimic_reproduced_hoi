@@ -1,24 +1,31 @@
 # G1 privileged GMT：LAFAN1 与 Boneseed
 
-## 当前 tables teacher 分支
+## 当前 tables / Ultra boxes teacher 分支
 
-`hoi-retarget/tables-v1.0` 从 `codex/hoi-residual-ppo-teacher@78cd5b2` 切出。
-新增 `hoi_tables/`，从零学习 WM + 特权 actor/critic，不加载冻结 GMT 或做残差 PPO。
-机器人物理及共享实现保持不变，WM 使用获批的 313D 输入、82D 输出与五通道接触头。
-226 条 tables 清单、204/22 冻结划分、500 轮 WM warmup、RSI 及验证入口见 [TABLES.md](TABLES.md)。
-用户随后授权正式训练：L40，W&B 新项目 `hoiretarget-tables`。正式入口为
-`cluster/hoi_tables_train.sbatch.sh`：2×L40、全局4096环境、20k轮、500轮WM warmup，
-同allocation先做完整规模零更新预检，再在独立新进程从零训练。下文保留父分支历史。
-正式提交作业 `1512413`，W&B run `44ad3b72`；最后核验为 `PENDING / Priority`，
-Slurm 暂估美东 2026-11-07 20:04 获卡。新快照 `source_train03` 已通过 88 项 CPU 回归；
-完整规模 GPU 预检、数据身份、数值审计修复与提交回执详见 `TABLES.md`。
-当前训练继续使用作业 `1512413`、冻结 `source_train03`。用户新增每 2000 轮完整
-22 条 protected eval，使用独立 `source_eval01` 和 A10 作业，W&B eval run
-`788bbb03`；常驻 CPU 监听 `1513606` 依赖完整 22 条验证 `1513451` 成功后启动。
-评测按 `eval/iteration` 显示，训练进程、训练 writer 和科学实现不热更新。
-完整 22 条 GPU 验证已通过（6482 controls、policy/RMS 不变、零训练更新），
-监听作业 `1513606` 已运行并完成 W&B 握手，正在等待 checkpoint 2000。
-原训练核验到 1071 轮，启动时间未变，重启次数 0，科学源码校验全部通过。
+`hoi-retarget/tables-boxes-v1.0` 从原 `hoi-retarget/tables-v1.0` 改名，父提交为
+`codex/hoi-residual-ppo-teacher@78cd5b2`。新增 `hoi_tables/` 从零学习 WM +
+特权 actor/critic，机器人物理和共享科学实现保持不变。WM 313D 输入、82D 输出、
+五通道接触头、14 项奖励、500 轮 warmup、全局4096及H32不变。
+配置分别为 `configs/hoi_tables_v1.json` 和 `configs/hoi_ultra_boxes_v1.json`。
+数据、训练和评测入口及回执见 [TABLES.md](TABLES.md)。
+
+现有 tables 正式训练：Slurm `1512413`，2×L40，冻结 `source_train03`，
+W&B `hoiretarget-tables/44ad3b72`。核验训练未重启，原 launcher 和两 rank 的
+PID/start ticks 未变，scheduler restart=0。W&B 第1–1242轮连续、无重复。
+每2000轮用相应双rank checkpoint 完整评测22条 protected clips，合计6482 controls。
+完整 checkpoint500 GPU smoke `1513451` 已通过，policy/RMS不变、零训练更新；
+smoke 不当作正式2000轮评测点。GPU评测仍使用冻结 `source_eval01`。
+
+Tables 与 Ultra 的评测均写入**所属训练 run**的 `eval/*`，轴为 `eval/iteration`。
+CPU unified writer `1513706` 在独立 `source_unified01` 继续写 tables 原训练run，
+训练进程未热更新。旧独立 eval watcher `1513606` 已取消，空run `788bbb03` 已删除。
+新入口为 `cluster/hoi_direct_train.sbatch.sh`，统一注册训练run并接上同run评测。
+
+Ultra profile使用2651条 canonical train motion（381 source groups）、四类八个资产。
+每2000轮跑完整HOI80：80 clips、23718 controls、最长629步，不被500步训练timeout截断。
+HOI80 canonical human/object/joint指标与TablesReward survival分开。
+当前机器人手部的contact cache须重新计算；提供CPU准备脚本，尚未提交Ultra全量准备、
+GPU capacity或正式训练。默认八rank/八L40，可显式两rank共卡使用四L40，global batch不变。
 
 ## HOI residual 扩展入口
 

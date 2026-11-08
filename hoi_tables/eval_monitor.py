@@ -1,10 +1,10 @@
-"""Sequential protected-22 checkpoint evaluation and its own W&B writer.
+"""SDK-free sequential protected-22 checkpoint evaluation scheduler.
 
-The active trainer, its frozen source and its training W&B run are read-only.
+The active trainer and its frozen source are read-only.
 Each immutable two-rank checkpoint pair gets one durable submission intent.
 An ambiguous sbatch reply is reconciled by unique job name, never resubmitted.
-Only a complete, manifest-bound 22-clip result is uploaded to the separate
-evaluation run, with eval/iteration as its explicit plotting axis.
+Only a complete, manifest-bound 22-clip result is accepted. The unified monitor
+publishes it to its owning training run with eval/iteration as the plotting axis.
 """
 from __future__ import annotations
 
@@ -13,16 +13,12 @@ from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import math
-import os
 from pathlib import Path
-import re
 import subprocess
 import time
 import zipfile
-from zoneinfo import ZoneInfo
 
-from .telemetry import (ASSETS, ENTITY, PROJECT, _ensure_private_project, _init, _sdk,
-                        atomic_json, exclusive_writer)
+from .telemetry import ASSETS, ENTITY, PROJECT, atomic_json
 
 PROTOCOL = "hoi_tables_full22_periodic_eval_v1"
 INTERVAL = 2000
@@ -210,18 +206,28 @@ class Slurm:
 
 class Supervisor:
     """Durable scheduler ledger, independent from SDK/network telemetry."""
+    protocol = PROTOCOL
+    expected_clips = staticmethod(expected_clips)
+    checkpoint_pair = staticmethod(checkpoint_pair)
+    validate_result = staticmethod(validate_result)
+    validate_parent = staticmethod(validate_parent)
+
+    def request_extra(self):
+        """Profile-specific immutable request bindings; empty for tables."""
+        return {}
+
     def __init__(self, root, campaign, training_root, source_root, training_source, parent_run_id,
                  *, slurm=None, train_job=None, resources=None):
         self.root, self.campaign, self.training_root = Path(root), Path(campaign), Path(training_root)
         self.source_root, self.training_source = Path(source_root), Path(training_source)
         self.parent_run_id, self.train_job = parent_run_id, train_job
-        validate_parent(self.training_root, parent_run_id)
+        self.validate_parent(self.training_root, parent_run_id)
         self.slurm, self.resources = slurm or Slurm(), resources or {}
         self.root.mkdir(parents=True, exist_ok=True)
         self.manifest = self.campaign/"input/manifest.json"
-        expected_clips(self.manifest)
+        self.expected_clips(self.manifest)
         self.state_path = self.root/"eval_supervisor.json"
-        self.identity = {"protocol": PROTOCOL, "parent_run_id": parent_run_id,
+        self.identity = {"protocol": self.protocol, "parent_run_id": parent_run_id,
                          "training_root": str(self.training_root.resolve()), "source_root": str(self.source_root.resolve()),
                          "training_source": str(self.training_source.resolve()), "manifest_sha256": sha256(self.manifest),
                          "eval_source_sha256": source_tree_hash(self.source_root)}
@@ -236,7 +242,7 @@ class Supervisor:
         for iteration in MILESTONES:
             key = str(iteration)
             if key in self.state["evaluations"]: continue
-            pair = checkpoint_pair(self.training_root, iteration)
+            pair = self.checkpoint_pair(self.training_root, iteration)
             if not all(complete_checkpoint(path) for path in pair.values()): continue
             directory = self.root/f"iter_{iteration:06d}"
             directory.mkdir(exist_ok=True)
@@ -247,7 +253,7 @@ class Supervisor:
                        "asset_bundle": str((self.campaign/"input/assets.json").resolve()),
                        "shape_bank": str((self.campaign/"input/shape_bank.json").resolve()),
                        "reference_contacts": str((self.campaign/"formal_inputs01/reference_contacts.pt").resolve()),
-                       "output": str((directory/"evaluation").resolve())}
+                       "output": str((directory/"evaluation").resolve()), **self.request_extra()}
             request_path = directory/"request.json"
             if request_path.exists():
                 existing = json.loads(request_path.read_text())
@@ -306,7 +312,7 @@ class Supervisor:
                         if status["state"] != "COMPLETED" or status["exitcode"] not in (0, None):
                             raise RuntimeError("GPU evaluation job did not complete successfully")
                         result_path = Path(request["output"])/"result.json"
-                        metrics = validate_result(result_path, request)
+                        metrics = self.validate_result(result_path, request)
                         entry.update(status="complete", metrics=metrics, result=str(result_path), result_sha256=sha256(result_path))
                     except Exception as error:
                         entry.update(status="failed", error_type=type(error).__name__, error=str(error),
@@ -340,152 +346,31 @@ class Supervisor:
         return self.state
 
 
-def _run_identity(root, training_root, parent_run_id, eval_id, name=None, train_job=None, source_root=None):
-    if not re.fullmatch(r"[A-Za-z0-9_-]{4,64}", eval_id) or eval_id == parent_run_id:
-        raise ValueError("Evaluation needs an independent run ID")
-    validate_parent(training_root, parent_run_id)
-    metadata_path = Path(training_root)/"run_metadata.json"
-    metadata = json.loads(metadata_path.read_text())
-    config = {"protocol": PROTOCOL, "eval_only": True, "parent_training_run_id": parent_run_id,
-              "parent_training_job_id": train_job, "eval_every": INTERVAL, "training_iterations": 20000,
-              "clip_count": 22, "per_asset_clips": 11, "eval_num_envs": 1, "seed": 0,
-              "no_failure_reset": True, "optimizer_updates": 0, "normalizer_updates": 0,
-              **{key: metadata[key] for key in ("source_sha256", "manifest_sha256", "asset_catalog_sha256",
-                                               "shape_bank_sha256", "reference_contacts_sha256") if key in metadata}}
-    for key in ("source_sha256", "manifest_sha256", "asset_catalog_sha256", "shape_bank_sha256", "reference_contacts_sha256"):
-        if key in config and not re.fullmatch(r"[a-f0-9]{64}", config[key]):
-            raise ValueError("Invalid parent training identity hash")
-    manifest_path = Path(training_root).parent/"input/manifest.json"
-    if manifest_path.exists():
-        manifest = json.loads(manifest_path.read_text())
-        if "cache" in manifest:
-            config["reference_cache_sha256"] = manifest["cache"]["sha256"]
-    if source_root is not None:
-        config["eval_source_sha256"] = source_tree_hash(source_root)
-    identity = {"id": eval_id, "entity": ENTITY, "project": PROJECT, "parent_run_id": parent_run_id,
-                "name": name or "tables_v1_eval-"+datetime.now(ZoneInfo("America/New_York")).strftime("%Y%m%d-%H%M%S"),
-                "parent_metadata_sha256": sha256(metadata_path), "protocol": PROTOCOL}
-    return identity, config
+
+DISABLED_WRITER = (
+    "Separate evaluation W&B writers are disabled; use python -m "
+    "hoi_tables.unified_monitor to merge evaluation into its owning training run"
+)
 
 
-def _check_registration(previous, identity):
-    if any(previous.get(k) != identity[k] for k in ("id", "entity", "project", "parent_run_id", "parent_metadata_sha256", "protocol")):
-        raise ValueError("Evaluation registration belongs to another run or parent training campaign")
+def register(*args, **kwargs):
+    """Reject the historical separate-run API without importing an SDK."""
+    raise RuntimeError(DISABLED_WRITER)
 
 
-def register(root, training_root, *, parent_run_id, eval_id, name=None, train_job=None, source_root=None, wandb_module=None):
-    root = Path(root)
-    with exclusive_writer(root):
-        identity, config = _run_identity(root, training_root, parent_run_id, eval_id, name, train_job, source_root)
-        path = root/"eval_wandb_registration.json"
-        if path.exists():
-            previous = json.loads(path.read_text()); _check_registration(previous, identity)
-            return previous
-        module = _sdk(wandb_module)
-        _ensure_private_project(module, ENTITY, PROJECT)
-        run = _init(module, root, identity, config, resume="never")
-        run.define_metric("eval/iteration")
-        run.define_metric("eval/*", step_metric="eval/iteration")
-        run.summary.update({"status": "waiting_for_checkpoints", "parent_training_run_id": parent_run_id})
-        run.finish(exit_code=0)
-        registration = {**identity, "url": run.url, "private_project": True}
-        atomic_json(path, registration)
-        return registration
+def monitor(*args, **kwargs):
+    """Reject the historical separate-run API without importing an SDK."""
+    raise RuntimeError(DISABLED_WRITER)
 
 
-def monitor(root, campaign, training_root, source_root, training_source, *, parent_run_id, eval_id,
-            name=None, train_job=None, poll_interval=30., resources=None, slurm=None, wandb_module=None, sleep=time.sleep):
-    root, run, phase = Path(root), None, "initializing"
-    try:
-        with exclusive_writer(root):
-            identity, config = _run_identity(root, training_root, parent_run_id, eval_id, name, train_job, source_root)
-            registration = json.loads((root/"eval_wandb_registration.json").read_text())
-            _check_registration(registration, identity)
-            identity["name"] = registration["name"]
-            module = _sdk(wandb_module)
-            run = _init(module, root, identity, config, resume="must")
-            run.define_metric("eval/iteration")
-            run.define_metric("eval/*", step_metric="eval/iteration")
-            logged = max(0, int(getattr(run, "step", 0))-1)
-            supervisor = Supervisor(root, campaign, training_root, source_root, training_source, parent_run_id,
-                                    slurm=slurm, train_job=train_job, resources=resources)
-            atomic_json(root/"eval_monitor_ready.json", {"id": eval_id, "parent_run_id": parent_run_id, "url": run.url})
-            while True:
-                phase = "scheduler_and_results"
-                state = supervisor.tick()
-                for iteration, entry in sorted((int(i), e) for i, e in state["evaluations"].items()):
-                    if entry["status"] == "complete" and iteration > logged:
-                        phase = "logging_full_evaluation"
-                        if sha256(entry["result"]) != entry["result_sha256"]:
-                            raise ValueError("Completed evaluation result changed before publication")
-                        verified_metrics = validate_result(entry["result"], supervisor._request(entry))
-                        run.log(verified_metrics, step=iteration, commit=True)
-                        logged = iteration
-                        run.summary.update({"status": "monitoring", "eval/iteration": iteration})
-                        atomic_json(root/"eval_wandb_cursor.json", {"id": eval_id, "last_logged_iteration": logged})
-                failed = [int(i) for i, e in state["evaluations"].items() if e["status"] == "failed"]
-                run.summary["eval/failed_milestones"] = failed
-                if state.get("finished"):
-                    exitcode = int(bool(state["parent_training_exitcode"] or failed or state["missing_milestones"]))
-                    run.summary.update({"status": "finished" if exitcode == 0 else "finished_with_failures",
-                                        "eval/missing_milestones": state["missing_milestones"],
-                                        "parent_training_exitcode": state["parent_training_exitcode"]})
-                    run.finish(exit_code=exitcode)
-                    atomic_json(root/"eval_monitor_done.json", {"id": eval_id, "exitcode": exitcode,
-                                                               "last_logged_iteration": logged,
-                                                               "missing_milestones": state["missing_milestones"],
-                                                               "failed_milestones": failed})
-                    return exitcode
-                sleep(poll_interval)
-    except Exception as error:
-        atomic_json(root/"eval_monitor_error.json", {"phase": phase, "error_type": type(error).__name__})
-        if run is not None:
-            try:
-                run.summary["status"] = "failed"
-                run.summary["failure_phase"] = phase
-                if "supervisor" in locals():
-                    run.summary["eval/failed_milestones"] = [int(i) for i, e in supervisor.state["evaluations"].items() if e["status"] == "failed"]
-                run.finish(exit_code=1)
-            except Exception: pass
-        return 1
-
-
-def main():
-    parser = argparse.ArgumentParser(__doc__)
-    parser.add_argument("--root", type=Path)
-    parser.add_argument("--campaign", type=Path)
-    parser.add_argument("--training-root", type=Path)
-    parser.add_argument("--source-root", type=Path)
-    parser.add_argument("--training-source", type=Path)
-    parser.add_argument("--parent-run-id", default="44ad3b72")
-    parser.add_argument("--eval-id")
-    parser.add_argument("--name")
-    parser.add_argument("--train-job")
-    parser.add_argument("--register-only", action="store_true")
+def main(argv=None):
+    parser = argparse.ArgumentParser(__doc__, epilog=DISABLED_WRITER)
     parser.add_argument("--validate-request", type=Path)
-    parser.add_argument("--poll-interval", type=float, default=30.)
-    parser.add_argument("--partition", default="batch")
-    parser.add_argument("--gres", default="gpu:a10:1")
-    args = parser.parse_args()
-    if args.validate_request:
-        validate_request(json.loads(args.validate_request.read_text()))
-        return 0
-    if args.root is None or args.training_root is None or args.eval_id is None:
-        parser.error("--root, --training-root and independent --eval-id are required")
-    if args.register_only:
-        try:
-            print(json.dumps(register(args.root, args.training_root, parent_run_id=args.parent_run_id, eval_id=args.eval_id,
-                                      name=args.name, train_job=args.train_job, source_root=args.source_root)))
-            return 0
-        except Exception as error:
-            atomic_json(args.root/"eval_monitor_error.json", {"phase": "registration", "error_type": type(error).__name__})
-            return 1
-    if args.campaign is None or args.source_root is None or args.training_source is None:
-        parser.error("Monitoring requires --campaign, --source-root and unchanged --training-source")
-    return monitor(args.root, args.campaign, args.training_root, args.source_root, args.training_source,
-                   parent_run_id=args.parent_run_id, eval_id=args.eval_id, name=args.name,
-                   train_job=args.train_job, poll_interval=args.poll_interval,
-                   resources={"partition": args.partition, "gres": args.gres})
+    args, unknown = parser.parse_known_args(argv)
+    if unknown or args.validate_request is None:
+        parser.error(DISABLED_WRITER)
+    validate_request(json.loads(args.validate_request.read_text()))
+    return 0
 
 
 if __name__ == "__main__":
