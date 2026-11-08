@@ -612,3 +612,31 @@ Current receipt: `queue_status_latest.json`; full before/after records and
 resource/source checks: `queue_candidates_20261108_01/verified.json`, under
 the Ultra campaign root. The original `two_l40_submission.json` remains the
 historical submission receipt, rather than being overwritten after migration.
+
+## Native trajectories from each periodic HOI80 evaluation
+
+The user requested recording before Ultra starts. `evaluate_hoi80` now saves
+all **80** cases during the original scheduled evaluation every2000 iterations,
+covering **23798 T+1 state frames / 23718 control intervals** at50Hz. The
+629-step case remains complete, including all post-failure states. Canonical
+COM-velocity initialization is applied before the first recorded frame.
+
+Each asset worker writes `trajectories/case_XXXXX.npz` and a JSON manifest
+inside its independent evaluation directory. The aggregate `result.json`
+indexes every file by relative path and SHA256. Saved fields include native
+38-link robot world poses, object poses/velocities, physical reference38 poses,
+71D actual/reference robot states, actions/rewards/failure flags, five-channel
+contacts and validity, exact reference-frame indices and the complete50Hz
+clock. Original canonical PHC39 source columns are also preserved separately.
+Native rendering poses use **wxyz**; the raw canonical reference retains its
+original **xyzw** layout. Coordinates retain their shared world frame, without
+trajectory alignment or reconstruction of actual links from joint FK.
+
+Manifests bind the owning run, all eight checkpoint hashes, model/RMS hashes,
+source/input identities, body order, clip IDs/durations and visual-asset paths.
+Missing, corrupted, substituted or truncated trajectories fail aggregation
+and the owning-run monitor's result validation. The recorder changes no
+policy/RMS/statistics and owns no simulation step or optimizer. Networks,
+observations, rewards, physics, data, learning batches and evaluation scoring
+remain unchanged. W&B continues receiving the same scalar `eval/*` metrics
+on the owning training run; raw trajectories and videos stay on the cluster.

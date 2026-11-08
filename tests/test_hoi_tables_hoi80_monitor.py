@@ -10,6 +10,7 @@ import zipfile
 
 from hoi_tables import hoi80_monitor as monitor
 from tests.test_hoi_tables_eval_monitor import FakeSlurm
+from tests.test_hoi_tables_trajectories import fixture_trajectory
 
 
 class HOI80MonitorTests(unittest.TestCase):
@@ -115,6 +116,10 @@ class HOI80MonitorTests(unittest.TestCase):
         report["per_asset"] = {asset: {"clip_count": sum(c["asset"] == asset for c in clips),
                     "control_steps": sum(c["control_steps"] for c in clips if c["asset"] == asset),
                     "metrics": self.metrics([c for c in clips if c["asset"] == asset])} for asset in monitor.ASSETS}
+        report.update(trajectory_schema=monitor.TRAJECTORY_SCHEMA,trajectory_count=80,recorded_state_frames=23798)
+        for clip in clips:
+            lane = self.control/f'asset_{monitor.ASSETS.index(clip["asset"]):02d}'
+            clip['trajectory'] = fixture_trajectory(lane,clip,report)
         return report
 
     def test_exact_heterogeneous80_and23718_not_ten_per_asset(self):
@@ -147,7 +152,7 @@ class HOI80MonitorTests(unittest.TestCase):
 
     def test_missing_cropped_reset_wrong_reference_and_frozen_state_fail(self):
         request = self.request(); original = self.result(request); path = self.control/"test-result.json"
-        for change in ("missing", "cropped", "reset", "source", "rank", "canonical", "normalizer", "policy", "rate"):
+        for change in ("missing", "cropped", "reset", "source", "rank", "canonical", "normalizer", "policy", "rate", "trajectory", "trajectory_count"):
             report = copy.deepcopy(original)
             if change == "missing": report["clips"].pop()
             if change == "cropped": report["clips"][0]["control_steps"] -= 1
@@ -158,6 +163,8 @@ class HOI80MonitorTests(unittest.TestCase):
             if change == "normalizer": report["normalizer_updates"] = 1
             if change == "policy": report["policy_state_sha256_after"] = "d"*64
             if change == "rate": report["metrics"]["joint_pass_rate"] = report["metrics"]["tables_reward_survival_rate"]
+            if change == "trajectory": report['clips'][0].pop('trajectory')
+            if change == "trajectory_count": report['trajectory_count'] = 79
             path.write_text(json.dumps(report))
             with self.assertRaises(ValueError, msg=change): monitor.validate_result(path, request)
 

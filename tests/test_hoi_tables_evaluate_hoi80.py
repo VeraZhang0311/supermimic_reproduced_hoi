@@ -16,6 +16,7 @@ from hoi_tables import evaluate_hoi80 as evaluation
 from hoi_tables.config import TrainConfig
 from hoi_tables.networks import feature_schema
 from tests.test_hoi_tables_evaluate import Motion,Environment,FrozenPolicy
+from tests.test_hoi_tables_trajectories import fixture_trajectory
 
 
 class CheckpointTests(unittest.TestCase):
@@ -91,7 +92,10 @@ def reports(root):
             "policy_state_sha256_before":"same","policy_state_sha256_after":"same",
             **dict.fromkeys(("no_normalizer_update","no_optimizer_update","full_reference_duration","no_failure_reset"),True),
             **dict.fromkeys(("optimizer_updates","normalizer_updates","replay_updates","rsi_updates"),0)}
-        folder=root/f"asset_{rank:02d}";folder.mkdir();(folder/"report.json").write_text(json.dumps(report));result.append(report)
+        folder=root/f"asset_{rank:02d}";folder.mkdir()
+        report['trajectory_schema'] = evaluation.TRAJECTORY_SCHEMA
+        for clip in local: clip['trajectory'] = fixture_trajectory(folder,clip,report)
+        (folder/"report.json").write_text(json.dumps(report));result.append(report)
     return result
 
 
@@ -106,6 +110,7 @@ class CoverageTests(unittest.TestCase):
             self.assertEqual(result["metrics"]["joint_pass_rate"],0.)
             self.assertEqual(result["metrics"]["tables_reward_survival_rate"],0.)
             self.assertEqual(max(c["control_steps"] for c in result["clips"]),629)
+            self.assertEqual((result['trajectory_count'],result['recorded_state_frames']),(80,23798))
 
     def test_truncated_629_clip_or_training_update_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -114,6 +119,12 @@ class CoverageTests(unittest.TestCase):
             values[0]["control_steps"]-=129
             (root/"asset_00/report.json").write_text(json.dumps(values[0]))
             with self.assertRaisesRegex(ValueError,"truncated"): evaluation.aggregate_reports(root)
+
+    def test_missing_native_trajectory_prevents_complete_evaluation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);values=reports(root)
+            (root/values[0]['clips'][0]['trajectory']['path']).unlink()
+            with self.assertRaisesRegex(ValueError,'missing'): evaluation.aggregate_reports(root)
 
     def test_canonical_recorder_initializes_after_reset_and_scores629_after_failure(self):
         motion=Motion(629);motion.entries[0]["clip_id"]="ultra/canonical-test"

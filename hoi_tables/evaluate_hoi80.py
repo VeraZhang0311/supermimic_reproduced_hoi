@@ -18,6 +18,7 @@ from .evaluate import (file_sha256, state_dict_hash, _canonical, _common_identit
                        rollout_clip, summarize as tracking_summary, FAILURE_DEFINITION,
                        SUCCESS_DEFINITION)
 from .experiments import ULTRA_ASSETS as ASSETS
+from .trajectories import SCHEMA as TRAJECTORY_SCHEMA, validate_trajectory
 
 SCHEMA = "hoi_ultra_hoi80_evaluation_v1"
 ASSET_SCHEMA = "hoi_ultra_hoi80_asset_evaluation_v1"
@@ -137,9 +138,10 @@ def load_checkpoints(root, iteration, *, manifest, asset_bundle, geometry_bundle
 
 class CanonicalRecorder:
     """Post-reset canonical COM-velocity initialization, then T+1 state capture."""
-    def __init__(self, env, reference, teacher_kin):
+    def __init__(self, env, reference, teacher_kin, trajectory=None):
         self.env, self.reference, self.teacher_kin = env, reference, teacher_kin
         self.states, self.objects, self.initialization = [], [], None
+        self.trajectory = trajectory
 
     def __getattr__(self, name): return getattr(self.env,name)
 
@@ -151,6 +153,8 @@ class CanonicalRecorder:
         q = mat_to_quat(obj[1])
         self.states.append(flatten_state(state)[0].detach().clone())
         self.objects.append(torch.cat((obj[0],q[:,1:],q[:,:1]),-1)[0].detach().clone())
+        if self.trajectory is not None:
+            self.trajectory.capture(self.env, state, obj)
 
     def reset(self, ids, frames):
         import numpy as np
@@ -164,6 +168,8 @@ class CanonicalRecorder:
 
     def step(self, action):
         out = self.env.step(action)
+        if self.trajectory is not None:
+            self.trajectory.control(action, out)
         self.record()
         return out
 
@@ -190,12 +196,14 @@ def aggregate_reports(root, output=None):
     common = ("iteration","checkpoint_sha256","model_state_sha256","parent_run_id","source_identity","smoke",
               "input_sha256","checkpoint_identity","manifest_sha256","canonical_sha256","eval_source_sha256",
               "expected_clip_ids","expected_clips","expected_control_steps","protocol_files_sha256",
-              "policy_state_sha256_before","policy_state_sha256_after")
+              "policy_state_sha256_before","policy_state_sha256_after","trajectory_schema")
     expected = reports[0].get("expected_clips",{})
     if len(expected)!=80 or sum(c["control_steps"] for c in expected.values())!=23718:
         raise ValueError("HOI80 report has an invalid expected panel")
     if reports[0].get("canonical_sha256")!=CANONICAL_SHA256 or reports[0].get("protocol_files_sha256")!=PROTOCOL_FILES:
         raise ValueError("HOI80 canonical manifest/scoring implementation identity changed")
+    if reports[0].get("trajectory_schema") != TRAJECTORY_SCHEMA:
+        raise ValueError("HOI80 requires full native trajectory recording")
     if set(reports[0].get("checkpoint_sha256",{}))!={f"rank_{i:02d}" for i in range(8)}:
         raise ValueError("HOI80 requires all eight checkpoint hashes")
     for rank,report in enumerate(reports):
@@ -232,6 +240,8 @@ def aggregate_reports(root, output=None):
             raise ValueError("HOI80 clip was truncated/reset/mis-scored")
     steps = sum(c["control_steps"] for c in clips)
     if steps!=23718 or steps!=reports[0]["expected_control_steps"]: raise ValueError("HOI80 control duration changed")
+    for clip in clips:
+        validate_trajectory(root, clip, reports[0], verify_payload=True)
     result = {key:reports[0][key] for key in common}
     result.update(schema=SCHEMA,passed=True,partition="protected_eval",clip_count=80,control_steps=steps,
                   no_normalizer_update=True,no_optimizer_update=True,full_reference_duration=True,no_failure_reset=True,
@@ -244,6 +254,8 @@ def aggregate_reports(root, output=None):
                   primary_success_definition="Pinned canonical PHC39 human/object/joint pose gates; distinct from TablesReward survival",
                   domain_randomization=False,nominal_properties=True,policy_deterministic=True,tracked_body_count=14,
                   canonical_scoring_body_count=39)
+    result["trajectory_count"] = len(clips)
+    result["recorded_state_frames"] = sum(c["state_frames"] for c in clips)
     if not result["smoke"] and result["iteration"]%2000: raise ValueError("Non-milestone scheduled report")
     _canonical(result)
     if output is not None:
@@ -321,10 +333,19 @@ def main():
     shape = points[args.asset:args.asset+1].to(args.device)
     panel = json.loads(Path(args.canonical).read_text(encoding="utf-8"))
     virtual = virtual_scorer(motion,panel,ASSETS[args.asset],args.device)
+    inputs = {name:file_sha256(getattr(args,name)) for name in ("manifest","asset_bundle","geometry_bundle","shape_bank","reference_contacts","canonical")}
+    from .trajectories import NativeTrajectory
+    trajectory_identity = {"iteration":args.iteration,"parent_run_id":args.parent_run_id,
+                           "checkpoint_sha256":pair["checkpoint_sha256"],"model_state_sha256":pair["model_state_sha256"],
+                           "source_identity":source,"canonical_sha256":CANONICAL_SHA256,"input_sha256":inputs,
+                           "asset_bundle":str(Path(args.asset_bundle).resolve()),"robot_urdf":teacher_kin.urdf_path,
+                           "robot_visual_urdf":str(Path(__file__).resolve().parents[1]/"data/g1_hw3/converted.urdf"),
+                           "robot_mesh_root":str(Path(__file__).resolve().parents[1]/"data/g1_hw3")}
     clips = []
     for clip,case in enumerate(motion.cases):
         reference = motion.load_reference(clip)
-        recorder = CanonicalRecorder(env,reference,teacher_kin)
+        trajectory = NativeTrajectory(motion,teacher_kin)
+        recorder = CanonicalRecorder(env,reference,teacher_kin,trajectory)
         record = rollout_clip(recorder,motion,mdp,privileged,policy,clip,teacher_kin,shape,assets[args.asset])
         states = unflatten_state(torch.stack(recorder.states))
         body = virtual(states)
@@ -333,6 +354,8 @@ def main():
         record.update(canonical_score,canonical_case_id=case["id"],canonical_index=case["canonical_index"],
                       motion_sha256=case["motion_sha256"],reference_sha256=case["reference_sha256"],
                       canonical_initialization=recorder.initialization,virtual39_common_fk=common)
+        record["trajectory"] = trajectory.save(output,record,trajectory_identity,reference)
+        validate_trajectory(output.parent,record,trajectory_identity,verify_payload=True)
         clips.append(record)
         print(json.dumps({"phase":"canonical_clip_complete","iteration":args.iteration,"clip_id":record["clip_id"],
                           "control_steps":record["control_steps"],"human_pass":record["human_pass"],
@@ -341,7 +364,6 @@ def main():
     if after!=before: raise RuntimeError("HOI80 changed policy/RMS tensors")
     if any(file_sha256(Path(args.checkpoint_root)/rank/f"checkpoint_{args.iteration:06d}.pt")!=digest for rank,digest in pair["checkpoint_sha256"].items()):
         raise RuntimeError("Evaluated checkpoint changed during rollout")
-    inputs = {name:file_sha256(getattr(args,name)) for name in ("manifest","asset_bundle","geometry_bundle","shape_bank","reference_contacts","canonical")}
     report = {"schema":ASSET_SCHEMA,"passed":True,"partition":"protected_eval","asset":ASSETS[args.asset],"asset_id":args.asset,
               "iteration":args.iteration,"parent_run_id":args.parent_run_id,"checkpoint_sha256":pair["checkpoint_sha256"],
               "model_state_sha256":pair["model_state_sha256"],"source_identity":source,"smoke":args.smoke,
@@ -357,6 +379,7 @@ def main():
               "success_definition":SUCCESS_DEFINITION,"failure_definition":deepcopy(FAILURE_DEFINITION),
               "native_physics":env.physics_report,"native_object":env.object_solver_report,"native_contacts":env.contacts.evidence,
               "native_capacity":capacity_readback(env.physics),"warp_runtime":warp_runtime}
+    report["trajectory_schema"] = TRAJECTORY_SCHEMA
     with (output/"report.json").open("x",encoding="utf-8") as stream: json.dump(report,stream,indent=2,allow_nan=False)
     print("ULTRA_HOI80_ASSET_EVALUATION_PASS",flush=True)
 

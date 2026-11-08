@@ -16,6 +16,7 @@ import re
 from . import eval_monitor as base
 from .experiments import ULTRA_ASSETS as ASSETS
 from .unified_monitor import owning_run
+from .trajectories import SCHEMA as TRAJECTORY_SCHEMA, validate_trajectory
 
 PROTOCOL = "hoi_ultra_full_canonical80_periodic_eval_v1"
 SCHEMA = "hoi_ultra_hoi80_evaluation_v1"
@@ -197,6 +198,11 @@ def validate_result(path, request):
             raise ValueError("HOI80 must score all post-action states and exclude the initial state")
     if report.get("control_steps") != CONTROL_STEPS:
         raise ValueError("HOI80 must score all 23718 control intervals")
+    if (report.get("trajectory_schema") != TRAJECTORY_SCHEMA or report.get("trajectory_count") != 80
+            or report.get("recorded_state_frames") != CONTROL_STEPS + 80):
+        raise ValueError("HOI80 must save all80 trajectories and23798 native state frames")
+    for clip in clips:
+        validate_trajectory(Path(path).parent, clip, report)
     metrics = {"eval/iteration": request["iteration"], "eval/clip_count": 80, "eval/control_steps": CONTROL_STEPS}
     metrics.update({"eval/"+key: value for key, value in base._numeric_metrics(report.get("metrics")).items()})
     rates = _check_rates(report["metrics"], clips)
