@@ -31,6 +31,11 @@ HOI80 canonical human/object/joint指标与TablesReward survival分开。
 获卡后先做完整零更新GPU capacity，全部通过后用新进程从零训练，当前尚未开始GPU验证/优化。
 仍用hoiretarget-tables project，Ultra训练run名称前缀ultra_boxes_v1-；完整HOI80只写回所属run。
 实际启动记录、冻结源码SHA和集群回执见TABLES.md，现有tables作业不修改、不重启。
+复用缓存打包1514101、真实16组consumer验证1514102已成功，全部2731条标签就绪，无几何重算。
+单卡预检1514103在并发H32 actor图时OOM，0优化更新，保留失败run30ff7c18。
+已仅修改同卡actor反传调度，完整batch/H32/数学/RMS/RNG等价测试及175项CPU回归通过。
+新source_memory01/formal_02作业1514391排队申请一张L40；暂估美东11月8日07:24，获卡后重新验收。
+GPU显存效果与正式训练尚未验证；标签缓存、当前机器人物理、网络与奖励公式均不变。
 
 ## HOI residual 扩展入口
 

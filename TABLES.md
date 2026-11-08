@@ -535,3 +535,23 @@ The complete CPU suite passed **175 tests** after this execution-order change,
 including the full H32 update/state/RNG equivalence and real Gloo scheduling
 checks. Cache-reuse adapter/source bytes remain unchanged from the already
 validated pack; the retry does not regenerate or repack reference labels.
+
+Latest retry snapshot:
+
+- Source `source_memory01`, revision `28cb5e9`, 151 manifest files; archive
+  SHA256 `ec5f5eeaa48210ebfae32221ac08aa76a0903c7ebbf8a3323f639785c488fea8`.
+  All 56 physics/network/reward/reference-loader source files match
+  `source_reuse01`; only execution scheduling and its metadata/tests changed.
+- Fresh campaign `formal_02`, **Slurm1514391**, **one L40**, eight asset ranks,
+  full global configuration. Existing cache SHA remains `b341769b…573d1e8`.
+- It is pending GPU resources, with Slurm's current tentative start
+  **November8 07:23:57 America/New_York**. This replaces the earlier
+  hypothetical queue estimate. No reference-label dependency remains.
+- The launcher must again pass the complete native zero-update production
+  capacity probe before constructing fresh formal processes. Single-GPU
+  capacity with the new memory schedule is **not yet verified**; formal
+  training has not started. No automatic resource or batch/horizon reduction.
+- Receipt: `memory_retry_submission.json`. Original failed preflight run
+  `30ff7c18` remains the historical record; the retry registers a fresh
+  `ultra_boxes_v1-...` training run on allocation, in `hoiretarget-tables`.
+  Full HOI80 every2000 is logged into that owning training run.
