@@ -353,7 +353,8 @@ all eight asset workers and the same global objective. Explicit values of two
 or one select four or eight GPUs, respectively; those are optional deployment
 topologies, not measured requirements. The complete
 production zero-update capacity probe must pass before fresh formal models
-are constructed. Ultra capacity and full training have **not** been run.
+are constructed. A successful Ultra capacity pass is required; earlier failed
+preflight attempts do not authorize formal optimizer updates.
 
 Ultra reuses the **existing v1.1 reference-contact targets**. The previous
 boxes runs already loaded `expected_contact` / `expected_valid` directly from
@@ -398,7 +399,7 @@ The manual project workspace includes three canonical HOI80 plots in
 `09 Eval - HOI80`, initially collapsed; existing training and protected22
 panels are preserved. Automatic panel creation remains disabled.
 
-Final validation: **167 tables/Ultra CPU tests passed**, including owning-run
+Final validation: **175 tables/Ultra CPU tests passed**, including owning-run
 logging/handoff, all-ten-milestone scheduling, eight-rank input/checkpoint
 contracts, full HOI80 duration, source freezing and launch preparation. All
 five new/updated scheduler scripts passed `bash -n`. Existing cluster Ultra
@@ -482,3 +483,55 @@ begin **ultra_boxes_v1-**; no evaluation-only run is created.
   A non-submitting single-GPU `sbatch --test-only` on November7, assuming
   labels ready immediately, predicted **November9 21:46 America/New_York**.
   This conditional scheduler estimate can move and is not a promised start.
+
+## Existing-cache reuse and single-GPU actor memory schedule
+
+The user then explicitly requested reuse of existing Ultra labels. Full
+recomputation `1513788` was canceled, and the dependent old GPU request was
+held and replaced. The train and eval bundles already contain all 2731 required
+reference-label records with matching motion SHA and T+1 frame counts.
+
+- Frozen reuse source `source_reuse01`, revision `2daa5f7`, 149 files; archive
+  SHA256 `b20bb80a92f9246fb3ad891f0d7b960e6f46aca3159c98e067127b856cafb6a7`.
+- Fast verification/repacking job **1514101** completed successfully in 64s.
+  It copied existing values for train2651 and canonical80, totaling **780322
+  state frames**; no geometric labels were recomputed.
+- Cache:
+  `/mnt/projects/ll/tianzizh/hoi_direct_ultra_inputs_v11_cached_v1/reference_contacts.pt`;
+  SHA256 `b341769b9d28b1d6c7852fb1355eb3a09e5acc77aa0905b0471b8aeeb573d1e8`.
+- CPU consumer job **1514102** passed all 16 real dataset/asset consumers,
+  verifying the complete train/eval inventory, identical normalized reward
+  provenance, original source values, correct local indexing and zero calls to
+  the exact-reference-geometry kernel. No model/statistics/replay updates.
+- Single-L40 preflight **1514103**, output `formal_01`, allocated successfully.
+  It registered owning training run **30ff7c18** in `hoiretarget-tables`, name
+  `ultra_boxes_v1-20261107-230612`; its unified logger was **1514106**. The
+  canonical80 supervisor initialized and no separate evaluation run was made.
+- That preflight hit CUDA OOM while eight ranks simultaneously retained their
+  H32 actor graphs. The card exposed 44.32GiB; processes used about 4.2–6.1GiB
+  each. The zero-update guard stopped it before formal training, with no
+  checkpoints or optimizer updates. Its failed run/reports are retained.
+
+The memory fix serializes only each shared GPU's **local actor forward/BPTT**.
+All eight assets, 4096 native environments, full local/global learning batches,
+H32, networks, reward formulae, observations, precision and optimizer counts are
+unchanged. Each rank computes the same full local gradient; all ranks then
+perform the original global gradient mean, clipping and Adam step together.
+RMS updates and critic/WM updates retain their original locations. Unused CUDA
+allocator segments are returned before the first turn and after each rank's
+backward; live parameters/gradients are retained. Tables defaults to the old
+parallel path and its running frozen source is untouched.
+
+H32 CPU equivalence tests compare gradients, model/RMS tensors, optimizer
+states, metrics and RNG against the original algorithm. Real 2/4-rank Gloo
+tests also verify one actor graph per logical GPU and coordinated failure
+propagation before any gradient synchronization or optimizer step. Runtime
+metadata records `actor_backward_schedule=serialized_per_gpu`. The cached
+v1.1 labels and their repacker code remain byte-identical, so they are reused
+without another preparation job. A fresh single-L40 production probe must
+pass before fresh formal training starts; current retry receipts follow.
+
+The complete CPU suite passed **175 tests** after this execution-order change,
+including the full H32 update/state/RNG equivalence and real Gloo scheduling
+checks. Cache-reuse adapter/source bytes remain unchanged from the already
+validated pack; the retry does not regenerate or repack reference labels.

@@ -81,6 +81,9 @@ class LaunchTests(unittest.TestCase):
         self.assertEqual(normalized['training']['num_envs'],4096)
         self.assertEqual(normalized['evaluation']['every'],2000)
         self.assertTrue(normalized['evaluation']['owning_training_run'])
+        metadata=json.loads((self.root/'single_l40/training/run_metadata.json').read_text())
+        self.assertEqual(metadata['experiment']['actor_backward_schedule'],'serialized_per_gpu')
+        self.assertEqual(curated_config(metadata)['experiment']['actor_backward_schedule'],'serialized_per_gpu')
 
     def test_missing_fresh_contact_cache_fails_before_creating_campaign(self):
         Path(self.paths['reference_contacts']).unlink();campaign=self.root/'missing'

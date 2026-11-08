@@ -63,7 +63,7 @@ def prepare(config, campaign, source, *, workers_per_gpu=None):
     if campaign.exists():raise FileExistsError('Use a new campaign; active runs are never overwritten')
     value=json.loads(config.read_text());name=value.get('profile')
     if value.get('schema')!=SCHEMA or name not in PROFILES:raise ValueError('Invalid experiment configuration')
-    from .train import build_parser
+    from .train import actor_backward_schedule, build_parser
     from .experiments import resolve_arguments
     args=build_parser().parse_args(['--experiment-config',str(config),'--output',str(campaign/'training')])
     if workers_per_gpu is not None:args.workers_per_gpu=workers_per_gpu
@@ -103,7 +103,8 @@ def prepare(config, campaign, source, *, workers_per_gpu=None):
     if name=='tables':metadata['protected_eval']=22
     else:metadata['train_source_groups']=raw_manifest['partitions']['train']['source_groups']
     metadata['experiment']={'profile':name,'assets':list(profile.assets),'evaluation':normalized['evaluation'],
-                            'workers_per_gpu':args.workers_per_gpu,'config_sha256':sha(config)}
+                            'workers_per_gpu':args.workers_per_gpu,'config_sha256':sha(config),
+                            'actor_backward_schedule':actor_backward_schedule(name,args.workers_per_gpu)}
     atomic_json(training/'run_metadata.json',metadata)
     receipt={'campaign':str(campaign),'source':str(frozen),'profile':name,'assets':list(profile.assets),
              'workers':profile.world_size,'workers_per_gpu':args.workers_per_gpu,

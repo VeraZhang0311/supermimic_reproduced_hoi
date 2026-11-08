@@ -1,10 +1,73 @@
-"""Synchronous two-asset learning, including real-data RMS moments."""
+"""Synchronous asset learning, including real-data RMS moments."""
 from __future__ import annotations
 
+from contextlib import contextmanager
 from types import MethodType
 import torch
 import torch.distributed as dist
 from supermimic.networks import RunningNorm
+
+
+def _release_cuda_cache():
+    if torch.cuda.is_available():
+        torch.cuda.synchronize(torch.cuda.current_device())
+        torch.cuda.empty_cache()
+
+
+@contextmanager
+def serialized_gpu_backward(workers_per_gpu, release=None):
+    """Run one full local backward at a time on each shared GPU.
+
+    Ranks assigned to different GPUs run the same turn concurrently. The body
+    must contain no distributed collectives: synchronize gradients and step
+    optimizers only after every rank leaves this context successfully. Caught
+    body/release errors are propagated after all turns and a CPU Gloo vote, so
+    healthy peers never proceed to an optimizer step while a rank has failed.
+    This preserves the complete local batch, graph and gradient calculation.
+    """
+    if type(workers_per_gpu) is not int or workers_per_gpu < 1:
+        raise ValueError("workers_per_gpu must be a positive integer")
+    if workers_per_gpu == 1 or not dist.is_available() or not dist.is_initialized():
+        yield
+        return
+    world, rank = dist.get_world_size(), dist.get_rank()
+    if world % workers_per_gpu:
+        raise ValueError("Distributed ranks must divide equally among shared GPUs")
+    if dist.get_backend() != "gloo":
+        raise ValueError("Serialized GPU backward requires the CPU Gloo process group")
+    release = _release_cuda_cache if release is None else release
+    failure = None
+    # Every process returns unused segments from the preceding WM phase
+    # before the first large actor graph claims the shared device's free RAM.
+    try:
+        release()
+    except BaseException as error:
+        failure = (error, error.__traceback__)
+    # No rank starts the large graph while a peer is still in the prior phase.
+    dist.barrier()
+    for turn in range(workers_per_gpu):
+        if rank % workers_per_gpu == turn:
+            try:
+                yield
+            except BaseException as error:
+                if failure is None:
+                    failure = (error, error.__traceback__)
+            finally:
+                try:
+                    release()
+                except BaseException as error:
+                    if failure is None:
+                        failure = (error, error.__traceback__)
+        # A failed body still reaches every barrier; peers finish their own
+        # turns before any rank can enter the caller's gradient collective.
+        dist.barrier()
+    failures = torch.tensor([int(failure is not None)], device="cpu", dtype=torch.int64)
+    dist.all_reduce(failures, op=dist.ReduceOp.SUM)
+    if failure is not None:
+        error, traceback = failure
+        raise error.with_traceback(traceback)
+    if failures.item():
+        raise RuntimeError(f"Serialized GPU backward failed on {failures.item()} peer rank(s)")
 
 
 def _sum(value):

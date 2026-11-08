@@ -23,6 +23,11 @@ def _parameter_hash(module):
     return digest.hexdigest()
 
 
+def actor_backward_schedule(profile, workers_per_gpu):
+    """Execution order only; batches, objective and optimizer steps are fixed."""
+    return "serialized_per_gpu" if profile == "ultra" and workers_per_gpu > 1 else "parallel"
+
+
 def build_parser():
     parser = argparse.ArgumentParser(__doc__)
     parser.add_argument("--experiment-config")
@@ -85,7 +90,7 @@ def main():
     from .replay import ReplayBuffer
     from .env import TableSim
     from .distributed import (broadcast_models, bind_distributed_statistics, synchronize_gradients,
-                              synchronize_contact_counts, state_hash)
+                              synchronize_contact_counts, state_hash, serialized_gpu_backward)
     experiment.topology(rank=rank, world=world, local_rank=int(os.environ.get("LOCAL_RANK",rank)),
                         workers_per_gpu=args.workers_per_gpu, shared_gpu=args.shared_gpu,
                         smoke=args.smoke, asset=args.asset, visible_devices=torch.cuda.device_count())
@@ -132,10 +137,12 @@ def main():
         bind_distributed_statistics(policy, wm, critic)
     torch.manual_seed(args.seed + rank)
     replay = ReplayBuffer(config.buffer_steps, config.num_envs, device, seed=args.seed+rank)
+    actor_schedule = actor_backward_schedule(experiment.name, topology["workers_per_gpu"])
+    actor_context = (lambda: serialized_gpu_backward(topology["workers_per_gpu"])) if actor_schedule == "serialized_per_gpu" else None
     learner = Learner(policy, wm, critic, motion, teacher_kin, reward, config, shapes=shapes, replay=replay,
                       gradient_sync=synchronize_gradients if world > 1 else None,
                       stats_sync=synchronize_contact_counts if world > 1 else None,
-                      distributed_normalizers=world > 1)
+                      distributed_normalizers=world > 1, actor_backward_context_factory=actor_context)
     solver_capacity = capacity_profile(args.nconmax, args.njmax, args.epa_horizon)
     sim_cfg = make_sim(device, args)
     configure_capacity(sim_cfg, solver_capacity)
@@ -153,6 +160,7 @@ def main():
     if experiment.name != "tables":
         identity["experiment"] = {"profile":experiment.name,"assets":list(experiment.assets),
                                   "workers_per_gpu":topology["workers_per_gpu"],
+                                  "actor_backward_schedule":actor_schedule,
                                   "geometry_bundle_sha256":hashlib.sha256(Path(args.geometry_bundle).read_bytes()).hexdigest(),
                                   "config_binding":experiment_binding,
                                   "evaluation":{"kind":experiment.evaluation,"every":2000,"owning_training_run":True}}

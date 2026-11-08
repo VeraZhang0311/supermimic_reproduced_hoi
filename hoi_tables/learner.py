@@ -5,6 +5,7 @@ All oracle features are rebuilt from each imagined state. Only reference
 targets and episode-constant physical context may come from the real start.
 """
 import math
+from contextlib import nullcontext
 
 import torch
 from torch import nn
@@ -34,12 +35,16 @@ def _finite(module, label):
 
 class Learner:
     def __init__(self, policy, wm, critic, motion, kin, reward, config=None, *, shapes=None, replay=None,
-                 gradient_sync=None, stats_sync=None, distributed_normalizers=False):
+                 gradient_sync=None, stats_sync=None, distributed_normalizers=False,
+                 actor_backward_context_factory=None):
         self.config = (config or TrainConfig()).validate()
         self.pi, self.wm, self.critic = policy, wm, critic
         self.motion, self.kin, self.reward = motion, kin, reward
         self.shapes, self.buffer = shapes, replay
         self.gradient_sync, self.stats_sync = gradient_sync, stats_sync
+        if actor_backward_context_factory is not None and not callable(actor_backward_context_factory):
+            raise TypeError("actor_backward_context_factory must create a fresh context manager")
+        self.actor_backward_context_factory = nullcontext if actor_backward_context_factory is None else actor_backward_context_factory
         # Distributed RunningNorm wrappers aggregate counts/moments and must
         # also participate for an empty local fit subset.
         self.distributed_normalizers = bool(distributed_normalizers)
@@ -285,21 +290,27 @@ class Learner:
         optimizer = self.optimizers["pi"]
         self.optimizers["wm"].zero_grad(set_to_none=True)
         self.optimizers["critic"].zero_grad(set_to_none=True)
-        with frozen_parameters(self.wm, self.critic):
-            trajectory = self.imagine(start)
-            loss = -trajectory["objective"]
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            if self.gradient_sync is not None:
-                self.gradient_sync(self.pi)
-            grad = nn.utils.clip_grad_norm_(self.pi.parameters(), 1.)
-            nn.utils.clip_grad_value_(self.pi.parameters(), .1)
-            if not bool(torch.isfinite(grad)):
-                raise FloatingPointError("Nonfinite actor BPTT gradient norm")
-            _finite(self.pi, "actor")
-            if any(p.grad is not None for module in (self.wm, self.critic) for p in module.parameters()):
-                raise RuntimeError("Actor BPTT must not populate WM or critic parameter gradients")
-            optimizer.step()
+        # Only local forward/BPTT may be serialized among ranks sharing a GPU.
+        # Forward reads RMS; no normalizer/statistics or gradient collective is
+        # allowed here. Each rank retains its complete local batch and H32.
+        with self.actor_backward_context_factory():
+            with frozen_parameters(self.wm, self.critic):
+                trajectory = self.imagine(start)
+                loss = -trajectory["objective"]
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                if any(p.grad is not None for module in (self.wm, self.critic) for p in module.parameters()):
+                    raise RuntimeError("Actor BPTT must not populate WM or critic parameter gradients")
+        # All ranks finish local BPTT before the same global gradient mean,
+        # clipping and one Adam step. Serialization never changes the update.
+        if self.gradient_sync is not None:
+            self.gradient_sync(self.pi)
+        grad = nn.utils.clip_grad_norm_(self.pi.parameters(), 1.)
+        nn.utils.clip_grad_value_(self.pi.parameters(), .1)
+        if not bool(torch.isfinite(grad)):
+            raise FloatingPointError("Nonfinite actor BPTT gradient norm")
+        _finite(self.pi, "actor")
+        optimizer.step()
         critic_loss = self.critic_update(trajectory, start)
         return {"pi_loss": float(loss.detach()), "v_loss": critic_loss, "pi_gradnorm": float(grad),
                 "imag_return_per_step": float(trajectory["reward"].detach().mean()),

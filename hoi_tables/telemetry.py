@@ -89,6 +89,8 @@ def curated_config(metadata):
                                 "evaluation_every": experiment["evaluation"]["every"],
                                 "evaluation_on_training_run": True,
                                 "evaluation_role": "canonical_development80" if experiment["profile"] == "ultra" else "protected_tables22"}
+        if experiment.get("actor_backward_schedule") in ("parallel", "serialized_per_gpu"):
+            result["experiment"]["actor_backward_schedule"] = experiment["actor_backward_schedule"]
     if metadata.get("from_scratch") is True:
         result["from_scratch"] = True
     if metadata.get("gpu_type") == "L40":
