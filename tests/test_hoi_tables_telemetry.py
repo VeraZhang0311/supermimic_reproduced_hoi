@@ -1,5 +1,6 @@
 """Offline W&B sidecar contracts; no SDK, credentials, login or network calls."""
 from contextlib import contextmanager
+from datetime import timezone
 import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -121,6 +122,24 @@ class TestTablesTelemetry(unittest.TestCase):
         self.assertIn("wm_val_contact_recall_left_hand_object", selected)
         with self.assertRaises(ValueError):
             telemetry._curated_metric(dict(row(1), wm_total=float("nan")))
+
+    def test_ultra_run_is_named_clearly_in_the_same_project(self):
+        value=metadata()
+        value['experiment']={'profile':'ultra','assets':['largebox_080_080_080'],
+                             'evaluation':{'kind':'canonical_hoi80','every':2000}}
+        (self.root/'run_metadata.json').write_text(json.dumps(value))
+        with self.assertRaisesRegex(ValueError,'ultra_boxes_v1-'):
+            telemetry._identity(self.root,entity=telemetry.ENTITY,project=telemetry.PROJECT,
+                                run_id='ultrafresh01',run_name=self.kwargs['run_name'])
+        with self.assertRaises(RuntimeError):
+            telemetry.register(self.root,**self.kwargs)
+        self.assertEqual(self.sdk.init_calls,[])
+        # Windows test runtimes may lack tzdata; cluster Linux has the zone.
+        with patch.object(telemetry,'ZoneInfo',return_value=timezone.utc):
+            registration=telemetry.register(self.root,run_id='ultrafresh01',wandb_module=self.sdk)
+        self.assertTrue(registration['name'].startswith('ultra_boxes_v1-'))
+        self.assertEqual(registration['project'],telemetry.PROJECT)
+        self.assertEqual(self.sdk.init_calls[0]['config']['experiment']['profile'],'ultra')
 
     def test_one_global_commit_per_common_iteration_including_wm_warmup(self):
         self.register()

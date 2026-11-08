@@ -103,9 +103,11 @@ def _identity(root, *, entity, project, run_id, run_name=None):
         raise ValueError("Invalid independent tables run ID")
     path = Path(root)/"run_metadata.json"
     metadata = json.loads(path.read_text(encoding="utf-8"))
-    name = run_name or "tables_v1-"+datetime.now(ZoneInfo("America/New_York")).strftime("%Y%m%d-%H%M%S")
-    if not re.fullmatch(r"tables_v1-[A-Za-z0-9_-]+", name):
-        raise ValueError("Tables run names must begin with tables_v1-")
+    profile = metadata.get("experiment", {}).get("profile", "tables")
+    prefix = "ultra_boxes_v1-" if profile == "ultra" else "tables_v1-"
+    name = run_name or prefix+datetime.now(ZoneInfo("America/New_York")).strftime("%Y%m%d-%H%M%S")
+    if not re.fullmatch(re.escape(prefix)+r"[A-Za-z0-9_-]+", name):
+        raise ValueError("Training run names must begin with "+prefix)
     return {"id": run_id, "entity": entity, "project": project, "name": name,
             "metadata_sha256": hashlib.sha256(path.read_bytes()).hexdigest()}, curated_config(metadata)
 

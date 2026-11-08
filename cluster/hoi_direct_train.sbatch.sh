@@ -57,7 +57,8 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 import secrets,sys
 print(secrets.token_hex(4))
-print('tables_v1-'+sys.argv[1]+'-'+datetime.now(ZoneInfo('America/New_York')).strftime('%Y%m%d-%H%M%S'))
+prefix='ultra_boxes_v1-' if sys.argv[1]=='ultra' else 'tables_v1-'
+print(prefix+datetime.now(ZoneInfo('America/New_York')).strftime('%Y%m%d-%H%M%S'))
 PY
 )
 PYTHONPATH="$COMPAT:$TELEMETRY/lib/python3.12/site-packages:$RUNTIME/lib/python3.12/site-packages:$SOURCE_ROOT" \
