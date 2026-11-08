@@ -664,6 +664,17 @@ global4096/WM2048/policy4096/H32/warmup500 and eight ranks over two GPUs.
 Deployment receipt: Ultra root `hoi80_trajectory_update_01/installed.json`.
 Tables1512413 retained its original start time and restart0 throughout.
 
+The same Ultra job subsequently obtained two L40s at `dj-l40-0` on November8,
+16:23:52 America/New_York. New owning run **d9189ee4** is named
+`ultra_boxes_v1-20261108-162506` in `hoiretarget-tables`. All eight full native
+zero-update capacity reports passed, the launcher saved `capacity_passed.json`,
+and fresh formal processes have produced actual `wm_only` optimization rows
+through iteration51. Warmup remains500. The formal frozen recorder bytes match
+`source_hoi80_trajectories_01`; evaluations will use this complete recording
+contract. Slurm allocation alone is not the evidence of optimization here.
+Subsequent server-side W&B readback confirms `running`, iteration67,
+stage`wm_only`, on the same owning run d9189ee4.
+
 ## Checkpoint6000 protected22 video delivery
 
 The original scheduled22-case result remains unchanged (SHA256
@@ -682,3 +693,53 @@ were delivered to local `results/tables_checkpoint6000_protected22_20261108`.
 Checks include full video decoding, every clip/bundle checksum,66 preview
 edge checks, all-frame camera projections and unchanged source/checkpoints/
 original evaluation. Raw native recordings remain on the cluster.
+
+## sub3_smalltable_027 foot/table penetration investigation
+
+The user's checkpoint6000 video observation is a **real collision-volume
+overlap**, not only artwork intersection. The original256-frame native-pose
+recording SHA is `e7e7e38ffc60bda67643b645789de224755de20bf24512861f6056612b3aac11`.
+At frame128 (2.56s), the right foot overlaps a convex table-leg segment by
+**19.495463 mm**; the maximum is **22.199047 mm** at frame156 (3.12s).
+There are158 saved states with overlap exceeding10mm. Frame0 is separated.
+
+The original recording was queried against both the exact bound source
+shapes and the actual native model exported from the same frozen evaluator.
+These results agree. An independent SciPy Minkowski-hull / capsule-radius
+calculation agrees within2.6e-9m at both sample frames and confirms that the
+capsule axis segment itself intersects the convex leg. No actual-state FK,
+trajectory alignment or physics replay was used for these measurements.
+
+Actual native geometry contains **44 closed, positive-volume table convex
+components**,3210 outward faces and zero inward faces. Both feet have seven
+analytic capsules, with8–10mm radii, enabled collision masks and the expected
+body-local transforms. Foot colliders therefore have no mesh winding to
+reverse. Their local Z coverage is approximately[-.035,-.015]m; shoe artwork
+extends to+.023584m. The unfilled upper artwork is a separate limitation,
+and does not explain away the confirmed capsule/table overlap.
+
+Measured foot/table native contact parameters are the default soft
+`solref=(.02,1)` and `solimp=(.9,.95,.001,.5,2)`, with foot sliding friction1.
+The table remains a4kg dynamic free rigid body; no attachment/following code
+is present. Soft-contact interpenetration followed by frictional dragging is
+the leading mechanism, rather than inverted mesh normals. A minimal **cluster
+MuJoCo3.15** compliance fixture gives9.631N at22mm overlap with defaults and
+37.240N with a stiffer pair probe. Those are fixture forces, **not measured
+forces from the full robot**. Reducing object `gap` from.01 to0 gives identical
+fixture forces/activation and is not credited as a fix.
+
+Full GPU force tracing job1517277 exported the native model, then failed to
+load a CCD CUDA module on the2080Ti (CUDA error200). It is not a successful
+GPU rollout. Completed CPU geometry jobs1517290/1517294/1517309 and independent
+fixture1517318 support the measurements above. A full-clip GPU A/B remains
+necessary before deploying a contact fix; the proposed first comparison is
+an isolated foot/table pair adjustment, retaining the robot/motor/soft-hand
+contract. No physics or running training was modified during this inspection.
+
+Cluster receipts: `collision_native_geometry_check_01/{geometry_summary.json,
+native_geometry.json,contact_activation_fixture.json}` under the tables root.
+Local figures/summaries: `results/tables_sub3_smalltable_027_collision_audit_20261108`.
+The clear figures use the same original saved poses, with shoe artwork in
+gray, physical capsules in green and the implicated convex leg segment in
+orange. Original scheduled6000 result SHA is still `e0fe62ee…b21271`;
+tables1512413 retained its original start time and restart0.

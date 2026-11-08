@@ -55,6 +55,11 @@ source_two_l40_01_before_trajectory_recording。作业号/提交时间与2×L40�
 eval仍只写所属训练run；物理、网络、奖励、观测、标签、500轮warmup和完整global batch不变。
 部署回执hoi80_trajectory_update_01/installed.json；tables1512413原始启动时间及restart0未变。
 Tables6000的22条视频已由独立A10作业1517200完成，原始评测及W&B指标未覆盖，交付见TABLES.md末节。
+Ultra1516579随后实际获得dj-l40-0两张L40，八rank capacity全部通过，已从零产生第51轮wm_only更新。
+所属run为d9189ee4，名称ultra_boxes_v1-20261108-162506，仍在hoiretarget-tables；500轮warmup不变。
+用户指出sub3_smalltable_027脚/桌腿穿透后，原视频与实际原生碰撞体CPU复核确认右脚最大22.199mm重叠，
+独立数学几何算法一致；44个桌子凸体均封闭且法线朝外，脚为7个薄鞋底胶囊体。软接触/摩擦拖带是主要嫌疑。
+2080Ti GPU力追踪因CUDA内核兼容性失败，不能称为完整GPU复现；未修改训练物理，完整证据及限制见TABLES.md。
 
 ## HOI residual 扩展入口
 
