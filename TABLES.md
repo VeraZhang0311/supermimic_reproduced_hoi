@@ -536,7 +536,7 @@ including the full H32 update/state/RNG equivalence and real Gloo scheduling
 checks. Cache-reuse adapter/source bytes remain unchanged from the already
 validated pack; the retry does not regenerate or repack reference labels.
 
-Latest retry snapshot:
+Historical single-card retry snapshot (superseded by the two-card retry below):
 
 - Source `source_memory01`, revision `28cb5e9`, 151 manifest files; archive
   SHA256 `ec5f5eeaa48210ebfae32221ac08aa76a0903c7ebbf8a3323f639785c488fea8`.
@@ -555,3 +555,30 @@ Latest retry snapshot:
   `30ff7c18` remains the historical record; the retry registers a fresh
   `ultra_boxes_v1-...` training run on allocation, in `hoiretarget-tables`.
   Full HOI80 every2000 is logged into that owning training run.
+
+## Two-L40 retry after the second capacity failure
+
+Single-card job **1514391** / `formal_02` / W&B **acdb6db4** failed in
+the native zero-update probe. All eight ranks completed ten WM backwards;
+rank7 ran out of memory during its H32 actor turn. The other ranks propagated
+that failure before any optimizer step. All eight reports confirm zero
+optimizer updates and unchanged model/RMS tensors; no formal iteration or
+checkpoint exists. The failed W&B run is retained as the failure record.
+
+The user explicitly authorized **two L40s**. New job **1516579** requests two
+cards, 32 CPUs, 192 GiB host memory and 96 hours; eight asset ranks now share
+four ranks per GPU. Source `source_two_l40_01`, revision **f3c533b**, is frozen
+separately, with output `formal_03`. All **146 Python/scheduler files** are
+byte-identical to `source_memory01`; only the Ultra config's execution topology
+changes. The cached labels, global4096/WM2048/policy4096/H32, 500 WM-only
+iterations, physics, network and rewards remain unchanged.
+
+The job must pass all eight full native capacity reports before fresh training
+processes start. It registers a new `ultra_boxes_v1-...` run in
+`hoiretarget-tables` on allocation; full HOI80 every2000 writes into that run.
+At **November8 09:23 America/New_York**, the job is pending priority; Slurm's
+tentative start is **November14 22:51:49 America/New_York**, subject to change.
+There is no new W&B run yet. Tables job1512413/run44ad3b72 remains running with
+restart count0. Deployment/status receipts: `two_l40_submission.json` and
+`two_l40_status.json` under the Ultra campaign root. Thirteen CPU routing and
+launch tests passed; two-card native capacity and formal training remain pending.

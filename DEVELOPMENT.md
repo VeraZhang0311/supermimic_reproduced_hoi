@@ -38,6 +38,9 @@ source_memory01/formal_02作业1514391已实际失败：10次WM反传通过，H3
 其W&B run为acdb6db4，正式迭代和优化更新均为0；保留失败报告，不将failed改写成running。
 单卡八个常驻仿真实例及replay留下的显存不足以容纳完整actor图，因此按用户授权申请两张L40。
 新任务仍保留同卡actor串行调度、原batch/H32及500轮WM warmup；标签缓存、物理、网络与奖励均不变。
+两卡任务已提交为1516579，独立source_two_l40_01/formal_03，冻结提交f3c533b；146份Python/调度文件与上次逐字节相同。
+11月8日09:23美东核验仍在Priority排队，Slurm暂估11月14日22:51:49；GPU验证和新W&B run均尚未开始。
+13项分卡/启动CPU回归通过；完整HOI80继续写回所属训练run。tables原作业restart=0且W&B正常running。
 
 ## HOI residual 扩展入口
 
