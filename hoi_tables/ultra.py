@@ -1,9 +1,10 @@
 """ULTRA inputs for the direct privileged teacher, without changing its objective.
 
 ULTRA retains its canonical, explicitly assumed 60 Hz source clock.  This module
-does not manufacture a tables/30 Hz manifest or inherit the historical robot or
-contact labels.  Existing object hulls, SDFs and FPS points are bound by bytes;
-reference contact intent is recomputed with the current hw3 collision geometry.
+does not manufacture a tables/30 Hz manifest or inherit the historical robot.
+Existing object hulls, SDFs and FPS points are bound by bytes. Reference intent
+can use the separately identified, user-authorized v1.1 cached targets; the
+historical exact-current-geometry cache reader remains available.
 """
 from __future__ import annotations
 
@@ -111,8 +112,9 @@ def _check_hands(evidence, hands=None):
 def load_ultra_assets(asset_bundle, geometry_bundle):
     """Return canonical sorted assets plus verified current-hand source binding.
 
-    Only object geometry/nominal properties are inherited.  Old asset IDs,
-    robot settings, FK, reference labels and native acceptance are not reused.
+    Only object geometry/nominal properties are inherited. Old asset IDs,
+    robot physics/FK and native acceptance are not reused. Label provenance
+    is selected separately by the reference-contact cache reader.
     """
     asset_bundle, geometry_bundle = Path(asset_bundle), Path(geometry_bundle)
     assets = _load_assets(asset_bundle)
@@ -128,7 +130,7 @@ def load_ultra_assets(asset_bundle, geometry_bundle):
         asset["geometry_cache"] = _binding(original["geometry_cache"], geometry_bundle.parent)
         load_geometry_cache(asset)
         asset["teacher_binding"] = {"catalog_sha256": catalog_sha, "geometry_bundle_sha256": geometry_sha,
-                                    "additional_runtime_scale": 1., "old_robot_or_labels_reused": False}
+                                    "additional_runtime_scale": 1., "historical_robot_physics_reused": False}
     hands = _binding(source["hands"]["geometry_cache"], geometry_bundle.parent)
     current, evidence = current_hands(hands)
     _check_hands(evidence, current)
@@ -334,6 +336,9 @@ def _record(motion, reward, index, chunk_size):
 def load_contact_cache(path, motion, assets, hands_binding):
     raw = Path(path).read_bytes()
     value = torch.load(io.BytesIO(raw), map_location="cpu", weights_only=True)
+    from .v11_reference_contacts import SCHEMA as REUSED_SCHEMA, load_reused_cache
+    if value.get("schema") == REUSED_SCHEMA:
+        return load_reused_cache(path, motion, assets, hands_binding, _raw=raw, _value=value)
     if (value.get("schema") != CONTACT_SCHEMA or value.get("complete") is not True
             or value.get("content_sha256") != _digest_json(_content(value))):
         raise ValueError("ULTRA reference contact cache schema/completeness/content mismatch")

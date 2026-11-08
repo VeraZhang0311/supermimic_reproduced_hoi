@@ -24,8 +24,9 @@ CPU unified writer `1513706` 在独立 `source_unified01` 继续写 tables 原�
 Ultra profile使用2651条 canonical train motion（381 source groups）、四类八个资产。
 每2000轮跑完整HOI80：80 clips、23718 controls、最长629步，不被500步训练timeout截断。
 HOI80 canonical human/object/joint指标与TablesReward survival分开。
-当前机器人手部的contact cache须重新计算。用户已授权启动：CPU准备作业1513788运行中；
-原四卡请求1513779已在排队时取消，替换为单L40作业1513885，依赖标签作业成功。
+用户已明确要求复用原v1.1接触标签，停止当前手部几何的全量重算；CPU作业1513788已取消。
+新适配缓存只校验并重打包既有train2651与canonical80 expected/valid，明确标记v1.1 reference intent来源。
+原四卡请求1513779已取消；原单卡1513885在更换缓存依赖和冻结源码期间hold，最新作业见TABLES.md。
 八个资产rank同卡运行（workers_per_gpu=8），4096环境和所有global batch不变。
 获卡后先做完整零更新GPU capacity，全部通过后用新进程从零训练，当前尚未开始GPU验证/优化。
 仍用hoiretarget-tables project，Ultra训练run名称前缀ultra_boxes_v1-；完整HOI80只写回所属run。

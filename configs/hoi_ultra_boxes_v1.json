@@ -6,7 +6,7 @@
     "asset_bundle": "/mnt/projects/ll/tianzizh/hoi_residual_ppo_20261106_01/input/assets/assets.json",
     "shape_bank": "/mnt/projects/ll/tianzizh/hoi_residual_ppo_20261106_01/input/shape_bank_v2.json",
     "geometry_bundle": "/mnt/projects/ll/tianzizh/supermimic_hoi_v1_development_20261023_15/results/contact5_ultrafoot_validation_20261023_01/bundle_train/bundle.json",
-    "reference_contacts": "/mnt/projects/ll/tianzizh/hoi_direct_ultra_inputs_v1/reference_contacts.pt"
+    "reference_contacts": "/mnt/projects/ll/tianzizh/hoi_direct_ultra_inputs_v11_cached_v1/reference_contacts.pt"
   },
   "training": {"num_envs": 4096, "iterations": 20000, "seed": 0},
   "execution": {"workers_per_gpu": 8},

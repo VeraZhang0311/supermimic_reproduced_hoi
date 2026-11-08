@@ -1,9 +1,9 @@
 #!/bin/bash
-#SBATCH --job-name=hoi-ultra-direct-inputs
+#SBATCH --job-name=hoi-ultra-v11-cache
 #SBATCH --partition=batch
-#SBATCH --cpus-per-task=16
-#SBATCH --mem=48G
-#SBATCH --time=12:00:00
+#SBATCH --cpus-per-task=2
+#SBATCH --mem=8G
+#SBATCH --time=01:00:00
 #SBATCH --no-requeue
 set -euo pipefail
 SOURCE_ROOT=${1:?Specify the committed source checkout}
@@ -15,15 +15,17 @@ export PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 OMP_NUM_THREADS=1 MKL_NUM_TH
 mapfile -t INPUTS < <(python - "$CONFIG" <<'PY'
 import json,sys
 v=json.load(open(sys.argv[1]));assert v['profile']=='ultra'
-for k in ('manifest','asset_bundle','geometry_bundle','shape_bank','reference_contacts'):print(v['paths'][k])
+for k in ('manifest','geometry_bundle','reference_contacts'):print(v['paths'][k])
 print(v['evaluation']['canonical']);print(v['evaluation']['helper_root'])
+from pathlib import Path
+print(Path(v['paths']['geometry_bundle']).resolve().parent.parent/'bundle_eval80/bundle.json')
 PY
 )
-test ! -e "${INPUTS[4]}"
-export PYTHONPATH="$SOURCE_ROOT:${INPUTS[6]}"
+test ! -e "${INPUTS[2]}"
+export PYTHONPATH="$SOURCE_ROOT:${INPUTS[4]}"
 cd "$SOURCE_ROOT"
-python -m hoi_tables.ultra preflight --manifest "${INPUTS[0]}" --asset-bundle "${INPUTS[1]}" \
- --geometry-bundle "${INPUTS[2]}" --shape-bank "${INPUTS[3]}" --canonical "${INPUTS[5]}"
-python -m hoi_tables.ultra prepare-contacts --manifest "${INPUTS[0]}" --asset-bundle "${INPUTS[1]}" \
- --geometry-bundle "${INPUTS[2]}" --shape-bank "${INPUTS[3]}" --canonical "${INPUTS[5]}" \
- --output "${INPUTS[4]}" --workers "$SLURM_CPUS_PER_TASK" --threads 1
+# Repackage the already-computed v1.1 task intent, with complete SHA/T+1 checks.
+# This path never recomputes hand/object reference geometry or runs FK.
+python -m hoi_tables.v11_reference_contacts --manifest "${INPUTS[0]}" \
+ --train-bundle "${INPUTS[1]}" --eval-bundle "${INPUTS[5]}" \
+ --canonical "${INPUTS[3]}" --helper-root "${INPUTS[4]}" --output "${INPUTS[2]}"
