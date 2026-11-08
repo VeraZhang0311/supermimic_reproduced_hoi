@@ -27,15 +27,17 @@ HOI80 canonical human/object/joint指标与TablesReward survival分开。
 用户已明确要求复用原v1.1接触标签，停止当前手部几何的全量重算；CPU作业1513788已取消。
 新适配缓存只校验并重打包既有train2651与canonical80 expected/valid，明确标记v1.1 reference intent来源。
 原四卡请求1513779已取消；原单卡1513885在更换缓存依赖和冻结源码期间hold，最新作业见TABLES.md。
-八个资产rank同卡运行（workers_per_gpu=8），4096环境和所有global batch不变。
-获卡后先做完整零更新GPU capacity，全部通过后用新进程从零训练，当前尚未开始GPU验证/优化。
+八个资产rank按最新用户授权改为两张L40、每卡四个rank（workers_per_gpu=4），4096环境和所有global batch不变。
+获卡后先做完整零更新GPU capacity，全部通过后用新进程从零训练。
 仍用hoiretarget-tables project，Ultra训练run名称前缀ultra_boxes_v1-；完整HOI80只写回所属run。
 实际启动记录、冻结源码SHA和集群回执见TABLES.md，现有tables作业不修改、不重启。
 复用缓存打包1514101、真实16组consumer验证1514102已成功，全部2731条标签就绪，无几何重算。
 单卡预检1514103在并发H32 actor图时OOM，0优化更新，保留失败run30ff7c18。
 已仅修改同卡actor反传调度，完整batch/H32/数学/RMS/RNG等价测试及175项CPU回归通过。
-新source_memory01/formal_02作业1514391排队申请一张L40；暂估美东11月8日07:24，获卡后重新验收。
-GPU显存效果与正式训练尚未验证；标签缓存、当前机器人物理、网络与奖励公式均不变。
+source_memory01/formal_02作业1514391已实际失败：10次WM反传通过，H32 actor阶段OOM。
+其W&B run为acdb6db4，正式迭代和优化更新均为0；保留失败报告，不将failed改写成running。
+单卡八个常驻仿真实例及replay留下的显存不足以容纳完整actor图，因此按用户授权申请两张L40。
+新任务仍保留同卡actor串行调度、原batch/H32及500轮WM warmup；标签缓存、物理、网络与奖励均不变。
 
 ## HOI residual 扩展入口
 

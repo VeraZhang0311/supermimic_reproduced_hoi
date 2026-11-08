@@ -348,10 +348,10 @@ Training remains global4096/H32/WM batch2048/policy batch4096, 20k iterations,
 training timeout is unchanged.
 
 The eight asset ranks share one logical model and synchronized statistics. The
-Ultra configuration now defaults to `workers_per_gpu=8` on **one L40**, keeping
-all eight asset workers and the same global objective. Explicit values of two
-or one select four or eight GPUs, respectively; those are optional deployment
-topologies, not measured requirements. The complete
+Ultra configuration now defaults to `workers_per_gpu=4` on **two L40s** after
+the user's explicit authorization following two failed single-card probes.
+All eight asset workers and the same global objective are retained. Explicit
+values of two or one select four or eight GPUs, respectively. The complete
 production zero-update capacity probe must pass before fresh formal models
 are constructed. A successful Ultra capacity pass is required; earlier failed
 preflight attempts do not authorize formal optimizer updates.

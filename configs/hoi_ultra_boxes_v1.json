@@ -9,7 +9,7 @@
     "reference_contacts": "/mnt/projects/ll/tianzizh/hoi_direct_ultra_inputs_v11_cached_v1/reference_contacts.pt"
   },
   "training": {"num_envs": 4096, "iterations": 20000, "seed": 0},
-  "execution": {"workers_per_gpu": 8},
+  "execution": {"workers_per_gpu": 4},
   "evaluation": {
     "kind": "canonical_hoi80",
     "every": 2000,
