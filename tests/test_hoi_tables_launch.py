@@ -73,6 +73,15 @@ class LaunchTests(unittest.TestCase):
         with self.assertRaises(FileExistsError):prepare(self.config_path,campaign,self.source)
         self.assertEqual(sentinel.read_text(),'active')
 
+    def test_single_l40_preparation_keeps_full_training_and_evaluation(self):
+        with patch.object(Path,'symlink_to',autospec=True,side_effect=fake_link):
+            result=prepare(self.config_path,self.root/'single_l40',self.source,workers_per_gpu=8)
+        self.assertEqual((result['workers'],result['workers_per_gpu'],result['gpus']),(8,8,1))
+        normalized=json.loads((self.root/'single_l40/experiment.json').read_text())
+        self.assertEqual(normalized['training']['num_envs'],4096)
+        self.assertEqual(normalized['evaluation']['every'],2000)
+        self.assertTrue(normalized['evaluation']['owning_training_run'])
+
     def test_missing_fresh_contact_cache_fails_before_creating_campaign(self):
         Path(self.paths['reference_contacts']).unlink();campaign=self.root/'missing'
         with self.assertRaisesRegex(FileNotFoundError,'reference_contacts'):prepare(self.config_path,campaign,self.source)

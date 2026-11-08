@@ -346,9 +346,11 @@ Training remains global4096/H32/WM batch2048/policy batch4096, 20k iterations,
 500 WM-only iterations and the existing adaptive RSI mixture. The 500-step
 training timeout is unchanged.
 
-The eight asset ranks share one model and synchronized statistics. Default
-`workers_per_gpu=1` requests eight L40s; an explicit value of two uses four L40s
-without changing the eight asset workers or global objective. The complete
+The eight asset ranks share one logical model and synchronized statistics. The
+Ultra configuration now defaults to `workers_per_gpu=8` on **one L40**, keeping
+all eight asset workers and the same global objective. Explicit values of two
+or one select four or eight GPUs, respectively; those are optional deployment
+topologies, not measured requirements. The complete
 production zero-update capacity probe must pass before fresh formal models
 are constructed. Ultra capacity and full training have **not** been run.
 
@@ -394,12 +396,12 @@ SRC=/absolute/committed/hoi-retarget-tables
 CFG=$SRC/configs/hoi_ultra_boxes_v1.json
 CAMPAIGN=/mnt/projects/ll/tianzizh/hoi_direct_ultra_v1_01
 prep=$(sbatch --parsable "$SRC/cluster/hoi_ultra_prepare.sbatch.sh" "$SRC" "$CFG")
-sbatch --dependency=afterok:$prep --gres=gpu:l40:8 \
+sbatch --dependency=afterok:$prep --gres=gpu:l40:1 \
   --output=/mnt/projects/ll/tianzizh/hoi_direct_ultra_v1_01-%j.log \
   "$SRC/cluster/hoi_direct_train.sbatch.sh" "$CAMPAIGN" "$SRC" "$CFG"
 ```
 
-The destination cache and campaign must be new. To select four GPUs, pass
+The destination cache and campaign must be new. The default is one GPU. To explicitly select four GPUs, pass
 `--export=ALL,HOI_WORKERS_PER_GPU=2 --gres=gpu:l40:4` to the training submission.
 `hoi_tables.launch` freezes source, links existing inputs read-only, writes
 profile metadata, and rejects existing campaigns. The launcher requires a
@@ -429,9 +431,15 @@ begin **ultra_boxes_v1-**; no evaluation-only run is created.
 - Original CPU attempt `1513778` was canceled during abnormally slow runtime
   initialization on `mp-2080ti-0`; no contact cache or optimizer update was
   produced. The pending training dependency was updated to the replacement.
-- L40 job **1513779**, requested **4×L40**, 32 CPUs / 192 GiB / 96 hours,
-  with **afterok:1513788**. Eight synchronized asset workers run two per GPU;
-  global4096, all batches/H32, 500 WM-only iterations and 20k total are retained.
+- Original L40 request **1513779** used four GPUs as a parallel deployment
+  choice, without single-GPU capacity evidence. After the user pointed out
+  their prior single-L40 v1.1 Ultra training, this still-pending request was
+  held and canceled before allocation. Contact preparation was not restarted.
+- Replacement **1513885** requests **1×L40**, 32 CPUs / 192 GiB / 96 hours,
+  with **afterok:1513788** and `HOI_WORKERS_PER_GPU=8`. All eight asset workers
+  map to CUDA0; global4096, WM batch2048, policy batch4096, H32, 500 WM-only
+  iterations and 20k total remain unchanged. Twenty targeted routing/launch/
+  capacity CPU tests passed. Actual single-L40 capacity is still unmeasured.
 - Its launcher refuses missing labels, freezes `formal_01/source`, registers
   a distinct Ultra training run in the shared project, and verifies the unified
   logger plus complete canonical80 scheduler before the zero-update native
@@ -447,3 +455,11 @@ begin **ultra_boxes_v1-**; no evaluation-only run is created.
   `contact_prepare_retry.json`, `training_submission.json`, `label_timing.json`;
   live preparation log: `contacts02-1513788.log`. Naming change passed all
   12 telemetry tests; current tables sources/jobs were not changed.
+- Current GPU receipt: `single_l40_submission.json`; the original
+  `training_submission.json` is retained as history. The frozen source config
+  is overridden explicitly by `HOI_WORKERS_PER_GPU=8`; normalization writes
+  eight workers per GPU into the eventual campaign configuration.
+- Actual Slurm start estimate is **N/A** while labels are a dependency.
+  A non-submitting single-GPU `sbatch --test-only` on November7, assuming
+  labels ready immediately, predicted **November9 21:46 America/New_York**.
+  This conditional scheduler estimate can move and is not a promised start.

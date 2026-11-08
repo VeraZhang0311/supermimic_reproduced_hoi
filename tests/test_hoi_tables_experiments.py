@@ -55,6 +55,18 @@ class ExperimentTests(unittest.TestCase):
         args,_,_ = self.resolve_json(self.config(),"--iterations","22000","--workers-per-gpu","1")
         self.assertEqual((args.iterations,args.workers_per_gpu,args.num_envs),(22000,1,4096))
 
+    def test_single_l40_keeps_all_eight_assets_and_full_global_configuration(self):
+        value=self.config();value['execution']['workers_per_gpu']=8
+        args,experiment,_=self.resolve_json(value)
+        workers=[experiment.topology(rank=i,world=8,local_rank=i,
+                                    workers_per_gpu=args.workers_per_gpu,visible_devices=1) for i in range(8)]
+        self.assertEqual([w['asset_id'] for w in workers],list(range(8)))
+        self.assertEqual([w['device_index'] for w in workers],[0]*8)
+        self.assertEqual([w['required_visible_devices'] for w in workers],[1]*8)
+        cfg=TrainConfig(num_envs=args.num_envs,iterations=args.iterations,seed=args.seed).validate()
+        self.assertEqual((cfg.num_envs,cfg.wm_batch,cfg.pi_batch,cfg.horizon,cfg.wm_only_iters),
+                         (4096,2048,4096,32,500))
+
     def test_rejects_scientific_overrides_and_separate_eval_run(self):
         value = self.config(); value["training"]["wm_only_iters"] = 12
         with self.assertRaisesRegex(ValueError,"Unsupported"): self.resolve_json(value)
