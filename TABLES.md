@@ -7,7 +7,8 @@ The entry point is `python -m hoi_tables.train`. Profiles are
 `configs/hoi_tables_v1.json` and `configs/hoi_ultra_boxes_v1.json`.
 Both publish periodic evaluation into their owning training W&B run under
 `eval/*`; neither creates an evaluation W&B run. The existing tables training
-job continues unchanged. Ultra training has not been submitted.
+job continues unchanged. The Ultra preparation/validation/training chain is
+submitted; its current launch snapshot is recorded below.
 
 ## Scientific contract
 
@@ -356,7 +357,7 @@ The old robot's contact labels cannot be reused. `hoi_tables.ultra` prepares
 2651 training references plus 80 evaluation references, with strict data,
 robot, geometry and implementation identities. These are reference labels,
 not policy rollouts. The configuration names a new cache destination; the
-full cache preparation has **not** been submitted.
+full cache preparation is now running in job `1513788`.
 
 Every 2000 iterations, `hoi_tables.hoi80_monitor.Supervisor` binds all eight
 same-iteration checkpoints and runs the **complete canonical HOI80** panel.
@@ -404,4 +405,45 @@ The destination cache and campaign must be new. To select four GPUs, pass
 profile metadata, and rejects existing campaigns. The launcher requires a
 healthy owning-run logger **and** evaluation scheduler before starting the
 capacity probe. Existing runtimes and active tables sources remain read-only.
-These commands are documented entry points; no Ultra training was submitted.
+These commands are reusable entry points; the current submission is below.
+
+## Authorized Ultra launch snapshot
+
+The user authorized contact preparation, L40 validation and subsequent fresh
+Ultra training, with the existing tables training left running. Both datasets
+use project **hoiretarget-tables**, with separate training runs. Ultra names
+begin **ultra_boxes_v1-**; no evaluation-only run is created.
+
+- Isolated deployment root:
+  `/mnt/projects/ll/tianzizh/hoi_ultra_boxes_teacher_20261107_01`.
+- Immutable staged source revision: `a03f15fb87203371f4165d64c67256383c66e5e5`;
+  147 manifest files, all 46 shared Python files equal to current tables.
+  Source archive SHA256:
+  `e74351e0bb20e9fab0d0a6ab841d75facad7c9ff294e13720b58e1ed24e2ae00`.
+- Active CPU reference preparation: **1513788**, 16 CPUs / 48 GiB on
+  `ee-a6000-1.grasp.maas`. Input preflight passed all eight assets, train2651,
+  canonical80 and 23718 canonical controls. All 16 workers are computing
+  unchanged exact current-hand labels. A short timing job `1513816` passed;
+  representative frames took 0.17–0.21 seconds each, so full preparation is
+  expected to require hours. This small timing sample is not a completion ETA.
+- Original CPU attempt `1513778` was canceled during abnormally slow runtime
+  initialization on `mp-2080ti-0`; no contact cache or optimizer update was
+  produced. The pending training dependency was updated to the replacement.
+- L40 job **1513779**, requested **4×L40**, 32 CPUs / 192 GiB / 96 hours,
+  with **afterok:1513788**. Eight synchronized asset workers run two per GPU;
+  global4096, all batches/H32, 500 WM-only iterations and 20k total are retained.
+- Its launcher refuses missing labels, freezes `formal_01/source`, registers
+  a distinct Ultra training run in the shared project, and verifies the unified
+  logger plus complete canonical80 scheduler before the zero-update native
+  capacity probe. All eight capacity reports must pass before fresh training
+  processes/models/RMS/optimizers/replay are constructed. No checkpoint resume.
+- Every2000, full HOI80 results go to that Ultra run under `eval/*`, using
+  `eval/iteration`. All eight checkpoints and all 80 original cases are bound.
+- At this snapshot, **labels are still computing; L40 validation and formal
+  optimizer updates have not begun**. All L40 nodes were allocated, and the
+  training job is pending its reference-preparation dependency. W&B registration
+  occurs inside the L40 launcher, so a new run ID is not claimed yet.
+- Root receipts: `staging.json`, `contact_prepare_submission.json`,
+  `contact_prepare_retry.json`, `training_submission.json`, `label_timing.json`;
+  live preparation log: `contacts02-1513788.log`. Naming change passed all
+  12 telemetry tests; current tables sources/jobs were not changed.

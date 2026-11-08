@@ -24,8 +24,11 @@ CPU unified writer `1513706` 在独立 `source_unified01` 继续写 tables 原�
 Ultra profile使用2651条 canonical train motion（381 source groups）、四类八个资产。
 每2000轮跑完整HOI80：80 clips、23718 controls、最长629步，不被500步训练timeout截断。
 HOI80 canonical human/object/joint指标与TablesReward survival分开。
-当前机器人手部的contact cache须重新计算；提供CPU准备脚本，尚未提交Ultra全量准备、
-GPU capacity或正式训练。默认八rank/八L40，可显式两rank共卡使用四L40，global batch不变。
+当前机器人手部的contact cache须重新计算。用户已授权启动：CPU准备作业1513788运行中；
+L40作业1513779依赖其成功，四L40/八rank（每卡两个worker）、global batch不变。
+获卡后先做完整零更新GPU capacity，全部通过后用新进程从零训练，当前尚未开始GPU验证/优化。
+仍用hoiretarget-tables project，Ultra训练run名称前缀ultra_boxes_v1-；完整HOI80只写回所属run。
+实际启动记录、冻结源码SHA和集群回执见TABLES.md，现有tables作业不修改、不重启。
 
 ## HOI residual 扩展入口
 
