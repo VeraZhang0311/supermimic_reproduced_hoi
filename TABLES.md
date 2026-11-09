@@ -1,5 +1,28 @@
 # Privileged tables and Ultra boxes teacher
 
+Tables training ended after scheduler preemption on2026-11-09; the user chose
+not to resume it. Both rank checkpoint8500 files are retained. Automatic
+preemption recovery is restricted to the Ultra profile and its existing owner.
+
+Ultra preemption recovery uses `hoi_tables/preemption.py` and the three
+`cluster/hoi_preemption_*.sbatch.sh` wrappers, staged separately from the frozen
+training/evaluation science. An afterany CPU handler acts only on PREEMPTED;
+application errors, OOM, cancellation and completion are never blindly retried.
+It audits the latest complete synchronized eight-rank snapshot (or the original
+checkpoint500 bundle), submits a held two-L40 attempt, arms its successor
+handler, then releases it. All learner/RMS/Adam/RSI/contact/RNG state restores;
+simulator/replay recreate with statistics-frozen prefill and no repeated warmup.
+Each new GPU allocation passes the existing full-size zero-update capacity gate.
+
+The owning W&B registration and canonical HOI80 evaluation ledger stay fixed.
+Telemetry performs a graceful handoff. Paired historical metric rows are
+retained; replayed iterations remain in each attempt's native logs until the
+original history frontier is exceeded, avoiding conflicting W&B event payloads.
+New checkpoints publish only as complete eight-rank sets. Unpaired metric tails
+and incomplete newer checkpoints are archived, never deleted. Full HOI80 still
+runs at absolute2000-iteration milestones and records trajectories into the same
+training run's eval section. A running trainer is never requeued to test this.
+
 Ultra recovery from checkpoint500 uses `configs/hoi_ultra_boxes_resume500_solver_v1.json`
 and `cluster/hoi_ultra_resume500.sbatch.sh`. The immutable eight-rank bundle binds
 the failed parent run, checkpoint bytes, source, all three networks/RMS, Adam
