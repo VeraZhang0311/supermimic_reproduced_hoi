@@ -1,0 +1,30 @@
+{
+  "schema": "hoi_direct_teacher_experiment_v1",
+  "profile": "ultra",
+  "paths": {
+    "manifest": "/mnt/projects/ll/tianzizh/hoi_residual_ppo_20261106_01/input/ultra_manifest.json",
+    "asset_bundle": "/mnt/projects/ll/tianzizh/hoi_residual_ppo_20261106_01/input/assets/assets.json",
+    "shape_bank": "/mnt/projects/ll/tianzizh/hoi_residual_ppo_20261106_01/input/shape_bank_v2.json",
+    "geometry_bundle": "/mnt/projects/ll/tianzizh/supermimic_hoi_v1_development_20261023_15/results/contact5_ultrafoot_validation_20261023_01/bundle_train/bundle.json",
+    "reference_contacts": "/mnt/projects/ll/tianzizh/hoi_direct_ultra_inputs_v11_cached_v1/reference_contacts.pt",
+    "resume_bundle": "/mnt/projects/ll/tianzizh/hoi_ultra_boxes_teacher_20261107_01/recovery500_01/resume500_bundle.json"
+  },
+  "training": {
+    "num_envs": 4096,
+    "iterations": 20000,
+    "seed": 0
+  },
+  "execution": {
+    "workers_per_gpu": 4
+  },
+  "evaluation": {
+    "kind": "canonical_hoi80",
+    "every": 2000,
+    "owning_training_run": true,
+    "canonical": "/mnt/projects/ll/tianzizh/supermimic_hoi_zeroshot/results/hoi80_inputs/manifest.json",
+    "helper_root": "/mnt/projects/ll/tianzizh/gmt26k_hoi80_zeroshot_20261106_03/source"
+  },
+  "solver": {
+    "ls_iterations": 200
+  }
+}

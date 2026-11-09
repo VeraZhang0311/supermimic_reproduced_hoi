@@ -56,6 +56,18 @@ class CheckpointTests(unittest.TestCase):
         self.checkpoints[7]["policy"]["norm.count"]+=1;self.save(7)
         with self.assertRaisesRegex(ValueError,"not synchronized"): self.load()
 
+    def test_explicit_continuation_is_evaluated_on_same_full80_contract(self):
+        from hoi_tables.resume import lineage
+        from hoi_tables.solver_health import policy
+        parent={'iteration':500,'parent_run_id':'parent00','bundle_sha256':'a'*64,
+                'records':[{'rank':i,'sha256':str(i)*64} for i in range(8)]}
+        for rank in range(8):
+            self.checkpoints[rank]['identity'].update(from_scratch=False,base_checkpoint=lineage(parent),solver_health=policy(200))
+            self.save(rank)
+        self.assertEqual(len(self.load()['checkpoint_sha256']),8)
+        self.checkpoints[7]['identity']['base_checkpoint']['repeat_wm_warmup']=True;self.save(7)
+        with self.assertRaisesRegex(ValueError,'continuation'):self.load()
+
     def test_wrong_asset_worker_batch_geometry_or_milestone_rejected(self):
         for key,value,match in (("asset_id",6,"protocol"),("world_size",2,"protocol"),("worker_config",TrainConfig().to_dict(),"worker batches")):
             old=self.checkpoints[7]["identity"][key];self.checkpoints[7]["identity"][key]=value;self.save(7)

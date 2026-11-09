@@ -91,8 +91,17 @@ def curated_config(metadata):
                                 "evaluation_role": "canonical_development80" if experiment["profile"] == "ultra" else "protected_tables22"}
         if experiment.get("actor_backward_schedule") in ("parallel", "serialized_per_gpu"):
             result["experiment"]["actor_backward_schedule"] = experiment["actor_backward_schedule"]
-    if metadata.get("from_scratch") is True:
-        result["from_scratch"] = True
+    if type(metadata.get('from_scratch')) is bool:
+        result['from_scratch'] = metadata['from_scratch']
+    if 'resume' in metadata:
+        from .resume import validate_lineage
+        validate_lineage({'from_scratch':False,'base_checkpoint':metadata['resume'],
+                          'solver_health':metadata['solver_health']})
+        result['resume'] = _safe_schema(metadata['resume'])
+        result['start_iteration'] = metadata['start_iteration']
+    if 'solver_health' in metadata:
+        from .solver_health import identity_policy
+        result['solver_health'] = identity_policy(metadata)
     if metadata.get("gpu_type") == "L40":
         result["gpu_type"] = "L40"
     return result

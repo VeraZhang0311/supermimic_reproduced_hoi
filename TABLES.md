@@ -1,5 +1,22 @@
 # Privileged tables and Ultra boxes teacher
 
+Ultra recovery from checkpoint500 uses `configs/hoi_ultra_boxes_resume500_solver_v1.json`
+and `cluster/hoi_ultra_resume500.sbatch.sh`. The immutable eight-rank bundle binds
+the failed parent run, checkpoint bytes, source, all three networks/RMS, Adam
+states, RSI, contact statistics and RNG. Robot/contact/motor code stays unchanged.
+The model-local numerical line-search budget is raised from50 to200; every native
+flag (including solver limits and unknown bits) and nonfinite state remains fatal.
+Failures save decoded world/asset/frame diagnostics before stopping.
+
+On two L40 GPUs, eight disposable workers first restore500, prefill64 real replay
+steps without updating normalizers, collect4096 real stress steps each, test the
+unchanged native hard guard, then run full-sized zero-update gradient/capacity
+validation. Only an all-rank pass allows W&B registration and fresh processes
+restoring the original500 again. Training starts at501, preserving the absolute
+LR schedule and2000-iteration full HOI80 milestones, with trajectories and eval
+scalars written into the owning continuation run. Simulator/replay are recreated;
+this is not bitwise simulator continuation. The tables training node is excluded.
+
 Branch `hoi-retarget/tables-boxes-v1.0` (renamed from `hoi-retarget/tables-v1.0`) starts at
 `codex/hoi-residual-ppo-teacher@78cd5b2c3530f9aa47b0c944436e59d5dc054093`.
 The existing `supermimic/` and `hoi_residual/` implementations are unchanged.

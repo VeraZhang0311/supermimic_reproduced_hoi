@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import torch
+from pathlib import Path
 
 from hoi_residual.env import HOISim
 from hoi_residual.features import ObjectHistory, object_observation, torso_pose
@@ -14,13 +15,16 @@ from .sampling import AdaptiveRSI
 
 class TableSim(HOISim):
     def __init__(self, sim_cfg, num_envs, motion, mdp, asset, output, *, teacher_kin,
-                 reward, eval_mode=False, max_episode_steps=500):
+                 reward, eval_mode=False, max_episode_steps=500, solver_ls_iterations=50):
         self.iteration, self.teacher_kin, self.reward_model = 0, teacher_kin, reward
+        self._solver_failure_output = Path(output)
         self.sampler = None if eval_mode else AdaptiveRSI(motion, asset_index=int(asset["asset_id"]))
         self._history_ready = False
         super().__init__(sim_cfg, num_envs, motion, mdp, asset, output,
                          eval_mode=eval_mode, max_episode_steps=max_episode_steps)
         self.contacts = PairContacts(self)
+        from .solver_health import configure
+        self.solver_health = configure(self,solver_ls_iterations)
         self.history = ObjectHistory(object_observation(torso_pose(teacher_kin, self.state()), self.object_state()))
         self.q_prev, self.qd_prev = (x.clone() for x in self.state()[4:])
         self.episode_id = torch.arange(self.N, device=self.device)
@@ -59,7 +63,13 @@ class TableSim(HOISim):
             raise ValueError("Table teacher requires finite direct [N,29] actions")
         S0, previous, f0 = self.state(), self.a_prev.clone(), self.f.clone()
         target = self.default_q + self.xi[:, 1:30] + self.alpha * action
-        contact, valid = self.contacts.step(target)
+        try:
+            contact, valid = self.contacts.step(target)
+        except RuntimeError as error:
+            if str(error) == 'native contact/constraint buffer overflow':
+                from .solver_health import raise_failure
+                raise_failure(self,error)
+            raise
         if self._check_object_after_step:
             self.object_solver_report = audit_object_solver(self)
             self.object_solver_checks += 1

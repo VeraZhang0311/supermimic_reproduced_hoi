@@ -51,6 +51,9 @@ def build_parser():
     parser.add_argument("--nconmax", type=int, default=512)
     parser.add_argument("--njmax", type=int, default=2048)
     parser.add_argument("--epa-horizon", type=int, default=64)
+    parser.add_argument('--ls-iterations',type=int,help='Explicit line-search budget; all native flags remain fatal')
+    parser.add_argument('--resume-bundle',help='Complete identity-bound parent checkpoint bundle')
+    parser.add_argument('--recovery-validation-steps',type=int,default=0,help='Disposable restored-policy real-control stress before full capacity probe')
     return parser
 
 
@@ -61,6 +64,9 @@ def main():
     experiment, experiment_binding = resolve_arguments(args)
     if args.capacity_only and args.smoke:
         parser.error("Capacity validation uses the formal configuration, not smoke overrides")
+    if args.recovery_validation_steps and (not args.capacity_only or not args.resume_bundle or args.recovery_validation_steps<4096):
+        parser.error('Recovery stress requires restored full capacity mode and at least4096 real steps')
+    if args.resume_bundle and args.smoke:parser.error('Continuation cannot change the formal learning configuration')
     if not os.environ.get("SLURM_JOB_ID"):
         raise RuntimeError("Run GPU workloads through the scheduler")
     rank, world = int(os.environ.get("RANK", 0)), int(os.environ.get("WORLD_SIZE", 1))
@@ -147,7 +153,7 @@ def main():
     sim_cfg = make_sim(device, args)
     configure_capacity(sim_cfg, solver_capacity)
     env = TableSim(sim_cfg, config.num_envs, motion, mdp, asset, output, teacher_kin=teacher_kin,
-                   reward=reward, max_episode_steps=32 if args.smoke else 500)
+                   reward=reward, max_episode_steps=32 if args.smoke else 500,solver_ls_iterations=args.ls_iterations)
     print(json.dumps({"rank":rank,"phase":"native_scene_ready","asset":asset["object_asset"]}),flush=True)
     identity = {"schema": feature_schema(), "physics": physics_contract(), "warp_runtime": warp_runtime,
                 "global_config": global_config.to_dict(), "worker_config": config.to_dict(),
@@ -164,23 +170,37 @@ def main():
                                   "geometry_bundle_sha256":hashlib.sha256(Path(args.geometry_bundle).read_bytes()).hexdigest(),
                                   "config_binding":experiment_binding,
                                   "evaluation":{"kind":experiment.evaluation,"every":2000,"owning_training_run":True}}
+    if args.ls_iterations!=50 or args.resume_bundle:
+        from .solver_health import policy as solver_policy
+        identity['solver_health']=solver_policy(args.ls_iterations)
+    start_iteration=0
+    resume_receipt=None
+    if args.resume_bundle:
+        from .resume import load_rank,restore,lineage
+        checkpoint,parent=load_rank(args.resume_bundle,rank,identity)
+        resume_receipt=restore(checkpoint,parent,learner,env)
+        start_iteration=checkpoint['iteration']
+        identity.update(from_scratch=False,base_checkpoint=lineage(parent))
+        env.reset(torch.arange(env.N,device=env.device))
+        del checkpoint
+        _json(output/'resume_receipt.json',resume_receipt)
     _json(output/"config.json", identity)
     resets = 0
     collected_steps = 0
     collection_stats = {"reward_sum": 0., "transitions": 0, "terminated": 0, "done": 0,
                         "episode_steps_sum": 0., "episode_return_sum": 0., "episodes": 0, "terms": {}}
-    def collect(steps):
+    def collect(steps, *, update_statistics=True):
         nonlocal resets, collected_steps
         for _ in range(steps):
             before = env.snapshot()
-            action = learner.action(before)
+            action = learner.action(before,update_statistics=update_statistics)
             result = env.step(action)
             after = env.snapshot()  # preserve terminal state before reset
             transition = {**before, "a": action, "s_next": after["s"], "o_next": after["o"],
                           "actuator_next": after["actuator"], "next_f": after["f"],
                           "done": result["done"], "r": result["reward"],
                           "contact": result["contact"], "contact_valid": result["contact_valid"]}
-            learner.observe(transition)
+            learner.observe(transition,update_statistics=update_statistics)
             collected_steps += 1
             collection_stats["reward_sum"] += float(result["reward"].sum())
             collection_stats["transitions"] += config.num_envs
@@ -199,9 +219,32 @@ def main():
                 env.reset(ids)
                 resets += len(ids)
     initial = {name: state_hash(module) for name, module in (("pi", policy), ("wm", wm), ("critic", critic))}
-    collect(config.warmup_steps)
+    collect(config.warmup_steps,update_statistics=not bool(args.resume_bundle))
+    if resume_receipt:
+        from .evaluate import state_dict_hash
+        after_prefill={name:state_dict_hash(module.state_dict()) for name,module in (('policy',policy),('wm',wm),('critic',critic))}
+        if after_prefill!=resume_receipt['models_and_rms_sha256']:raise RuntimeError('Fresh replay prefill changed restored model/RMS')
+        _json(output/'resume_prefill.json',{'passed':True,'real_steps':config.warmup_steps,'optimizer_updates':0,
+              'models_and_RMS_unchanged':True,'next_iteration':start_iteration+1,'repeat_wm_warmup':False})
     if args.capacity_only:
         from .capacity import validate_capacity, CapacityValidationError
+        if args.recovery_validation_steps:
+            from .recovery_checks import validate_native_guard
+            _json(output/'guard_validation.json',validate_native_guard(device))
+            from .evaluate import state_dict_hash
+            stress_before={name:state_dict_hash(module.state_dict()) for name,module in (('policy',policy),('wm',wm),('critic',critic))}
+            for tick in range(args.recovery_validation_steps):
+                env.iteration=start_iteration+int(tick*config.utd)
+                collect(1,update_statistics=False)
+                if (tick+1)%256==0:print(json.dumps({'rank':rank,'phase':'recovery_native_stress','real_steps':tick+1}),flush=True)
+            stress_after={name:state_dict_hash(module.state_dict()) for name,module in (('policy',policy),('wm',wm),('critic',critic))}
+            if stress_before!=stress_after:raise RuntimeError('Recovery stress changed model/RMS')
+            from hoi_residual.capacity import overflow_detail
+            native=overflow_detail(env.physics)
+            if native['overflow_world_count']:raise RuntimeError('Recovery stress has native flags')
+            _json(output/'recovery_stress_report.json',{'passed':True,'real_control_steps':args.recovery_validation_steps,
+                'physics_substeps':4*args.recovery_validation_steps,'environment_transitions':config.num_envs*args.recovery_validation_steps,
+                'optimizer_updates':0,'models_and_RMS_unchanged':True,'native':native,'solver_health':env.solver_health})
         print(json.dumps({"rank":rank,"phase":"production_capacity_begin"}),flush=True)
         try:
             report = validate_capacity(learner, replay, env, global_config,
@@ -215,10 +258,10 @@ def main():
             dist.barrier()
             dist.destroy_process_group()
         return
-    history, accumulator = [], 0.
+    history, accumulator = [], (start_iteration/config.utd)%1
     training_initial = {name: _parameter_hash(module) for name, module in (("pi", policy), ("wm", wm), ("critic", critic))}
     started = time.monotonic()
-    for iteration in range(1, config.iterations+1):
+    for iteration in range(start_iteration+1, config.iterations+1):
         env.iteration = iteration
         accumulator += 1/config.utd
         count, accumulator = int(accumulator), accumulator % 1
@@ -234,7 +277,7 @@ def main():
                        term_frac=collection_stats["terminated"] / transitions,
                        reset_frac=collection_stats["done"] / transitions,
                        wall_hours=(time.monotonic()-started)/3600,
-                       iterations_per_second=iteration/max(1e-6,time.monotonic()-started))
+                       iterations_per_second=(iteration-start_iteration)/max(1e-6,time.monotonic()-started))
         if collection_stats["episodes"]:
             metrics.update(ep_len=collection_stats["episode_steps_sum"]/collection_stats["episodes"],
                            ep_ret_norm=collection_stats["episode_return_sum"]/collection_stats["episodes"])

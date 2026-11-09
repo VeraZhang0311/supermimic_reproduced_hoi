@@ -99,9 +99,10 @@ def load_checkpoints(root, iteration, *, manifest, asset_bundle, geometry_bundle
         if checkpoint.get("schema")!="hoi_tables_checkpoint_v1" or checkpoint.get("iteration")!=iteration:
             raise ValueError("Direct-teacher checkpoint schema/iteration mismatch")
         identity = checkpoint.get("identity",{})
+        from .resume import validate_lineage
+        validate_lineage(identity)
         if (identity.get("schema")!=feature_schema() or identity.get("asset")!=asset or identity.get("asset_id")!=rank
-                or identity.get("world_size")!=8 or identity.get("from_scratch") is not True
-                or identity.get("base_checkpoint") is not None or identity.get("smoke") is not False
+                or identity.get("world_size")!=8 or identity.get("smoke") is not False
                 or identity.get("schedule_scope")!="500WM_then_fixed_actor_critic" or identity.get("physics")!=physics):
             raise ValueError("Ultra checkpoint physics/features/asset/direct-teacher protocol mismatch")
         experiment = identity.get("experiment",{})
@@ -327,8 +328,10 @@ def main():
     if before!=pair["model_state_sha256"]["policy"]: raise RuntimeError("Policy/RMS changed during device load")
     output.mkdir(parents=True,exist_ok=False)
     sim_cfg = make_sim(args.device,args); configure_capacity(sim_cfg,capacity_profile(512,2048,64))
+    from .solver_health import identity_policy
     env = TableSim(sim_cfg,1,motion,mdp,assets[args.asset],output,teacher_kin=teacher_kin,reward=reward,
-                   eval_mode=True,max_episode_steps=int(motion.clip_len.max())+1)
+                   eval_mode=True,max_episode_steps=int(motion.clip_len.max())+1,
+                   solver_ls_iterations=identity_policy(pair['identity'])['ls_iterations'])
     privileged = PrivilegedFeatures(teacher_kin,motion)
     shape = points[args.asset:args.asset+1].to(args.device)
     panel = json.loads(Path(args.canonical).read_text(encoding="utf-8"))

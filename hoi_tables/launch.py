@@ -71,11 +71,13 @@ def prepare(config, campaign, source, *, workers_per_gpu=None):
     if profile.world_size%args.workers_per_gpu:raise ValueError('Workers must divide equally among GPUs')
     inputs={key:Path(getattr(args,key)).resolve() for key in ('manifest','asset_bundle','shape_bank','reference_contacts')}
     if name=='ultra':inputs.update(geometry_bundle=Path(args.geometry_bundle).resolve(),canonical=Path(args.canonical).resolve())
+    if args.resume_bundle:inputs['resume_bundle']=Path(args.resume_bundle).resolve()
     for key,path in inputs.items():
         if not path.is_file():raise FileNotFoundError(f'Missing {key}: {path}; run reference-only preparation first')
     campaign.mkdir(parents=True);(campaign/'input').mkdir()
     destinations={'manifest':'manifest.json','asset_bundle':'assets.json','shape_bank':'shape_bank.json',
-                  'reference_contacts':'reference_contacts.pt','geometry_bundle':'geometry_bundle.json','canonical':'hoi80_manifest.json'}
+                  'reference_contacts':'reference_contacts.pt','geometry_bundle':'geometry_bundle.json','canonical':'hoi80_manifest.json',
+                  'resume_bundle':'resume_bundle.json'}
     paths={}
     for key,path in inputs.items():
         target=campaign/'input'/destinations[key];target.symlink_to(path);paths[key]=str(target)
@@ -105,11 +107,19 @@ def prepare(config, campaign, source, *, workers_per_gpu=None):
     metadata['experiment']={'profile':name,'assets':list(profile.assets),'evaluation':normalized['evaluation'],
                             'workers_per_gpu':args.workers_per_gpu,'config_sha256':sha(config),
                             'actor_backward_schedule':actor_backward_schedule(name,args.workers_per_gpu)}
+    if args.ls_iterations!=50 or args.resume_bundle:
+        from .solver_health import policy
+        metadata['solver_health']=policy(args.ls_iterations)
+    if args.resume_bundle:
+        from .resume import bundle,lineage
+        parent=bundle(inputs['resume_bundle'])
+        metadata.update(from_scratch=False,resume=lineage(parent),start_iteration=parent['iteration']+1)
     atomic_json(training/'run_metadata.json',metadata)
     receipt={'campaign':str(campaign),'source':str(frozen),'profile':name,'assets':list(profile.assets),
              'workers':profile.world_size,'workers_per_gpu':args.workers_per_gpu,
              'gpus':profile.world_size//args.workers_per_gpu,'input_sha256':{k:sha(v) for k,v in inputs.items()},
              'optimizer_updates':0,'gpu_job_started':False,'evaluation_owning_run':True}
+    if args.resume_bundle:receipt.update(resume=metadata['resume'],start_iteration=metadata['start_iteration'])
     atomic_json(campaign/'preparation.json',receipt)
     return receipt
 

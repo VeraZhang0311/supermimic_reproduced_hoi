@@ -93,24 +93,27 @@ def resolve_arguments(args):
         path = Path(args.experiment_config)
         payload = path.read_bytes()
         raw = json.loads(payload)
-        if raw.get("schema") != SCHEMA or set(raw)-{"schema","profile","paths","training","execution","evaluation"}:
+        if raw.get("schema") != SCHEMA or set(raw)-{"schema","profile","paths","training","execution","evaluation","solver"}:
             raise ValueError("Invalid direct-teacher experiment schema/fields")
         for key in ("paths", "training", "execution", "evaluation"):
             if not isinstance(raw.get(key), dict): raise ValueError("Experiment requires " + key)
-        allowed = {"paths":{"manifest","asset_bundle","shape_bank","reference_contacts","geometry_bundle"},
+        allowed = {"paths":{"manifest","asset_bundle","shape_bank","reference_contacts","geometry_bundle","resume_bundle"},
                    "training":{"num_envs","iterations","seed"}, "execution":{"workers_per_gpu"},
                    "evaluation":{"kind","every","owning_training_run","canonical","helper_root"}}
         for key, names in allowed.items():
             if set(raw[key])-names: raise ValueError("Unsupported experiment fields: " + key)
+        if not isinstance(raw.get('solver',{}),dict) or set(raw.get('solver',{}))-{'ls_iterations'}:
+            raise ValueError('Invalid explicit numerical solver budget')
         binding = {"schema":SCHEMA,"config_sha256":hashlib.sha256(payload).hexdigest()}
     selected = profile(args.profile or raw.get("profile", "tables"))
     evaluation = raw.get("evaluation", {})
     if evaluation and (evaluation.get("kind") != selected.evaluation or evaluation.get("every") != 2000
                        or evaluation.get("owning_training_run") is not True):
         raise ValueError("Evaluation must use the matching full panel every2000 on the owning training run")
-    defaults = {"num_envs":4096,"iterations":20000,"seed":0,"workers_per_gpu":1,"canonical":None,"helper_root":None}
+    defaults = {"num_envs":4096,"iterations":20000,"seed":0,"workers_per_gpu":1,"canonical":None,"helper_root":None,
+                'resume_bundle':None,'ls_iterations':50}
     values = {**raw.get("paths",{}), **raw.get("training",{}), **raw.get("execution",{}),
-              **{key:evaluation[key] for key in ("canonical","helper_root") if key in evaluation}}
+              **{key:evaluation[key] for key in ("canonical","helper_root") if key in evaluation},**raw.get('solver',{})}
     for name in ("manifest","asset_bundle","shape_bank","reference_contacts","geometry_bundle", *defaults):
         if getattr(args, name, None) is None: setattr(args, name, values.get(name,defaults.get(name)))
     for name in ("manifest","asset_bundle","shape_bank"):
@@ -120,6 +123,9 @@ def resolve_arguments(args):
     for name in ("num_envs", "iterations", "workers_per_gpu"):
         if type(getattr(args,name)) is not int or getattr(args,name)<1: raise ValueError(name+" must be a positive integer")
     if type(args.seed) is not int or args.seed<0: raise ValueError("seed must be nonnegative")
+    from .solver_health import policy
+    policy(args.ls_iterations)
+    if args.resume_bundle and selected.name!='ultra':raise ValueError('This continuation contract is Ultra-only')
     args.profile = selected.name
     if binding is not None:
         binding.update(profile=selected.name, assets=list(selected.assets), evaluation={"kind":selected.evaluation,"every":2000,"owning_training_run":True})
