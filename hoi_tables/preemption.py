@@ -80,7 +80,9 @@ class Scheduler:
         state=self.status(job)['state']
         if state=='PENDING':self.call(['scancel',str(job)])
         elif state in ('RUNNING','CONFIGURING','COMPLETING'):
-            self.call(['scancel','--signal=TERM','--full',str(job)])
+            # The batch shell execs the Python writer. Signal it alone so its
+            # SIGTERM handler can flush the still-live wandb-core child.
+            self.call(['scancel','--signal=TERM','--batch',str(job)])
     def release(self,job):
         if self.status(job)['state']!='PENDING':return
         detail=self.call(['scontrol','show','job','-o',str(job)])

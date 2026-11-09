@@ -171,6 +171,12 @@ class Tests(unittest.TestCase):
             self.assertNotIn('CUDA_VISIBLE_DEVICES',call.call_args.kwargs['env'])
             self.assertNotIn('ROCR_VISIBLE_DEVICES',call.call_args.kwargs['env'])
 
+    def test_logger_handoff_signals_only_parent_not_sdk_children(self):
+        scheduler=recovery.Scheduler()
+        with patch.object(scheduler,'status',return_value={'state':'RUNNING'}),patch.object(scheduler,'call') as call:
+            scheduler.stop_logger('200')
+        self.assertEqual(call.call_args.args[0],['scancel','--signal=TERM','--batch','200'])
+
     def test_counterfeit_checkpoint_set_is_not_considered_complete(self):
         for rank in range(8):
             p=self.actual/f'rank_{rank:02d}/checkpoint_001000.pt';p.parent.mkdir(parents=True,exist_ok=True);p.write_bytes(b'not a complete torch archive')
