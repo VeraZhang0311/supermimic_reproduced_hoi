@@ -103,3 +103,17 @@ class RecoveryTests(unittest.TestCase):
             path.write_text(json.dumps({'iteration':501,'stage':'actor_critic','wm_total':1.})+'\n')
             reader=JSONLReader(path);self.assertEqual(reader.poll(),1)
             self.assertEqual(set(reader.pending),{501})
+
+    def test_hundred_step_lineage_and_io_only_change_keep_science_strict(self):
+        value={'iteration':3700,'parent_run_id':'parent00','bundle_sha256':'a'*64,
+               'records':[{'rank':i,'sha256':str(i)*64} for i in range(8)]}
+        identity={'from_scratch':False,'base_checkpoint':resume.lineage(value),'solver_health':policy(200),
+                  'reward':{},'global_config':TrainConfig().to_dict(),'worker_config':TrainConfig().to_dict()}
+        resume.validate_lineage(identity)
+        changed=deepcopy(identity)
+        for key in ('global_config','worker_config'):changed[key]['ckpt_every']=100
+        self.assertEqual(resume._semantic(identity),resume._semantic(changed))
+        changed['global_config']['lr']*=2
+        self.assertNotEqual(resume._semantic(identity),resume._semantic(changed))
+        identity['base_checkpoint']['iteration']=3750
+        with self.assertRaises(ValueError):resume.validate_lineage(identity)

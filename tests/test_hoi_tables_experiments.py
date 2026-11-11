@@ -55,6 +55,19 @@ class ExperimentTests(unittest.TestCase):
         args,_,_ = self.resolve_json(self.config(),"--iterations","22000","--workers-per-gpu","1")
         self.assertEqual((args.iterations,args.workers_per_gpu,args.num_envs),(22000,1,4096))
 
+    def test_checkpoint_cadence_preserves_eval_and_supports_explicit_override(self):
+        args,_,binding=self.resolve_json(self.config())
+        self.assertEqual(args.checkpoint_every,100)
+        self.assertEqual(binding['evaluation']['every'],2000)
+        value=self.config();value['execution']['checkpoint_every']=100
+        args,_,_=self.resolve_json(value,'--checkpoint-every','500')
+        self.assertEqual(args.checkpoint_every,500)
+        tables=self.args('--manifest','m','--asset-bundle','a','--shape-bank','s')
+        resolve_arguments(tables);self.assertEqual(tables.checkpoint_every,500)
+        for bad in (0,True,50,300,100.0):
+            value=self.config();value['execution']['checkpoint_every']=bad
+            with self.assertRaisesRegex(ValueError,'checkpoint_every'):self.resolve_json(value)
+
     def test_single_l40_keeps_all_eight_assets_and_full_global_configuration(self):
         value=self.config();value['execution']['workers_per_gpu']=8
         args,experiment,_=self.resolve_json(value)

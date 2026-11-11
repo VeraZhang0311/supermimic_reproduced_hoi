@@ -98,7 +98,7 @@ def resolve_arguments(args):
         for key in ("paths", "training", "execution", "evaluation"):
             if not isinstance(raw.get(key), dict): raise ValueError("Experiment requires " + key)
         allowed = {"paths":{"manifest","asset_bundle","shape_bank","reference_contacts","geometry_bundle","resume_bundle"},
-                   "training":{"num_envs","iterations","seed"}, "execution":{"workers_per_gpu"},
+                   "training":{"num_envs","iterations","seed"}, "execution":{"workers_per_gpu","checkpoint_every"},
                    "evaluation":{"kind","every","owning_training_run","canonical","helper_root"}}
         for key, names in allowed.items():
             if set(raw[key])-names: raise ValueError("Unsupported experiment fields: " + key)
@@ -110,7 +110,8 @@ def resolve_arguments(args):
     if evaluation and (evaluation.get("kind") != selected.evaluation or evaluation.get("every") != 2000
                        or evaluation.get("owning_training_run") is not True):
         raise ValueError("Evaluation must use the matching full panel every2000 on the owning training run")
-    defaults = {"num_envs":4096,"iterations":20000,"seed":0,"workers_per_gpu":1,"canonical":None,"helper_root":None,
+    defaults = {"num_envs":4096,"iterations":20000,"seed":0,"workers_per_gpu":1,
+                "checkpoint_every":100 if selected.name=="ultra" else 500,"canonical":None,"helper_root":None,
                 'resume_bundle':None,'ls_iterations':50}
     values = {**raw.get("paths",{}), **raw.get("training",{}), **raw.get("execution",{}),
               **{key:evaluation[key] for key in ("canonical","helper_root") if key in evaluation},**raw.get('solver',{})}
@@ -123,6 +124,9 @@ def resolve_arguments(args):
     for name in ("num_envs", "iterations", "workers_per_gpu"):
         if type(getattr(args,name)) is not int or getattr(args,name)<1: raise ValueError(name+" must be a positive integer")
     if type(args.seed) is not int or args.seed<0: raise ValueError("seed must be nonnegative")
+    if (type(args.checkpoint_every) is not int or args.checkpoint_every<100
+            or args.checkpoint_every%100 or 2000%args.checkpoint_every):
+        raise ValueError('checkpoint_every must be a positive100-step multiple dividing the2000-step evaluation cadence')
     from .solver_health import policy
     policy(args.ls_iterations)
     if args.resume_bundle and selected.name!='ultra':raise ValueError('This continuation contract is Ultra-only')

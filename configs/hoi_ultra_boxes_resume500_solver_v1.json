@@ -15,7 +15,8 @@
     "seed": 0
   },
   "execution": {
-    "workers_per_gpu": 4
+    "workers_per_gpu": 4,
+    "checkpoint_every": 100
   },
   "evaluation": {
     "kind": "canonical_hoi80",

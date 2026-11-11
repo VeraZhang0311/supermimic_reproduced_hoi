@@ -181,3 +181,14 @@ class Tests(unittest.TestCase):
         for rank in range(8):
             p=self.actual/f'rank_{rank:02d}/checkpoint_001000.pt';p.parent.mkdir(parents=True,exist_ok=True);p.write_bytes(b'not a complete torch archive')
         self.assertEqual(recovery.complete_sets(self.actual),{})
+
+    @unittest.skipIf(os.name=='nt','Production checkpoint links are verified on Linux')
+    def test_hundred_step_checkpoint_is_published_and_selected_for_recovery(self):
+        for rank in range(8):metrics(self.logical,rank,[3501]);metrics(self.actual,rank,[3502])
+        bridge=recovery.Bridge(self.actual,self.logical)
+        for rank in range(8):checkpoint(self.actual,rank,3600)
+        for rank in range(7):checkpoint(self.actual,rank,3700)
+        bridge.flush()
+        self.assertEqual(max(recovery.complete_sets(self.logical)),3600)
+        checkpoint(self.actual,7,3700);bridge.flush()
+        self.assertEqual(max(recovery.complete_sets(self.logical)),3700)

@@ -102,6 +102,7 @@ def initialize(root,campaign,train_job,logger_job,helpers):
         'eval_control':str(campaign/'evaluation'),'fallback_bundle':str((campaign/'input/resume_bundle.json').resolve()),
         'fallback_bundle_sha256':sha(campaign/'input/resume_bundle.json'),
         'helpers':str(helpers),'helper_sha256':{p.name:sha(p) for p in helpers.iterdir() if p.suffix in ('.py','.sh')},
+        'checkpoint_every':metadata.get('global_config',{}).get('ckpt_every',100),
         'trigger_states':['PREEMPTED'],'gpu_type':'L40','gpus':2,'tables_auto_resume':False,'created_utc':utc()}
     atomic(root/'policy.json',value)
     atomic(root/'state.json',{'schema':SCHEMA,'current':{'attempt':0,'train_job':str(train_job),'logger_job':str(logger_job),
@@ -169,7 +170,7 @@ def complete_sets(training_root):
     from hoi_tables.eval_monitor import complete_checkpoint
     root=Path(training_root);ranks=[{int(p.stem.split('_')[-1]):p for p in (root/f'rank_{i:02d}').glob('checkpoint_*.pt') if complete_checkpoint(p)} for i in range(8)]
     common=set.intersection(*(set(r) for r in ranks))
-    return {i:[r[i] for r in ranks] for i in sorted(common) if i>=500 and i%500==0}
+    return {i:[r[i] for r in ranks] for i in sorted(common) if i>=500 and i%100==0}
 
 class Bridge:
     """Publish paired new metrics and complete checkpoint sets, preserving history."""
@@ -206,7 +207,7 @@ class Bridge:
         candidates={int(p.stem.split('_')[-1]) for p in (self.actual/'rank_00').glob('checkpoint_*.pt')}-self.published
         for iteration in sorted(candidates):
             paths=[self.actual/f'rank_{rank:02d}/checkpoint_{iteration:06d}.pt' for rank in range(8)]
-            if iteration%500 or not all(complete_checkpoint(p) for p in paths):continue
+            if iteration<500 or iteration%100 or not all(complete_checkpoint(p) for p in paths):continue
             # A previously published checkpoint is immutable, including on a
             # replay after preemption. New attempts start after that checkpoint.
             targets=[self.logical/f'rank_{rank:02d}/checkpoint_{iteration:06d}.pt' for rank in range(8)]
@@ -314,6 +315,7 @@ def handle(root,parent,scheduler=None):
         marker=Path(v['training_root'])/'training_exitcode'
         if marker.exists():marker.rename(attempt/'previous_training_exitcode')
         config=read(Path(v['campaign'])/'experiment.json');config['paths']['resume_bundle']=selected
+        config.setdefault('execution',{})['checkpoint_every']=v.get('checkpoint_every',100)
         atomic(attempt/'experiment.json',config)
         detail={'attempt':number,'previous_train_job':key,'resume_iteration':iteration,'metrics_frontier':frontier,
             'actual_training_root':str(attempt/'training'),'control':str(attempt/'logging'),
@@ -357,6 +359,7 @@ def logger(root,attempt):
             run=module.init(**kwargs)
             active['run']=run
             run.summary.update({'recovery/attempt':a['attempt'],'recovery/checkpoint_iteration':a['resume_iteration'],
+                'recovery/checkpoint_every':v.get('checkpoint_every',100),
                 'recovery/previous_job':a['previous_train_job'],'recovery/current_job':a['train_job'],
                 'recovery/replayed_metrics_retained_in_attempt_logs':True,'recovery/metrics_rejoin_iteration':a['metrics_frontier']+1})
             return run

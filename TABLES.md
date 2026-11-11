@@ -846,3 +846,18 @@ artwork and reference ghosts. A quarter-speed close-up uses those same saved
 frames. All videos fully decode; rendering uses zero simulation steps or
 policy inferences. Raw poses/contact traces stay on the cluster. B has not
 been deployed to either running training job.
+## Ultra checkpoint cadence100
+
+Ultra now saves a full eight-rank learner checkpoint every100 iterations;
+tables keeps its500 default. `execution.checkpoint_every` and the explicit
+`--checkpoint-every` argument control the cadence. Full HOI80 remains every2000
+iterations on the owning run, with all native trajectories retained.
+
+Recovery recognizes and publishes complete100-iteration snapshots, including
+3600/3700, and preserves all existing full-state checks. Only `ckpt_every` in
+global/worker configuration is excluded from scientific continuation identity;
+learning settings, data, physics, model/RMS/Adam/RSI/contact/RNG validation and
+the500-iteration WM warmup remain checked. The minimum recoverable iteration
+remains500. Existing source and evaluation artifacts stay immutable; a new
+execution snapshot and evaluation ledger retain the completed2000 request and
+result while binding future evaluations to the updated execution source.

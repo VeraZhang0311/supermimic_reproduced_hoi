@@ -46,6 +46,7 @@ def build_parser():
     parser.add_argument("--asset", type=int)
     parser.add_argument("--num-envs", type=int, help="Global environment count across all asset workers")
     parser.add_argument("--iterations", type=int)
+    parser.add_argument('--checkpoint-every',type=int,help='Checkpoint IO cadence; Ultra defaults to100, tables to500')
     parser.add_argument("--seed", type=int)
     parser.add_argument("--shared-gpu", action="store_true")
     parser.add_argument("--nconmax", type=int, default=512)
@@ -111,7 +112,7 @@ def main():
     torch.manual_seed(args.seed)
     torch.backends.cuda.matmul.allow_tf32 = True
     shared_networks.AMP_DTYPE = torch.bfloat16
-    config = TrainConfig(num_envs=args.num_envs, iterations=args.iterations, seed=args.seed)
+    config = TrainConfig(num_envs=args.num_envs, iterations=args.iterations, seed=args.seed,ckpt_every=args.checkpoint_every)
     if args.smoke:
         config = replace(config, experiment_kind="smoke", num_envs=args.num_envs,
                          iterations=3, buffer_steps=256, warmup_steps=64, wm_batches=1,

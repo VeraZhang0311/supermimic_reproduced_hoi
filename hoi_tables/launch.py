@@ -88,11 +88,12 @@ def prepare(config, campaign, source, *, workers_per_gpu=None):
     frozen=campaign/'source';manifest=freeze(source,frozen)
     normalized=json.loads(config.read_text());normalized['paths'].update({k:v for k,v in paths.items() if k!='canonical'})
     normalized['execution']['workers_per_gpu']=args.workers_per_gpu
+    normalized['execution']['checkpoint_every']=args.checkpoint_every
     if name=='ultra':normalized['evaluation']['canonical']=paths['canonical']
     atomic_json(campaign/'experiment.json',normalized)
     training=campaign/'training';training.mkdir()
     from .networks import feature_schema
-    run_config=TrainConfig(num_envs=args.num_envs,iterations=args.iterations,seed=args.seed).validate()
+    run_config=TrainConfig(num_envs=args.num_envs,iterations=args.iterations,seed=args.seed,ckpt_every=args.checkpoint_every).validate()
     metadata={'branch':manifest['branch'],'from_scratch':True,'global_config':asdict(run_config),
               'schema':feature_schema(),'gpu_type':'L40','gpus':profile.world_size//args.workers_per_gpu,
               'total_env':args.num_envs,'source_sha256':sha(frozen/'SOURCE_MANIFEST.json'),

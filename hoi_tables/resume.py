@@ -18,7 +18,7 @@ def bundle(path):
     path=Path(path);raw=path.read_bytes();value=json.loads(raw)
     if (value.get('schema')!='hoi_resume_bundle_v1' or value.get('passed') is not True
         or value.get('world_size')!=8 or value.get('assets')!=list(ULTRA_ASSETS)
-        or type(value.get('iteration')) is not int or value['iteration']<500 or value['iteration']%500
+        or type(value.get('iteration')) is not int or value['iteration']<500 or value['iteration']%100
         or value.get('replay_and_simulator_serialized') is not False):
         raise ValueError('Invalid complete Ultra continuation bundle')
     records=value.get('records',[])
@@ -42,7 +42,7 @@ def validate_lineage(identity):
     base=identity.get('base_checkpoint',{})
     if (identity.get('from_scratch') is not False or not isinstance(base,dict)
         or base.get('schema')!=SCHEMA or type(base.get('iteration')) is not int or base['iteration']<500
-        or base['iteration']%500 or base.get('fresh_replay_and_simulator') is not True
+        or base['iteration']%100 or base.get('fresh_replay_and_simulator') is not True
         or base.get('repeat_wm_warmup') is not False
         or not re.fullmatch('[a-f0-9]{64}',base.get('bundle_sha256',''))
         or not re.fullmatch('[A-Za-z0-9_-]{4,64}',base.get('parent_run_id',''))
@@ -56,6 +56,9 @@ def _semantic(identity):
     from .evaluate import _reward_identity
     result=deepcopy(identity)
     for name in ('from_scratch','base_checkpoint','solver_health'):result.pop(name,None)
+    # Saving more often changes IO only. Every learning/physics field remains
+    # part of the strict continuation comparison.
+    for name in ('global_config','worker_config'):result.get(name,{}).pop('ckpt_every',None)
     result['reward']=_reward_identity(result['reward'])
     result.get('experiment',{}).get('config_binding',{}).pop('config_sha256',None)
     return json.dumps(result,sort_keys=True,separators=(',',':'))
@@ -83,7 +86,7 @@ def load_rank(path,rank,current_identity, *, enforce_model_source=True):
         # must remain byte-identical; orchestration/diagnostic additions below
         # are the only reviewed exceptions.
         allowed={'hoi_tables/train.py','hoi_tables/env.py','hoi_tables/experiments.py','hoi_tables/launch.py',
-                 'hoi_tables/evaluate_hoi80.py','hoi_tables/telemetry.py'}
+                 'hoi_tables/evaluate_hoi80.py','hoi_tables/telemetry.py','hoi_tables/resume.py'}
         for name,digest in manifest['files'].items():
             if name.endswith('.py') and name.split('/')[0] in ('supermimic','hoi_residual','hoi_tables'):
                 if hashlib.sha256((source/name).read_bytes()).hexdigest()!=digest:raise ValueError('Parent source changed: '+name)
