@@ -379,7 +379,9 @@ def main():
             reference = references[clip]
             record, frames, controls = batch.clip(clip, motion.entries[clip])
             states = unflatten_state(frames["robot_state"])
-            objects = frames["object_state"]
+            # The trajectory keeps wxyz and velocities. Canonical scoring
+            # consumes only position and the original xyzw quaternion.
+            objects = torch.cat((frames["actual_object_pos"], frames["actual_object_quat"][:, [1, 2, 3, 0]]), dim=-1)
             initialization = dict(batch.initialization)
             for field in ("environment_ids", "canonical_object13", "native_link_velocity"):
                 initialization[field] = [initialization[field][clip]]
