@@ -53,7 +53,7 @@ for asset in {0..7}; do
     --iteration "${INPUTS[3]}" --manifest "${INPUTS[4]}" --asset-bundle "${INPUTS[5]}" \
     --shape-bank "${INPUTS[6]}" --reference-contacts "${INPUTS[7]}" --parent-run-id "${INPUTS[8]}" \
     --geometry-bundle "${INPUTS[9]}" --canonical "${INPUTS[10]}" --helper-root "${INPUTS[11]}" \
-    --asset "$asset" --device cuda:0 --output "$OUTPUT/asset_0$asset" \
+    --asset "$asset" --batch-clips --device cuda:0 --output "$OUTPUT/asset_0$asset" \
     2>&1 | tee "$OUTPUT/asset_0$asset.log"
 done
 python -m hoi_tables.evaluate_hoi80 --aggregate "$OUTPUT" --output "$OUTPUT/result.json"

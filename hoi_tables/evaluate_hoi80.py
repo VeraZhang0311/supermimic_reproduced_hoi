@@ -45,6 +45,10 @@ def validate_source(training_source, runtime=None):
     runtime = Path(runtime or Path(__file__).resolve().parents[1]).resolve()
     manifest_path = source/"SOURCE_MANIFEST.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    training_manifest_hash = file_sha256(manifest_path)
+    runtime_manifest_path = runtime/"SOURCE_MANIFEST.json"
+    runtime_manifest = (json.loads(runtime_manifest_path.read_text(encoding="utf-8"))
+                        if runtime_manifest_path.exists() else {})
     if manifest.get("branch") != "hoi-retarget/tables-boxes-v1.0" or not manifest.get("files"):
         raise ValueError("Invalid frozen tables-boxes source manifest")
     scientific = {}
@@ -53,17 +57,24 @@ def validate_source(training_source, runtime=None):
         if not target.is_relative_to(source) or not target.is_file() or file_sha256(target)!=digest:
             raise ValueError("Frozen training source changed: "+name)
         if name.endswith(".py") and name.split("/")[0] in ("hoi_tables","hoi_residual","supermimic"):
-            if not (runtime/name).is_file() or file_sha256(runtime/name)!=digest:
+            runtime_file = runtime/name
+            runtime_hash = file_sha256(runtime_file) if runtime_file.is_file() else None
+            if runtime_hash == digest:
+                scientific[name] = digest
+            elif (name != "hoi_tables/evaluate_hoi80.py" or runtime_hash is None
+                  or runtime_manifest.get("parent_source_manifest_sha256") != training_manifest_hash
+                  or runtime_manifest.get("files", {}).get(name) != runtime_hash):
                 raise ValueError("Evaluation differs from frozen training science: "+name)
-            scientific[name] = digest
     required = ("hoi_tables/networks.py","hoi_tables/learner.py","hoi_tables/train.py","hoi_tables/ultra.py",
                 "hoi_tables/reward.py","hoi_tables/native_checks.py")
     if any(name not in scientific for name in required): raise ValueError("Frozen scientific manifest is incomplete")
     from .eval_monitor import source_tree_hash
-    return {"training_source":str(source),"training_source_manifest_sha256":file_sha256(manifest_path),
+    return {"training_source":str(source),"training_source_manifest_sha256":training_manifest_hash,
             "matched_scientific_files":scientific,"evaluation_source":str(runtime),
-            "evaluation_source_manifest_sha256":file_sha256(runtime/"SOURCE_MANIFEST.json") if (runtime/"SOURCE_MANIFEST.json").exists() else None,
-            "evaluation_source_tree_sha256":source_tree_hash(runtime),"evaluation_module_sha256":file_sha256(__file__)}
+            "evaluation_source_manifest_sha256":file_sha256(runtime_manifest_path) if runtime_manifest else None,
+            "evaluation_source_tree_sha256":source_tree_hash(runtime),
+            "evaluation_module_sha256":file_sha256(runtime/"hoi_tables/evaluate_hoi80.py")
+            if (runtime/"hoi_tables/evaluate_hoi80.py").is_file() else file_sha256(__file__)}
 
 
 def expected_clips(binding):
@@ -273,6 +284,7 @@ def main():
     parser.add_argument("--output",required=True)
     parser.add_argument("--iteration",type=int)
     parser.add_argument("--asset",type=int,choices=range(8))
+    parser.add_argument("--batch-clips", action="store_true", help="Run all clips of the asset in parallel native worlds")
     parser.add_argument("--smoke",action="store_true")
     parser.add_argument("--device",default="cuda:0")
     parser.add_argument("--seed",type=int,default=0)
@@ -329,7 +341,8 @@ def main():
     output.mkdir(parents=True,exist_ok=False)
     sim_cfg = make_sim(args.device,args); configure_capacity(sim_cfg,capacity_profile(512,2048,64))
     from .solver_health import identity_policy
-    env = TableSim(sim_cfg,1,motion,mdp,assets[args.asset],output,teacher_kin=teacher_kin,reward=reward,
+    worlds = len(motion.cases) if args.batch_clips else 1
+    env = TableSim(sim_cfg,worlds,motion,mdp,assets[args.asset],output,teacher_kin=teacher_kin,reward=reward,
                    eval_mode=True,max_episode_steps=int(motion.clip_len.max())+1,
                    solver_ls_iterations=identity_policy(pair['identity'])['ls_iterations'])
     privileged = PrivilegedFeatures(teacher_kin,motion)
@@ -344,20 +357,40 @@ def main():
                            "asset_bundle":str(Path(args.asset_bundle).resolve()),"robot_urdf":teacher_kin.urdf_path,
                            "robot_visual_urdf":str(Path(__file__).resolve().parents[1]/"data/g1_hw3/converted.urdf"),
                            "robot_mesh_root":str(Path(__file__).resolve().parents[1]/"data/g1_hw3")}
+    batch = None
+    if args.batch_clips:
+        from .hoi80_batch import rollout_asset
+        references = [motion.load_reference(clip) for clip in range(len(motion.cases))]
+        print(json.dumps({"phase": "canonical_asset_batch_start", "asset": ASSETS[args.asset],
+                          "parallel_environments": worlds}), flush=True)
+        batch = rollout_asset(env, motion, mdp, privileged, policy, teacher_kin, shape,
+                              assets[args.asset], references)
     clips = []
     for clip,case in enumerate(motion.cases):
-        reference = motion.load_reference(clip)
-        trajectory = NativeTrajectory(motion,teacher_kin)
-        recorder = CanonicalRecorder(env,reference,teacher_kin,trajectory)
-        record = rollout_clip(recorder,motion,mdp,privileged,policy,clip,teacher_kin,shape,assets[args.asset])
-        states = unflatten_state(torch.stack(recorder.states))
+        if batch is None:
+            reference = motion.load_reference(clip)
+            trajectory = NativeTrajectory(motion,teacher_kin)
+            recorder = CanonicalRecorder(env,reference,teacher_kin,trajectory)
+            record = rollout_clip(recorder,motion,mdp,privileged,policy,clip,teacher_kin,shape,assets[args.asset])
+            states = unflatten_state(torch.stack(recorder.states))
+            objects = torch.stack(recorder.objects)
+            initialization = recorder.initialization
+        else:
+            reference = references[clip]
+            record, frames, controls = batch.clip(clip, motion.entries[clip])
+            states = unflatten_state(frames["robot_state"])
+            objects = frames["object_state"]
+            initialization = dict(batch.initialization)
+            for field in ("environment_ids", "canonical_object13", "native_link_velocity"):
+                initialization[field] = [initialization[field][clip]]
         body = virtual(states)
         common = virtual.audit_common_positions(body,teacher_kin.forward(states)[0],teacher_kin.body_names)
-        canonical_score = score(body,torch.stack(recorder.objects),reference,dt=.02)
+        canonical_score = score(body,objects,reference,dt=.02)
         record.update(canonical_score,canonical_case_id=case["id"],canonical_index=case["canonical_index"],
                       motion_sha256=case["motion_sha256"],reference_sha256=case["reference_sha256"],
-                      canonical_initialization=recorder.initialization,virtual39_common_fk=common)
-        record["trajectory"] = trajectory.save(output,record,trajectory_identity,reference)
+                      canonical_initialization=initialization,virtual39_common_fk=common)
+        record["trajectory"] = (trajectory.save(output,record,trajectory_identity,reference) if batch is None
+                                else batch.save(output,frames,controls,record,trajectory_identity,reference))
         validate_trajectory(output.parent,record,trajectory_identity,verify_payload=True)
         clips.append(record)
         print(json.dumps({"phase":"canonical_clip_complete","iteration":args.iteration,"clip_id":record["clip_id"],
@@ -381,7 +414,8 @@ def main():
               "domain_randomization":False,"nominal_properties":True,"policy_deterministic":True,"seed":args.seed,
               "success_definition":SUCCESS_DEFINITION,"failure_definition":deepcopy(FAILURE_DEFINITION),
               "native_physics":env.physics_report,"native_object":env.object_solver_report,"native_contacts":env.contacts.evidence,
-              "native_capacity":capacity_readback(env.physics),"warp_runtime":warp_runtime}
+              "native_capacity":capacity_readback(env.physics),"warp_runtime":warp_runtime,
+              "parallel_environments":worlds}
     report["trajectory_schema"] = TRAJECTORY_SCHEMA
     with (output/"report.json").open("x",encoding="utf-8") as stream: json.dump(report,stream,indent=2,allow_nan=False)
     print("ULTRA_HOI80_ASSET_EVALUATION_PASS",flush=True)
