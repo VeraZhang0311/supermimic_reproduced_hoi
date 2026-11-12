@@ -28,14 +28,23 @@ PY
 )
 OUTPUT=${INPUTS[0]}
 mkdir "$OUTPUT"
-finish() { code=$?; printf '%s\n' "$code" > "$OUTPUT/worker_exitcode"; exit "$code"; }
+eval_tmp=""
+finish() {
+  code=$?
+  if [[ -n "$eval_tmp" ]]; then rm -rf -- "$eval_tmp" || true; fi
+  printf '%s\n' "$code" > "$OUTPUT/worker_exitcode"
+  exit "$code"
+}
 trap finish EXIT
 trap 'exit 143' TERM
 trap 'exit 130' INT
 export PYTHONPATH="$SOURCE_ROOT:${INPUTS[11]}"
 export WARP_CACHE_PATH="$OUTPUT/cache/warp" TORCHINDUCTOR_CACHE_DIR="$OUTPUT/cache/inductor"
-export MPLCONFIGDIR="$OUTPUT/cache/mpl" CUDA_CACHE_PATH="$OUTPUT/cache/cuda" TMPDIR="$OUTPUT/tmp"
-mkdir -p "$WARP_CACHE_PATH" "$TORCHINDUCTOR_CACHE_DIR" "$MPLCONFIGDIR" "$CUDA_CACHE_PATH" "$TMPDIR"
+export MPLCONFIGDIR="$OUTPUT/cache/mpl" CUDA_CACHE_PATH="$OUTPUT/cache/cuda"
+# NVRTC can reject the deeply nested evaluation output path as a temp directory.
+eval_tmp=$(mktemp -d /tmp/hoi80.XXXXXXXX)
+export TMPDIR="$eval_tmp" TMP="$eval_tmp" TEMP="$eval_tmp"
+mkdir -p "$WARP_CACHE_PATH" "$TORCHINDUCTOR_CACHE_DIR" "$MPLCONFIGDIR" "$CUDA_CACHE_PATH"
 nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv > "$OUTPUT/gpu.txt"
 scontrol show job "${SLURM_JOB_ID:?HOI80 GPU evaluation requires Slurm}" > "$OUTPUT/slurm.txt"
 sha256sum supermimic/*.py hoi_residual/*.py hoi_tables/*.py hoi_tables/v11/*.py > "$OUTPUT/source.sha256"

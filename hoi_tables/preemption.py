@@ -59,6 +59,10 @@ def settings(root):
         if sha(Path(v['source'])/name)!=digest:raise ValueError('Frozen source changed: '+name)
     for name,digest in v['helper_sha256'].items():
         if sha(Path(v['helpers'])/name)!=digest:raise ValueError('Recovery helper changed: '+name)
+    if 'eval_source' in v:
+        from hoi_tables.eval_monitor import source_tree_hash
+        if source_tree_hash(v['eval_source']) != v['eval_source_sha256']:
+            raise ValueError('Frozen evaluation source changed')
     return v
 
 class Scheduler:
@@ -370,7 +374,7 @@ def logger(root,attempt):
         return unified.monitor(a['control'],v['training_root'],assets=ASSETS,eval_control=v['eval_control'],
             expected_run_id=v['run_id'],train_job=a['train_job'],wandb_module=SDK(),stop_requested=stopping,
             supervisor_factory=ContinuingSupervisor,supervisor_kwargs={'root':v['eval_control'],'campaign':v['campaign'],
-            'training_root':v['training_root'],'source_root':v['source'],'training_source':v['source'],
+            'training_root':v['training_root'],'source_root':v.get('eval_source',v['source']),'training_source':v['source'],
             'parent_run_id':v['run_id'],'train_job':a['train_job']})
     finally:
         for signum,handler in previous_signals.items():signal.signal(signum,handler)
