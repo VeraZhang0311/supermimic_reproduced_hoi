@@ -69,12 +69,12 @@ class ExperimentProfile:
         from .ultra import UltraTeacherMotion
         return UltraTeacherMotion(args.manifest, kin, device, canonical=args.canonical, helper_root=args.helper_root, **kwargs)
 
-    def reward(self, args, mdp, assets, hands):
+    def reward(self, args, mdp, assets, hands, *, native_hands=None):
         if self.name == "tables":
             from .reward import TablesReward
             return TablesReward(mdp, assets, hands, reference_contacts=args.reference_contacts)
         from .ultra import make_ultra_reward
-        return make_ultra_reward(mdp, assets, hands, reference_contacts=args.reference_contacts)
+        return make_ultra_reward(mdp, assets, hands, reference_contacts=args.reference_contacts, native_hands=native_hands)
 
 
 PROFILES = {"tables": ExperimentProfile("tables", TABLE_ASSETS, "protected_tables22"),
@@ -97,8 +97,10 @@ def resolve_arguments(args):
             raise ValueError("Invalid direct-teacher experiment schema/fields")
         for key in ("paths", "training", "execution", "evaluation"):
             if not isinstance(raw.get(key), dict): raise ValueError("Experiment requires " + key)
-        allowed = {"paths":{"manifest","asset_bundle","shape_bank","reference_contacts","geometry_bundle","resume_bundle"},
-                   "training":{"num_envs","iterations","seed"}, "execution":{"workers_per_gpu","checkpoint_every"},
+        allowed = {"paths":{"manifest","asset_bundle","shape_bank","reference_contacts","geometry_bundle","resume_bundle",
+                            "native_hands"},
+                   "training":{"num_envs","iterations","seed"},
+                   "execution":{"workers_per_gpu","checkpoint_every","actor_ranks_per_turn"},
                    "evaluation":{"kind","every","owning_training_run","canonical","helper_root"}}
         for key, names in allowed.items():
             if set(raw[key])-names: raise ValueError("Unsupported experiment fields: " + key)
@@ -110,9 +112,9 @@ def resolve_arguments(args):
     if evaluation and (evaluation.get("kind") != selected.evaluation or evaluation.get("every") != 2000
                        or evaluation.get("owning_training_run") is not True):
         raise ValueError("Evaluation must use the matching full panel every2000 on the owning training run")
-    defaults = {"num_envs":4096,"iterations":20000,"seed":0,"workers_per_gpu":1,
+    defaults = {"num_envs":4096,"iterations":20000,"seed":0,"workers_per_gpu":1,"actor_ranks_per_turn":1,
                 "checkpoint_every":100 if selected.name=="ultra" else 500,"canonical":None,"helper_root":None,
-                'resume_bundle':None,'ls_iterations':50}
+                'resume_bundle':None,'native_hands':None,'ls_iterations':50}
     values = {**raw.get("paths",{}), **raw.get("training",{}), **raw.get("execution",{}),
               **{key:evaluation[key] for key in ("canonical","helper_root") if key in evaluation},**raw.get('solver',{})}
     for name in ("manifest","asset_bundle","shape_bank","reference_contacts","geometry_bundle", *defaults):
@@ -121,8 +123,12 @@ def resolve_arguments(args):
         if not getattr(args,name): raise ValueError("Missing --" + name.replace("_","-"))
     if selected.name == "ultra" and not args.geometry_bundle:
         raise ValueError("Ultra requires an explicit geometry bundle")
-    for name in ("num_envs", "iterations", "workers_per_gpu"):
+    for name in ("num_envs", "iterations", "workers_per_gpu", "actor_ranks_per_turn"):
         if type(getattr(args,name)) is not int or getattr(args,name)<1: raise ValueError(name+" must be a positive integer")
+    if args.workers_per_gpu % args.actor_ranks_per_turn:
+        raise ValueError("actor_ranks_per_turn must divide workers_per_gpu")
+    if selected.name != "ultra" and args.actor_ranks_per_turn != 1:
+        raise ValueError("actor_ranks_per_turn is configurable only for Ultra")
     if type(args.seed) is not int or args.seed<0: raise ValueError("seed must be nonnegative")
     if (type(args.checkpoint_every) is not int or args.checkpoint_every<100
             or args.checkpoint_every%100 or 2000%args.checkpoint_every):
@@ -130,6 +136,8 @@ def resolve_arguments(args):
     from .solver_health import policy
     policy(args.ls_iterations)
     if args.resume_bundle and selected.name!='ultra':raise ValueError('This continuation contract is Ultra-only')
+    if args.native_hands and (selected.name != "ultra" or not args.reference_contacts):
+        raise ValueError("Native hands require the Ultra profile with frozen reference contacts")
     args.profile = selected.name
     if binding is not None:
         binding.update(profile=selected.name, assets=list(selected.assets), evaluation={"kind":selected.evaluation,"every":2000,"owning_training_run":True})

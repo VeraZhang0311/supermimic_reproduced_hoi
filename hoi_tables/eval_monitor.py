@@ -207,6 +207,7 @@ class Slurm:
 class Supervisor:
     """Durable scheduler ledger, independent from SDK/network telemetry."""
     protocol = PROTOCOL
+    milestones = MILESTONES
     expected_clips = staticmethod(expected_clips)
     checkpoint_pair = staticmethod(checkpoint_pair)
     validate_result = staticmethod(validate_result)
@@ -239,7 +240,7 @@ class Supervisor:
         atomic_json(self.state_path, self.state)
 
     def _discover(self):
-        for iteration in MILESTONES:
+        for iteration in self.milestones:
             key = str(iteration)
             if key in self.state["evaluations"]: continue
             pair = self.checkpoint_pair(self.training_root, iteration)
@@ -339,7 +340,7 @@ class Supervisor:
         parent_exitcode = self._parent_exitcode()
         pending = active or any(e["status"] == "ready" for e in entries.values())
         if parent_exitcode is not None and not pending:
-            missing = [i for i in MILESTONES if str(i) not in entries]
+            missing = [i for i in self.milestones if str(i) not in entries]
             self.state.update(finished=True, parent_training_exitcode=parent_exitcode, missing_milestones=missing,
                               failed_milestones=[int(i) for i, e in entries.items() if e["status"] == "failed"], finished_utc=utc())
             self.save()

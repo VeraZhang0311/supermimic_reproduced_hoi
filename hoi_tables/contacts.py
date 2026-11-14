@@ -13,8 +13,8 @@ CHANNELS = ("left_hand_object", "right_hand_object", "object_ground",
 LABEL_SCHEMA = "hoi_v1_pair_normal_impulse_v2"
 
 
-def geometry_roles(model, newton_model, robot_geoms, object_count):
-    roles = _geom_roles(model, newton_model, robot_geoms, object_count)
+def geometry_roles(model, newton_model, robot_geoms, object_count, *, hand_names=None):
+    roles = _geom_roles(model, newton_model, robot_geoms, object_count, hand_names=hand_names)
     feet, _ = _entity_mapping(model, {"left_ankle_roll_link", "right_ankle_roll_link"}, "body", newton_model)
     for role, name in enumerate(("left_ankle_roll_link", "right_ankle_roll_link"), start=3):
         ids = np.flatnonzero(model.geom_bodyid == feet[name])
@@ -65,15 +65,19 @@ def _kernel(wp):
 
 
 class PairContacts:
-    def __init__(self, env):
+    def __init__(self, env, *, native_hands=None):
         import mujoco_warp
         import warp as wp
         self.wp, self.physics = wp, env.physics
         self.solver, self.data = env.physics.solver, env.physics.solver.mjw_data
         if self.data.efc.force.shape[0] != env.N:
             raise RuntimeError("Five-channel contact binding requires one solver world per environment")
+        hand_names = None
+        if native_hands is not None:
+            from .native_hands import SIDES, geom_names
+            hand_names = {side: geom_names(side) for side in SIDES}
         roles = geometry_roles(self.solver.mj_model, self.physics.manager.get_model(),
-                               self.physics.geom_ids, len(env.asset["collision_meshes"]))
+                               self.physics.geom_ids, len(env.asset["collision_meshes"]), hand_names=hand_names)
         self.roles = wp.array(roles, dtype=wp.int32, device=self.data.contact.geom.device)
         capacity = int(self.data.naconmax)
         self.indices = wp.array(np.arange(capacity, dtype=np.int32), device=self.roles.device)

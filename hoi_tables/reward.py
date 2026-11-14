@@ -24,14 +24,17 @@ def bound_tensor(binding, parent=None):
     return torch.load(io.BytesIO(raw), map_location="cpu", weights_only=True)
 
 
-def current_hands(binding):
+def current_hands(binding, *, native_hands=None):
     """Bind current actual collision hulls; project calibrated probes onto them."""
     import numpy as np
     import trimesh
     from scipy.spatial.transform import Rotation
+    from supermimic.g1_assets import SOURCE_URDF
     from supermimic.g1_physics import ASSET_DIR
     old = bound_tensor(binding)
-    tree = ET.parse(URDF_PATH).getroot()
+    asset_dir = ASSET_DIR if native_hands is None else native_hands.asset_dir
+    urdf = URDF_PATH if native_hands is None else asset_dir / "source" / SOURCE_URDF
+    tree = ET.parse(urdf).getroot()
     hands, evidence = {}, {}
     for side in ("left", "right"):
         link = tree.find(f"link[@name='{side}_wrist_yaw_link']")
@@ -40,7 +43,7 @@ def current_hands(binding):
             mesh = collider.find("geometry/mesh")
             if mesh is None or "rubber_hand" not in mesh.get("filename", ""):
                 continue
-            path = ASSET_DIR / "source/meshes/g1" / Path(mesh.get("filename")).name
+            path = asset_dir / "source/meshes/g1" / Path(mesh.get("filename")).name
             data = trimesh.load_mesh(path, process=False)
             # STL repeats three vertices for every face. Weld coincident source
             # vertices before checking closed collision topology; keep native
@@ -55,8 +58,8 @@ def current_hands(binding):
             meshes.append({"vertices": welded_vertices, "faces": welded_faces})
             identity.append({"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
                              "origin_xyz": xyz.tolist(), "origin_rpy": rpy})
-        if len(meshes) != 3:
-            raise ValueError("Current hand must have palm, fingers and thumb collision hulls")
+        if len(meshes) != (3 if native_hands is None else 5):
+            raise ValueError("Unexpected number of current hand collision hulls")
         probes = (old[side]["palm_points"] + torch.tensor(old[side]["mount"])).numpy()
         nearest, distances = [], []
         for mesh in meshes:
@@ -79,11 +82,11 @@ def current_hands(binding):
 class TablesReward:
     max_step_reward = MAX_STEP_REWARD
 
-    def __init__(self, mdp, assets, hands_binding, *, reference_contacts=None):
+    def __init__(self, mdp, assets, hands_binding, *, reference_contacts=None, native_hands=None):
         self.mdp, self.motion, self.kin = mdp, mdp.motion, mdp.kin
         self.assets = {int(a["asset_id"]): a for a in assets}
         self.geometry = {i: bound_tensor(a["geometry_cache"]) for i, a in self.assets.items()}
-        self.hands, self.hand_evidence = current_hands(hands_binding)
+        self.hands, self.hand_evidence = current_hands(hands_binding, native_hands=native_hands)
         self._object_meshes = {i: _prepare_exact_meshes(g["collision_meshes"]) for i, g in self.geometry.items()}
         self._hand_meshes = {side: _prepare_exact_meshes(h["collision_meshes"]) for side, h in self.hands.items()}
         tracked = [self.kin.body_names[i] for i in self.kin.tracked_idx]
@@ -96,7 +99,8 @@ class TablesReward:
         self._frozen_contacts = None
         if reference_contacts is not None:
             from .prepare_contacts import load_contact_cache
-            expected, valid, metadata = load_contact_cache(reference_contacts, self.motion, assets, hands_binding)
+            expected, valid, metadata = load_contact_cache(reference_contacts, self.motion, assets, hands_binding,
+                                                           native_hands=native_hands)
             self._frozen_contacts = expected.to(self.motion.device), valid.to(self.motion.device)
             self.contract["frozen_reference_contacts"] = metadata
 

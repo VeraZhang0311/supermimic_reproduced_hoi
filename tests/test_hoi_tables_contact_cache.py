@@ -48,7 +48,7 @@ def fixture(root):
 
 class ReferenceOnlyReward:
     """Cheap stand-in for exact geometry; no policy, optimizer or simulator."""
-    def __init__(self, mdp, assets, hands):
+    def __init__(self, mdp, assets, hands, *, native_hands=None):
         self.hand_evidence, self._reference_contacts = {}, {}
 
     def _expected(self, frames):
@@ -273,7 +273,7 @@ class FrozenContactCacheTests(unittest.TestCase):
         original_context = contacts._WORKER_CONTEXT
         try:
             with patch.object(contacts, "_new_kinematics", side_effect=ValueError("broken frozen geometry")):
-                REAL_WORKER_INITIALIZER(str(self.manifest), str(self.catalog), "train", 2, 1, {})
+                REAL_WORKER_INITIALIZER(str(self.manifest), str(self.catalog), "train", 2, 1, {}, None)
             with self.assertRaisesRegex(RuntimeError, "broken frozen geometry"):
                 contacts._worker_clip("omomo/unitree_g1/sub1_largetable_001")
         finally:

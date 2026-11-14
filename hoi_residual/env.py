@@ -4,6 +4,7 @@ One fixed object asset per simulator worker. Multi-asset PPO synchronizes one
 actor/critic across workers, so MJWarp worlds remain topologically identical.
 No automatic reset: the collector values the final observation before reset.
 """
+from functools import partial
 from pathlib import Path
 from types import FunctionType
 import torch
@@ -16,7 +17,7 @@ from .rewards import MAX_POSITIVE_REWARD, reward
 
 class HOISim(TrackingSim):
     def __init__(self, sim_cfg, num_envs, motion, mdp, asset, output, *, eval_mode=False,
-                 max_episode_steps=500, v11_reward=None):
+                 max_episode_steps=500, v11_reward=None, robot_asset=None):
         if not eval_mode and (not motion.for_training or motion.partition != 'train'):
             raise ValueError('Physical training refuses Protected eval reference libraries')
         import isaaclab.sim as sim_utils
@@ -32,9 +33,15 @@ class HOISim(TrackingSim):
         self.object_solver_report = None
         self.object_solver_checks = 0
         usd = prepare_object_usd(asset, Path(output) / 'object_asset')
+        if robot_asset is not None:
+            from supermimic.robot import G1_CFG
+            robot_cfg = G1_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot",
+                                       spawn=G1_CFG.spawn.replace(usd_path=str(robot_asset.usd)))
 
         @configclass
         class Scene(TrackingSceneCfg):
+            if robot_asset is not None:
+                robot = robot_cfg
             object = RigidObjectCfg(prim_path='{ENV_REGEX_NS}/Object',
                 spawn=sim_utils.UsdFileCfg(usd_path=str(usd), rigid_props=sim_utils.RigidBodyPropertiesCfg(
                     disable_gravity=False, linear_damping=0., angular_damping=0.)),
@@ -45,8 +52,12 @@ class HOISim(TrackingSim):
         # is needed because the frozen GMT constructor has no scene hook and
         # its implementation SHA is part of the checkpoint physics contract.
         original = TrackingSim.__init__
+        scene_bindings = {**original.__globals__, 'TrackingSceneCfg': Scene}
+        if robot_asset is not None:
+            scene_bindings['G1PhysicsRuntime'] = partial(scene_bindings['G1PhysicsRuntime'],
+                                                        asset_dir=robot_asset.asset_dir)
         initialize = FunctionType(original.__code__,
-                                  {**original.__globals__, 'TrackingSceneCfg': Scene},
+                                  scene_bindings,
                                   original.__name__, original.__defaults__, original.__closure__)
         initialize(self, sim_cfg, num_envs, motion, mdp, eval_mode=eval_mode,
                    max_episode_steps=max_episode_steps)

@@ -115,9 +115,7 @@ class AssetRollout:
 
 @torch.no_grad()
 def rollout_asset(env, motion, mdp, privileged, policy, kin, shape, asset, references):
-    from hoi_zero_shot.native import initialize_canonical_object
-
-    if motion.partition != "protected_eval" or motion.for_training or env.N != len(references):
+    if motion.partition != "protected_eval" or motion.for_training or env.N != len(motion.entries):
         raise ValueError("Batch evaluation needs one world per protected clip")
     names = list(env.robot.body_names)
     if len(names) != BODY_COUNT or set(names) != set(kin.body_names):
@@ -127,11 +125,17 @@ def rollout_asset(env, motion, mdp, privileged, policy, kin, shape, asset, refer
     lengths = (motion.clip_end - starts).tolist()
     if len(lengths) != env.N or any(length < 1 for length in lengths):
         raise ValueError("HOI80 clips require a complete control interval in each world")
-    initial_rows = np.stack([reference[0] for reference in references])
+    initial_rows = None
+    if references is not None:
+        from hoi_zero_shot.native import initialize_canonical_object
+        initial_rows = np.stack([reference[0] for reference in references])
 
     def reset(lanes):
         ids = torch.as_tensor(lanes, device=env.device, dtype=torch.long)
         env.reset(ids, starts[ids])
+        if initial_rows is None:
+            env.refresh()
+            return {}
         receipt = initialize_canonical_object(env, initial_rows[lanes], env_ids=ids)
         env.history.reset(ids, object_observation(torso_pose(kin, env.state()), env.object_state()))
         return receipt

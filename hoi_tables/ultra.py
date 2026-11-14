@@ -79,14 +79,14 @@ def _geometry_bundle(path):
     return value, hashlib.sha256(raw).hexdigest()
 
 
-def _check_hands(evidence, hands=None):
+def _check_hands(evidence, hands=None, *, hull_count=3):
     if set(evidence) != {"left", "right"}:
         raise ValueError("Current hw3 hand evidence must cover left and right")
     for value in evidence.values():
         distance = value["calibrated_to_current_projection_max_m"]
         # This is the displacement of OLD calibrated probes before the exact
         # same projection used by tables. It is not a current surface error.
-        if not 0 <= distance < float("inf") or len(value["colliders"]) != 3:
+        if not 0 <= distance < float("inf") or len(value["colliders"]) != hull_count:
             raise ValueError("Current hw3 hand hull/projection evidence is invalid")
     if hands is not None:
         import numpy as np
@@ -98,7 +98,7 @@ def _check_hands(evidence, hands=None):
             record = evidence[side]
             if (points.shape != (record["probe_count"], 3) or not torch.isfinite(points).all()
                     or hashlib.sha256(points.numpy().tobytes()).hexdigest() != record["probe_sha256"]
-                    or len(hand["collision_meshes"]) != 3):
+                    or len(hand["collision_meshes"]) != hull_count):
                 raise ValueError("Current projected palm probe bytes/frame differ")
             distances = []
             for mesh in hand["collision_meshes"]:
@@ -333,12 +333,14 @@ def _record(motion, reward, index, chunk_size):
             "expected_sha256": _tensor_hash(expected), "valid_sha256": _tensor_hash(valid)}
 
 
-def load_contact_cache(path, motion, assets, hands_binding):
+def load_contact_cache(path, motion, assets, hands_binding, *, native_hands=None):
     raw = Path(path).read_bytes()
     value = torch.load(io.BytesIO(raw), map_location="cpu", weights_only=True)
     from .v11_reference_contacts import SCHEMA as REUSED_SCHEMA, load_reused_cache
     if value.get("schema") == REUSED_SCHEMA:
         return load_reused_cache(path, motion, assets, hands_binding, _raw=raw, _value=value)
+    if native_hands is not None:
+        raise ValueError("Native Ultra hands require the original Ultra v1.1 reference labels")
     if (value.get("schema") != CONTACT_SCHEMA or value.get("complete") is not True
             or value.get("content_sha256") != _digest_json(_content(value))):
         raise ValueError("ULTRA reference contact cache schema/completeness/content mismatch")
@@ -381,11 +383,12 @@ def load_contact_cache(path, motion, assets, hands_binding):
     return e.to(motion.device), v.to(motion.device), metadata
 
 
-def make_ultra_reward(mdp, assets, hands_binding, reference_contacts=None):
-    reward = TablesReward(mdp, assets, hands_binding)
-    _check_hands(reward.hand_evidence, reward.hands)
+def make_ultra_reward(mdp, assets, hands_binding, reference_contacts=None, *, native_hands=None):
+    reward = TablesReward(mdp, assets, hands_binding, native_hands=native_hands)
+    _check_hands(reward.hand_evidence, reward.hands, hull_count=3 if native_hands is None else 5)
     if reference_contacts is not None:
-        expected, valid, metadata = load_contact_cache(reference_contacts, mdp.motion, assets, hands_binding)
+        expected, valid, metadata = load_contact_cache(reference_contacts, mdp.motion, assets, hands_binding,
+                                                      native_hands=native_hands)
         reward._frozen_contacts = expected, valid
         reward.contract["frozen_reference_contacts"] = metadata
     return reward

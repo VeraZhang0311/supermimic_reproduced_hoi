@@ -37,6 +37,8 @@ TERM_NAMES = {"body_position", "body_orientation", "body_linear_velocity", "body
               "root_position", "root_orientation", "action_rate", "joint_limits", "object_position",
               "object_orientation", "object_linear_velocity", "object_angular_velocity", "hand_approach", "contact_match"}
 METRIC_FIELDS = {"lr", "real_steps", "resets", "wm_total", "wm_robot", "wm_object", "wm_contact", "wm_wm_gradnorm",
+                 "iteration_seconds", "collection_seconds", "transfer_and_statistics_seconds", "collection_wait_seconds",
+                 "wm_seconds", "actor_seconds", "critic_seconds",
                  "wm_gradnorm", "pi_loss", "v_loss", "pi_gradnorm", "imag_return_per_step", "imag_survival",
                  "real_reward_mean", "real_reward_std", "real_reward_min", "real_reward_max",
                  "real_reward_normalized", "real_episode_length_mean", "real_term_frac", "real_trunc_frac",
@@ -89,8 +91,13 @@ def curated_config(metadata):
                                 "evaluation_every": experiment["evaluation"]["every"],
                                 "evaluation_on_training_run": True,
                                 "evaluation_role": "canonical_development80" if experiment["profile"] == "ultra" else "protected_tables22"}
-        if experiment.get("actor_backward_schedule") in ("parallel", "serialized_per_gpu"):
+        if experiment.get("actor_backward_schedule") in ("parallel", "serialized_per_gpu", "grouped_per_gpu"):
             result["experiment"]["actor_backward_schedule"] = experiment["actor_backward_schedule"]
+        turns = experiment.get("actor_ranks_per_turn")
+        if experiment["profile"] == "ultra" and type(turns) is int and 1 <= turns <= 8:
+            result["experiment"]["actor_ranks_per_turn"] = turns
+    if isinstance(experiment, dict) and experiment.get("profile") == "ultra_tables":
+        result["experiment"] = _safe_schema(experiment)
     if type(metadata.get('from_scratch')) is bool:
         result['from_scratch'] = metadata['from_scratch']
     if 'resume' in metadata:
@@ -115,7 +122,7 @@ def _identity(root, *, entity, project, run_id, run_name=None):
     path = Path(root)/"run_metadata.json"
     metadata = json.loads(path.read_text(encoding="utf-8"))
     profile = metadata.get("experiment", {}).get("profile", "tables")
-    prefix = "ultra_boxes_v1-" if profile == "ultra" else "tables_v1-"
+    prefix = {"ultra": "ultra_boxes_v1-", "ultra_tables": "ultra_tables_v1-"}.get(profile, "tables_v1-")
     name = run_name or prefix+datetime.now(ZoneInfo("America/New_York")).strftime("%Y%m%d-%H%M%S")
     if not re.fullmatch(re.escape(prefix)+r"[A-Za-z0-9_-]+", name):
         raise ValueError("Training run names must begin with "+prefix)
@@ -236,6 +243,8 @@ def register(root, *, entity=ENTITY, project=PROJECT, run_id, run_name=None, wan
 
 
 def _curated_metric(record):
+    from .table_actions import TABLE_ACTIONS, action_key
+
     iteration = record.get("iteration")
     if type(iteration) is not int or iteration < 1 or record.get("stage") not in STAGES:
         raise ValueError("Invalid tables training metric identity/stage")
@@ -243,6 +252,10 @@ def _curated_metric(record):
     for key, value in record.items():
         diagnostic = bool(re.fullmatch(r"wm_val_h(?:1|8|32)_(?:robot_mse|object_mse|object_position_rmse_m|valid_samples)", key))
         diagnostic |= bool(re.fullmatch(r"wm_val_(?:contact_recall|contact_precision|contact_brier)_(?:left_hand_object|right_hand_object|object_ground|left_foot_object|right_foot_object)", key))
+        if key.startswith("tables_by_action/"):
+            _, label, metric = key.split("/", 2)
+            diagnostic |= (label in {action_key(action) for action in TABLE_ACTIONS}
+                           and metric in ("episode_count", "failure_rate", "normalized_return"))
         allowed = (key in METRIC_FIELDS or diagnostic
                    or any(key == prefix+term for prefix in ("rewards/", "real_reward_terms/", "reward_") for term in TERM_NAMES))
         if allowed:
@@ -253,8 +266,9 @@ def _curated_metric(record):
 
 
 class JSONLReader:
-    def __init__(self, path, state=None):
+    def __init__(self, path, state=None, *, curate=_curated_metric):
         self.path = Path(path)
+        self.curate = curate
         state = state or {}
         self.offset, self.last_read = int(state.get("offset", 0)), int(state.get("last_read", 0))
         self.pending = {int(k): v for k, v in state.get("pending", {}).items()}
@@ -275,7 +289,7 @@ class JSONLReader:
         rows = []
         for line in complete.splitlines():
             if not line.strip(): continue
-            row = _curated_metric(json.loads(line))
+            row = self.curate(json.loads(line))
             if row["iteration"] <= self.last_read:
                 continue
             rows.append(row)

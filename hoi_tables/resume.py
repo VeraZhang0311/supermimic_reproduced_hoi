@@ -56,12 +56,43 @@ def _semantic(identity):
     from .evaluate import _reward_identity
     result=deepcopy(identity)
     for name in ('from_scratch','base_checkpoint','solver_health'):result.pop(name,None)
-    # Saving more often changes IO only. Every learning/physics field remains
-    # part of the strict continuation comparison.
+    # Checkpoint cadence and actor turn grouping change execution only.
     for name in ('global_config','worker_config'):result.get(name,{}).pop('ckpt_every',None)
     result['reward']=_reward_identity(result['reward'])
-    result.get('experiment',{}).get('config_binding',{}).pop('config_sha256',None)
+    experiment = result.get('experiment', {})
+    experiment.get('config_binding', {}).pop('config_sha256', None)
+    for name in ('actor_backward_schedule', 'actor_ranks_per_turn'):
+        experiment.pop(name, None)
     return json.dumps(result,sort_keys=True,separators=(',',':'))
+
+
+def _outside_actor_turns(source):
+    # Allow changes to the scheduling context only. Gloo gradient reduction,
+    # running statistics and model hashing must still match the parent source.
+    source = source.replace(b'\r\n', b'\n')
+    before, start, context = source.partition(b'\ndef serialized_gpu_backward(')
+    _, end, after = context.partition(b'\ndef _sum(')
+    return (before, after) if start and end else None
+
+
+def _hand_transition(old, current):
+    """Permit the explicit HW3-to-original-Ultra hand swap, once."""
+    binding = current.get("native_hands")
+    if binding is None or old.get("native_hands") is not None:
+        return None
+    from .native_hands import load_native_hands
+    from supermimic.g1_physics import physics_contract
+
+    variant = load_native_hands(binding)
+    if (old.get("experiment", {}).get("profile") != "ultra"
+            or old["physics"]["asset_identity"] != binding["base_asset_identity"]
+            or current["physics"] != physics_contract(variant.asset_dir)):
+        raise ValueError("Native hand transition does not bind the HW3 parent checkpoint")
+    normalized = deepcopy(current)
+    normalized.pop("native_hands")
+    normalized["physics"]["asset_identity"] = binding["base_asset_identity"]
+    normalized["reward"]["hand_geometry"] = old["reward"]["hand_geometry"]
+    return normalized
 
 
 def load_rank(path,rank,current_identity, *, enforce_model_source=True):
@@ -73,7 +104,9 @@ def load_rank(path,rank,current_identity, *, enforce_model_source=True):
     if checkpoint.get('schema')!='hoi_tables_checkpoint_v1' or checkpoint.get('iteration')!=value['iteration']:
         raise ValueError('Resume checkpoint iteration/schema changed')
     old=checkpoint['identity'];validate_lineage(old)
-    if _semantic(old)!=_semantic(current_identity):raise ValueError('Resume scientific/data/config identity differs')
+    transition = _hand_transition(old, current_identity)
+    if _semantic(old)!=_semantic(transition if transition is not None else current_identity):
+        raise ValueError('Resume scientific/data/config identity differs')
     before,after=identity_policy(old),identity_policy(current_identity)
     if after['ls_iterations']<before['ls_iterations']:raise ValueError('Resume cannot lower solver budget')
     if old['asset_id']!=rank or old['asset']!=ULTRA_ASSETS[rank]:raise ValueError('Resume rank/asset mismatch')
@@ -87,11 +120,23 @@ def load_rank(path,rank,current_identity, *, enforce_model_source=True):
         # are the only reviewed exceptions.
         allowed={'hoi_tables/train.py','hoi_tables/env.py','hoi_tables/experiments.py','hoi_tables/launch.py',
                  'hoi_tables/evaluate_hoi80.py','hoi_tables/telemetry.py','hoi_tables/resume.py'}
+        if transition is not None:
+            allowed.update({'hoi_residual/env.py', 'hoi_residual/v11_contacts.py', 'hoi_tables/contacts.py',
+                            'hoi_tables/reward.py', 'hoi_tables/ultra.py'})
         for name,digest in manifest['files'].items():
             if name.endswith('.py') and name.split('/')[0] in ('supermimic','hoi_residual','hoi_tables'):
-                if hashlib.sha256((source/name).read_bytes()).hexdigest()!=digest:raise ValueError('Parent source changed: '+name)
-                if name not in allowed and hashlib.sha256((runtime/name).read_bytes()).hexdigest()!=digest:
-                    raise ValueError('Resume changed protected scientific implementation: '+name)
+                parent_bytes = (source/name).read_bytes()
+                if hashlib.sha256(parent_bytes).hexdigest()!=digest:raise ValueError('Parent source changed: '+name)
+                if name in allowed:
+                    continue
+                runtime_bytes = (runtime/name).read_bytes()
+                if runtime_bytes == parent_bytes:
+                    continue
+                if name == 'hoi_tables/distributed.py':
+                    protected = _outside_actor_turns(parent_bytes)
+                    if protected is not None and _outside_actor_turns(runtime_bytes) == protected:
+                        continue
+                raise ValueError('Resume changed protected scientific implementation: '+name)
     return checkpoint,value
 
 

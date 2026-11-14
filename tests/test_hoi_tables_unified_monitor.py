@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import unittest
 
 from hoi_tables import unified_monitor as monitor
+from hoi_tables.experiments import TABLE_ASSETS, ULTRA_ASSETS
 from hoi_tables.telemetry import exclusive_writer
 
 
@@ -127,6 +128,18 @@ class UnifiedMonitorTests(unittest.TestCase):
         self.assertEqual(len(self.sdk.calls), 1)
         self.assertTrue(self.sdk.calls[0]["settings"]["x_disable_meta"])
         for path, raw in originals.items(): self.assertEqual(path.read_bytes(), raw)
+
+    def test_mixed_jsonl_publishes_asset_and_action_metrics_to_the_same_run(self):
+        record = row(8050)
+        record["assets"] = {asset: {"sim_rew": .15, "real_steps": 256} for asset in ULTRA_ASSETS + TABLE_ASSETS}
+        record["tables_by_action/carry/failure_rate"] = .25
+        (self.training / "metrics.jsonl").write_text(json.dumps(record) + "\n")
+        self.assertEqual(monitor.monitor(self.control, self.training, assets=("mixed",),
+                                         wandb_module=self.sdk, stop_requested=lambda: True), 0)
+        event, = self.sdk.new_logs
+        self.assertEqual(self.sdk.calls[0]["id"], self.registration["id"])
+        self.assertEqual(event["assets/largetable/sim_rew"], .15)
+        self.assertEqual(event["tables_by_action/carry/failure_rate"], .25)
 
     def test_late_evaluation_keeps_checkpoint_axis_and_does_not_overwrite_training_stage(self):
         self.write(0, row(2200)); self.write(1, row(2200))

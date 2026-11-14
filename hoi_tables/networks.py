@@ -117,8 +117,9 @@ class Critic(nn.Module):
         self.shape_encoder = ShapeEncoder()
         self.net = mlp(ORACLE_DIM + 64, list(hidden), 1)
 
-    def forward(self, oracle, points):
-        return run_mlp(self.net, torch.cat((self.norm(oracle), self.shape_encoder(points)), -1)).squeeze(-1)
+    def forward(self, oracle, points, *, shape_embedding=None):
+        shape = self.shape_encoder(points) if shape_embedding is None else shape_embedding
+        return run_mlp(self.net, torch.cat((self.norm(oracle), shape), -1)).squeeze(-1)
 
     @torch.no_grad()
     def update_normalizers(self, oracle):
@@ -147,10 +148,10 @@ class WorldModel(nn.Module):
         _dim(xi_o, 12, "Object context")
         return torch.cat((invariant_features(S), a, xi_n), -1), torch.cat((object_features(S, O), xi_o), -1)
 
-    def inputs(self, S, O, a, xi_n, xi_o, points, actuator, mass_context):
+    def inputs(self, S, O, a, xi_n, xi_o, points, actuator, mass_context, *, shape_embedding=None):
         old, new = self.raw_inputs(S, O, a, xi_n, xi_o)
         new = self.object_in_norm(new)
-        shape = self.shape_encoder(points)
+        shape = self.shape_encoder(points) if shape_embedding is None else shape_embedding
         if mass_context.shape != old.shape[:-1] + (1,):
             raise ValueError("Torso mass context must be batch+(1,)")
         return torch.cat((self.in_norm(old), new[..., :15], shape, new[..., 15:], mass_context,
@@ -164,8 +165,9 @@ class WorldModel(nn.Module):
     def state_error(S_hat, O_hat, S, O):
         return torch.cat((RobotWorldModel.state_error(S_hat, S), object_state_error(S, O_hat, O)), -1)
 
-    def step(self, S, O, a, xi_n, xi_o, points, actuator, mass_context):
-        hidden = run_mlp(self.net[:-1], self.inputs(S, O, a, xi_n, xi_o, points, actuator, mass_context))
+    def step(self, S, O, a, xi_n, xi_o, points, actuator, mass_context, *, shape_embedding=None):
+        hidden = run_mlp(self.net[:-1], self.inputs(S, O, a, xi_n, xi_o, points, actuator, mass_context,
+                                                   shape_embedding=shape_embedding))
         y = run_mlp(self.net[-1], hidden)
         dr = y[..., :70] * self.out_norm.std() + self.out_norm.mean
         do = y[..., 70:] * self.object_out_norm.std() + self.object_out_norm.mean
@@ -190,7 +192,7 @@ class WorldModel(nn.Module):
         self.object_out_norm.update(target[..., 70:])
 
     def loss(self, S_hat, O_hat, S, O, contact_logits, contact_actual, contact_valid, mask,
-             pos_weight=None, lambda_object=1., lambda_contact=.1):
+             pos_weight=None, lambda_object=1., lambda_contact=.1, *, return_window_totals=False):
         error = self.state_error(S_hat, O_hat, S, O)
         robot = ((error[..., :70] / torch.maximum(self.out_norm.std(), self.robot_error_floor)) ** 2).mean(-1)
         scaled = (error[..., 70:] / torch.maximum(self.object_out_norm.std(), self.object_error_floor)) ** 2
@@ -202,7 +204,10 @@ class WorldModel(nn.Module):
         contact = (bce * valid).sum(-1) / valid.sum(-1).clamp_min(1)
         reduce = lambda value: (value * mask).sum() / max(1, mask.shape[0])
         r, o, c = reduce(robot), reduce(obj), reduce(contact)
-        return {"total": r + lambda_object * o + lambda_contact * c, "robot": r, "object": o, "contact": c}
+        losses = {"total": r + lambda_object * o + lambda_contact * c, "robot": r, "object": o, "contact": c}
+        if return_window_totals:
+            losses["window_total"] = ((robot + lambda_object * obj + lambda_contact * contact) * mask).sum(-1).detach()
+        return losses
 
 
 @contextmanager

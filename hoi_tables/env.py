@@ -15,14 +15,15 @@ from .sampling import AdaptiveRSI
 
 class TableSim(HOISim):
     def __init__(self, sim_cfg, num_envs, motion, mdp, asset, output, *, teacher_kin,
-                 reward, eval_mode=False, max_episode_steps=500, solver_ls_iterations=50):
+                 reward, eval_mode=False, max_episode_steps=500, solver_ls_iterations=50,
+                 native_hands=None):
         self.iteration, self.teacher_kin, self.reward_model = 0, teacher_kin, reward
         self._solver_failure_output = Path(output)
         self.sampler = None if eval_mode else AdaptiveRSI(motion, asset_index=int(asset["asset_id"]))
         self._history_ready = False
         super().__init__(sim_cfg, num_envs, motion, mdp, asset, output,
-                         eval_mode=eval_mode, max_episode_steps=max_episode_steps)
-        self.contacts = PairContacts(self)
+                         eval_mode=eval_mode, max_episode_steps=max_episode_steps, robot_asset=native_hands)
+        self.contacts = PairContacts(self, native_hands=native_hands)
         from .solver_health import configure
         self.solver_health = configure(self,solver_ls_iterations)
         self.history = ObjectHistory(object_observation(torso_pose(teacher_kin, self.state()), self.object_state()))

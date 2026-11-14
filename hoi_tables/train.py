@@ -23,9 +23,11 @@ def _parameter_hash(module):
     return digest.hexdigest()
 
 
-def actor_backward_schedule(profile, workers_per_gpu):
+def actor_backward_schedule(profile, workers_per_gpu, actor_ranks_per_turn=1):
     """Execution order only; batches, objective and optimizer steps are fixed."""
-    return "serialized_per_gpu" if profile == "ultra" and workers_per_gpu > 1 else "parallel"
+    if profile != "ultra" or workers_per_gpu == 1:
+        return "parallel"
+    return "serialized_per_gpu" if actor_ranks_per_turn == 1 else "grouped_per_gpu"
 
 
 def build_parser():
@@ -35,10 +37,12 @@ def build_parser():
     parser.add_argument("--manifest")
     parser.add_argument("--asset-bundle")
     parser.add_argument("--geometry-bundle")
+    parser.add_argument("--native-hands", help="Verified original Ultra hand asset receipt")
     parser.add_argument("--shape-bank")
     parser.add_argument("--canonical")
     parser.add_argument("--helper-root")
     parser.add_argument("--workers-per-gpu", type=int)
+    parser.add_argument("--actor-ranks-per-turn", type=int, help="Concurrent full H32 actor graphs per Ultra GPU")
     parser.add_argument("--reference-contacts", help="Optional complete, identity-bound exact reference contact cache")
     parser.add_argument("--output", required=True)
     parser.add_argument("--smoke", action="store_true")
@@ -136,7 +140,11 @@ def main():
         def points(self, ids): return self.bank[ids]
     shapes = Shapes()
     mdp = MDP(kin, motion, torch.tensor(default_joint_pos_list(), device=device))
-    reward = experiment.reward(args, mdp, assets, hands)
+    native_hands = None
+    if args.native_hands:
+        from .native_hands import load_native_hands
+        native_hands = load_native_hands(args.native_hands)
+    reward = experiment.reward(args, mdp, assets, hands, native_hands=native_hands)
     policy, wm, critic = (Policy(config.actor_hidden).to(device), WorldModel(config.wm_hidden, config.contact_hidden).to(device),
                           Critic(config.critic_hidden).to(device))
     if world > 1:
@@ -144,8 +152,11 @@ def main():
         bind_distributed_statistics(policy, wm, critic)
     torch.manual_seed(args.seed + rank)
     replay = ReplayBuffer(config.buffer_steps, config.num_envs, device, seed=args.seed+rank)
-    actor_schedule = actor_backward_schedule(experiment.name, topology["workers_per_gpu"])
-    actor_context = (lambda: serialized_gpu_backward(topology["workers_per_gpu"])) if actor_schedule == "serialized_per_gpu" else None
+    actor_schedule = actor_backward_schedule(experiment.name, topology["workers_per_gpu"], args.actor_ranks_per_turn)
+    actor_context = None
+    if actor_schedule != "parallel":
+        actor_context = lambda: serialized_gpu_backward(
+            topology["workers_per_gpu"], ranks_per_turn=args.actor_ranks_per_turn)
     learner = Learner(policy, wm, critic, motion, teacher_kin, reward, config, shapes=shapes, replay=replay,
                       gradient_sync=synchronize_gradients if world > 1 else None,
                       stats_sync=synchronize_contact_counts if world > 1 else None,
@@ -154,8 +165,11 @@ def main():
     sim_cfg = make_sim(device, args)
     configure_capacity(sim_cfg, solver_capacity)
     env = TableSim(sim_cfg, config.num_envs, motion, mdp, asset, output, teacher_kin=teacher_kin,
-                   reward=reward, max_episode_steps=32 if args.smoke else 500,solver_ls_iterations=args.ls_iterations)
+                   reward=reward, max_episode_steps=32 if args.smoke else 500, solver_ls_iterations=args.ls_iterations,
+                   native_hands=native_hands)
     print(json.dumps({"rank":rank,"phase":"native_scene_ready","asset":asset["object_asset"]}),flush=True)
+    if native_hands is not None:
+        _json(output / "native_hand_contacts.json", env.contacts.evidence)
     identity = {"schema": feature_schema(), "physics": physics_contract(), "warp_runtime": warp_runtime,
                 "global_config": global_config.to_dict(), "worker_config": config.to_dict(),
                 "asset": asset["object_asset"], "asset_id": asset_id, "world_size": world,
@@ -168,12 +182,16 @@ def main():
         identity["experiment"] = {"profile":experiment.name,"assets":list(experiment.assets),
                                   "workers_per_gpu":topology["workers_per_gpu"],
                                   "actor_backward_schedule":actor_schedule,
+                                  "actor_ranks_per_turn":args.actor_ranks_per_turn,
                                   "geometry_bundle_sha256":hashlib.sha256(Path(args.geometry_bundle).read_bytes()).hexdigest(),
                                   "config_binding":experiment_binding,
                                   "evaluation":{"kind":experiment.evaluation,"every":2000,"owning_training_run":True}}
     if args.ls_iterations!=50 or args.resume_bundle:
         from .solver_health import policy as solver_policy
         identity['solver_health']=solver_policy(args.ls_iterations)
+    if native_hands is not None:
+        identity["physics"] = env.physics.contract
+        identity["native_hands"] = native_hands.identity
     start_iteration=0
     resume_receipt=None
     if args.resume_bundle:

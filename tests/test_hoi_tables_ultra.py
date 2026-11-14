@@ -102,7 +102,9 @@ def fixture(root):
 
 
 class ReferenceOnlyReward:
-    def __init__(self, mdp, assets, hands):
+    def __init__(self, mdp, assets, hands, *, native_hands=None):
+        if native_hands is not None:
+            raise AssertionError("Legacy reference fixture requires the default hand")
         self.hand_evidence = hand_evidence()
         self.hands = hand_geometry()
         self._reference_contacts = {}

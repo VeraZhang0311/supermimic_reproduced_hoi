@@ -108,12 +108,27 @@ class RecoveryTests(unittest.TestCase):
         value={'iteration':3700,'parent_run_id':'parent00','bundle_sha256':'a'*64,
                'records':[{'rank':i,'sha256':str(i)*64} for i in range(8)]}
         identity={'from_scratch':False,'base_checkpoint':resume.lineage(value),'solver_health':policy(200),
-                  'reward':{},'global_config':TrainConfig().to_dict(),'worker_config':TrainConfig().to_dict()}
+                  'reward':{},'global_config':TrainConfig().to_dict(),'worker_config':TrainConfig().to_dict(),
+                  'experiment':{'workers_per_gpu':4,'actor_backward_schedule':'serialized_per_gpu'}}
         resume.validate_lineage(identity)
         changed=deepcopy(identity)
         for key in ('global_config','worker_config'):changed[key]['ckpt_every']=100
+        changed['experiment'].update(actor_backward_schedule='grouped_per_gpu', actor_ranks_per_turn=4)
         self.assertEqual(resume._semantic(identity),resume._semantic(changed))
+        changed['experiment']['workers_per_gpu'] = 2
+        self.assertNotEqual(resume._semantic(identity),resume._semantic(changed))
+        changed['experiment']['workers_per_gpu'] = 4
         changed['global_config']['lr']*=2
         self.assertNotEqual(resume._semantic(identity),resume._semantic(changed))
         identity['base_checkpoint']['iteration']=3750
         with self.assertRaises(ValueError):resume.validate_lineage(identity)
+
+    def test_actor_turn_source_guard_preserves_gradient_reduction(self):
+        prefix = b"import torch\n"
+        actor = b"\ndef serialized_gpu_backward(workers):\n    return workers\n"
+        reduction = b"\ndef _sum(value):\n    return value\n"
+        old = (prefix + actor + reduction).replace(b"\n", b"\r\n")
+        updated = prefix + actor.replace(b"return workers", b"return workers // 4") + reduction
+        self.assertEqual(resume._outside_actor_turns(old), resume._outside_actor_turns(updated))
+        changed = updated.replace(b"return value", b"return value / 2")
+        self.assertNotEqual(resume._outside_actor_turns(old), resume._outside_actor_turns(changed))

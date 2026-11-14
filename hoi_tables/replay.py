@@ -34,7 +34,7 @@ class ReplayBuffer:
     schema = "hoi_tables_real_joint_replay_v1"
 
     def __init__(self, capacity_steps=None, num_envs=None, device="cpu", *, partition="train", seed=0,
-                 holdout_fraction=.1, T=None, N=None):
+                 holdout_fraction=.1, T=None, N=None, asset_env_counts=None):
         capacity_steps = T if capacity_steps is None else capacity_steps
         num_envs = N if num_envs is None else num_envs
         if partition != "train":
@@ -50,6 +50,10 @@ class ReplayBuffer:
                      for name, (shape, dtype) in {**FIELDS, **OPTIONAL_FIELDS}.items()}
         self.ptr, self.size = 0, 0
         self.appended_steps = 0
+        self.asset_env_counts = tuple(asset_env_counts or ())
+        if self.asset_env_counts and (sum(self.asset_env_counts) != self.N or min(self.asset_env_counts) < 1):
+            raise ValueError("Replay asset lanes must cover all environments")
+        self._lane_locations = {}
 
     def __len__(self):
         return self.size*self.N
@@ -77,6 +81,10 @@ class ReplayBuffer:
         for name in ("f", "next_f", "episode_id", "asset_id"):
             if bool((prepared[name] < 0).any()):
                 raise ValueError("Replay reference and identity indices must be nonnegative")
+        if self.asset_env_counts:
+            for asset, lanes in enumerate(prepared["asset_id"].split(self.asset_env_counts)):
+                if not bool((lanes == asset).all()):
+                    raise ValueError("Replay asset differs from its fixed native lanes")
         # Validate the complete row before mutating a ring slot.  copy_ owns
         # storage so a subsequent in-place native reset cannot rewrite replay.
         for name, value in prepared.items():
@@ -84,6 +92,7 @@ class ReplayBuffer:
         self.ptr = (self.ptr+1) % self.T
         self.size = min(self.size+1, self.T)
         self.appended_steps += 1
+        self._lane_locations.clear()
 
     add = append
 
@@ -120,6 +129,9 @@ class ReplayBuffer:
             raise ValueError("Replay sample batch/window must be positive integers")
         if self.size < window:
             raise ValueError(f"Replay has {self.size} control steps; {window} are required")
+        cache_key = split if self.asset_env_counts and window == 1 and horizon is None else None
+        if cache_key in self._lane_locations:
+            return self._sample_lanes(batch_size, self._lane_locations[cache_key])
         ages = torch.arange(self.size-window+1, device=self.device)[:, None].expand(-1, self.N)
         env = torch.arange(self.N, device=self.device)[None].expand_as(ages)
         valid = self._subset(ages, env, split)
@@ -136,10 +148,34 @@ class ReplayBuffer:
                 raise ValueError("A positive imagination horizon requires the motion library")
             frame = self.data["f"][rows, env]
             valid &= motion.clip_end[motion.clip_id[frame]]-frame >= horizon
+        if self.asset_env_counts:
+            locations = []
+            offset = 0
+            for lanes, count in zip(valid.split(self.asset_env_counts, dim=1), self.asset_env_counts, strict=True):
+                indices = lanes.nonzero()
+                if not len(indices):
+                    raise ValueError(f"No eligible {split} replay samples for lanes starting at {offset}")
+                indices[:, 1] += offset
+                locations.append(indices)
+                offset += count
+            if cache_key is not None:
+                self._lane_locations[cache_key] = locations
+            return self._sample_lanes(batch_size, locations)
         locations = valid.nonzero()
         if not len(locations):
             raise ValueError(f"Replay contains no reset-safe {split} windows of length {window}")
         chosen = locations[torch.randint(len(locations), (batch_size,), device=self.device, generator=self.generator)]
+        return chosen[:, 0], chosen[:, 1]
+
+    def _sample_lanes(self, batch_size, locations):
+        selected = []
+        for indices, count in zip(locations, self.asset_env_counts, strict=True):
+            quota, remainder = divmod(batch_size * count, self.N)
+            if remainder or quota < 1:
+                raise ValueError("Replay batch cannot represent the exact asset proportions")
+            selected.append(indices[torch.randint(len(indices), (quota,), device=self.device, generator=self.generator)])
+        chosen = torch.cat(selected)
+        chosen = chosen[torch.randperm(batch_size, device=self.device, generator=self.generator)]
         return chosen[:, 0], chosen[:, 1]
 
     def sample_transitions(self, batch_size, *, split="all"):
@@ -193,6 +229,7 @@ class ReplayBuffer:
         rows = self._row(torch.arange(self.size, device=self.device))
         return {"schema": self.schema, "capacity_steps": self.T, "num_envs": self.N,
                 "partition": self.partition, "holdout_fraction": self.holdout_fraction,
+                **({"asset_env_counts": self.asset_env_counts} if self.asset_env_counts else {}),
                 "appended_steps": self.appended_steps, "generator_state": self.generator.get_state().clone(),
                 "data": {name: value[rows].clone() for name, value in self.data.items()}}
 
@@ -201,6 +238,8 @@ class ReplayBuffer:
             raise ValueError("Replay checkpoint shape, partition or schema mismatch")
         if set(state["data"]) != set(self.data):
             raise ValueError("Replay checkpoint field schema mismatch")
+        if tuple(state.get("asset_env_counts", ())) != self.asset_env_counts:
+            raise ValueError("Replay checkpoint asset lanes differ")
         sizes = {len(value) for value in state["data"].values()}
         if len(sizes) != 1 or next(iter(sizes)) > self.T:
             raise ValueError("Replay checkpoint row count mismatch")
@@ -213,6 +252,7 @@ class ReplayBuffer:
         for name, value in state["data"].items():
             self.data[name][:size].copy_(value)
         self.size, self.ptr = size, size % self.T
+        self._lane_locations.clear()
         self.appended_steps = int(state["appended_steps"])
         self.generator.set_state(state["generator_state"].cpu())
 

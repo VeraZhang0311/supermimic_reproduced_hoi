@@ -15,8 +15,8 @@ def _release_cuda_cache():
 
 
 @contextmanager
-def serialized_gpu_backward(workers_per_gpu, release=None):
-    """Run one full local backward at a time on each shared GPU.
+def serialized_gpu_backward(workers_per_gpu, release=None, *, ranks_per_turn=1):
+    """Run full local backwards in groups on each shared GPU.
 
     Ranks assigned to different GPUs run the same turn concurrently. The body
     must contain no distributed collectives: synchronize gradients and step
@@ -27,6 +27,8 @@ def serialized_gpu_backward(workers_per_gpu, release=None):
     """
     if type(workers_per_gpu) is not int or workers_per_gpu < 1:
         raise ValueError("workers_per_gpu must be a positive integer")
+    if type(ranks_per_turn) is not int or ranks_per_turn < 1 or workers_per_gpu % ranks_per_turn:
+        raise ValueError("ranks_per_turn must be a positive divisor of workers_per_gpu")
     if workers_per_gpu == 1 or not dist.is_available() or not dist.is_initialized():
         yield
         return
@@ -34,7 +36,7 @@ def serialized_gpu_backward(workers_per_gpu, release=None):
     if world % workers_per_gpu:
         raise ValueError("Distributed ranks must divide equally among shared GPUs")
     if dist.get_backend() != "gloo":
-        raise ValueError("Serialized GPU backward requires the CPU Gloo process group")
+        raise ValueError("Grouped GPU backward requires the CPU Gloo process group")
     release = _release_cuda_cache if release is None else release
     failure = None
     # Every process returns unused segments from the preceding WM phase
@@ -45,8 +47,8 @@ def serialized_gpu_backward(workers_per_gpu, release=None):
         failure = (error, error.__traceback__)
     # No rank starts the large graph while a peer is still in the prior phase.
     dist.barrier()
-    for turn in range(workers_per_gpu):
-        if rank % workers_per_gpu == turn:
+    for turn in range(workers_per_gpu // ranks_per_turn):
+        if (rank % workers_per_gpu) // ranks_per_turn == turn:
             try:
                 yield
             except BaseException as error:

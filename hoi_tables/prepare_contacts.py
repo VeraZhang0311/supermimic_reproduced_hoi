@@ -28,6 +28,11 @@ from .reward import TablesReward, current_hands
 
 SCHEMA = "hoi_tables_exact_reference_contact_cache_v1"
 LABEL_SCHEMA = "reference_hand_object_geometric_intent_v2_surface_intersection_unknown"
+LEGACY_FQ_IMPLEMENTATION = {
+    "hoi_tables/prepare_contacts.py": "0612c9e6f65766624e11c63fb35731af8d34ddd5d09e0d5fc046dd0ed7d51b2e",
+    "hoi_tables/reward.py": "d98c44fef900358b07f4ff71af88dd718b19e1efcd815e129afdd879c958b677",
+}
+NATIVE_PREPARATION_IMPLEMENTATION = "d9b2a8c92593ed27c44b49ac8d154c1e00a21046b5c07dbeb82ac8fd21956f29"
 _WORKER_CONTEXT = None
 CONTACT_CONTRACT = {
     "label_schema": LABEL_SCHEMA,
@@ -79,10 +84,17 @@ def _hands_identity(evidence):
     return result
 
 
-def contact_identity(motion, assets, hands_binding, *, hand_evidence=None):
+def _native_variant(path):
+    if path is None:
+        return None
+    from .native_hands import load_native_hands
+    return load_native_hands(path)
+
+
+def contact_identity(motion, assets, hands_binding, *, hand_evidence=None, native_hands=None):
     """Current geometry/implementation identity, independent of worker filters."""
     if hand_evidence is None:
-        _, hand_evidence = current_hands(hands_binding)
+        _, hand_evidence = current_hands(hands_binding, native_hands=native_hands)
     binding_path = Path(hands_binding["path"])
     if sha256_file(binding_path) != hands_binding["sha256"]:
         raise ValueError("reference-contact hand cache bytes changed")
@@ -101,7 +113,7 @@ def contact_identity(motion, assets, hands_binding, *, hand_evidence=None):
     if not {entry["object_asset"] for entry in motion.entries}.issubset(geometries):
         raise ValueError("reference-contact identity lacks a selected worker asset")
     selection = motion.manifest["selection"]
-    return {"contract": deepcopy(CONTACT_CONTRACT),
+    identity = {"contract": deepcopy(CONTACT_CONTRACT),
             "manifest_sha256": motion.manifest_sha256,
             "manifest_content_sha256": motion.manifest["content_sha256"],
             "reference_cache_sha256": motion.manifest["cache"]["sha256"],
@@ -112,6 +124,9 @@ def contact_identity(motion, assets, hands_binding, *, hand_evidence=None):
             "hand_geometry": _hands_identity(hand_evidence),
             "object_geometry": geometries,
             "implementation_sha256": _code_identity()}
+    if native_hands is not None:
+        identity["native_hands"] = {k: v for k, v in native_hands.identity.items() if k != "path"}
+    return identity
 
 
 def _labels(expected, valid, count):
@@ -176,7 +191,7 @@ def _compute_clip_record(motion, reward, index, chunk_size):
             "expected_sha256": _tensor_hash(expected), "valid_sha256": _tensor_hash(valid)}
 
 
-def _initialize_worker(manifest_path, asset_bundle, partition, chunk_size, threads, identity):
+def _initialize_worker(manifest_path, asset_bundle, partition, chunk_size, threads, identity, native_hands_path):
     """Read frozen inputs and construct one CPU FK/reward per spawned process."""
     global _WORKER_CONTEXT
     try:
@@ -186,8 +201,10 @@ def _initialize_worker(manifest_path, asset_bundle, partition, chunk_size, threa
         kin = _new_kinematics()
         assets, binding = _read_assets_and_hands(asset_bundle)
         motion = TableMotionLib(manifest_path, kin, "cpu", partition=partition, for_training=False)
-        reward = TablesReward(SimpleNamespace(kin=kin, motion=motion), assets, binding)
-        actual_identity = contact_identity(motion, assets, binding, hand_evidence=reward.hand_evidence)
+        native_hands = _native_variant(native_hands_path)
+        reward = TablesReward(SimpleNamespace(kin=kin, motion=motion), assets, binding, native_hands=native_hands)
+        actual_identity = contact_identity(motion, assets, binding, hand_evidence=reward.hand_evidence,
+                                           native_hands=native_hands)
         if actual_identity != identity:
             raise RuntimeError("reference-contact worker input identity differs from parent")
         _WORKER_CONTEXT = {"motion": motion, "reward": reward, "chunk_size": chunk_size,
@@ -222,7 +239,7 @@ def _worker_count(requested, threads, clip_count):
 
 
 def prepare_contact_cache(manifest_path, asset_bundle, output, *, chunk_size=32, kin=None, progress=None,
-                          workers=1, worker_threads=1):
+                          workers=1, worker_threads=1, native_hands_path=None):
     """Compute all train and protected-eval reference labels, then save once.
 
     ``kin`` and ``progress`` permit a test harness or a caller-owned progress UI;
@@ -245,14 +262,16 @@ def prepare_contact_cache(manifest_path, asset_bundle, output, *, chunk_size=32,
     if kin is None:
         kin = _new_kinematics()
     assets, hands_binding = _read_assets_and_hands(asset_bundle)
+    native_hands = _native_variant(native_hands_path)
     clips, identity, completed_frames = {}, None, 0
     effective_workers = {}
     started = time.monotonic()
     for partition in ("train", "protected_eval"):
         motion = TableMotionLib(manifest_path, kin, "cpu", partition=partition, for_training=False)
         mdp = SimpleNamespace(kin=kin, motion=motion)
-        reward = TablesReward(mdp, assets, hands_binding)
-        candidate_identity = contact_identity(motion, assets, hands_binding, hand_evidence=reward.hand_evidence)
+        reward = TablesReward(mdp, assets, hands_binding, native_hands=native_hands)
+        candidate_identity = contact_identity(motion, assets, hands_binding, hand_evidence=reward.hand_evidence,
+                                              native_hands=native_hands)
         if identity is not None and candidate_identity != identity:
             raise RuntimeError("reference-contact inputs changed between partitions")
         identity = candidate_identity
@@ -288,11 +307,11 @@ def prepare_contact_cache(manifest_path, asset_bundle, output, *, chunk_size=32,
             context = multiprocessing.get_context("spawn")
             with context.Pool(processes=effective, initializer=_initialize_worker,
                               initargs=(str(manifest_path.resolve()), str(asset_bundle.resolve()), partition,
-                                        chunk_size, worker_threads, identity)) as pool:
+                                        chunk_size, worker_threads, identity, native_hands_path)) as pool:
                 for record in pool.imap_unordered(_worker_clip, tasks, chunksize=1):
                     accept(record)
         # Re-read real current hand geometry and file hashes after exact work.
-        if contact_identity(motion, assets, hands_binding) != identity:
+        if contact_identity(motion, assets, hands_binding, native_hands=native_hands) != identity:
             raise RuntimeError("reference-contact inputs changed during preprocessing")
     manifest = motion.manifest
     if set(clips) != {entry["clip_id"] for entry in manifest["clips"]} or len(clips) != manifest["selection"]["included_count"]:
@@ -316,7 +335,7 @@ def prepare_contact_cache(manifest_path, asset_bundle, output, *, chunk_size=32,
     return {**metadata, "content_sha256": value["content_sha256"], "file_sha256": sha256_file(output)}
 
 
-def load_contact_cache(path, motion, assets, hands_binding):
+def load_contact_cache(path, motion, assets, hands_binding, *, native_hands=None):
     """Return expected/valid tensors in the current worker's local frame order.
 
     Every stored clip and both frozen partitions must remain present, including
@@ -328,7 +347,7 @@ def load_contact_cache(path, motion, assets, hands_binding):
             value.get("content_sha256") != _digest_json(_content_identity(value))):
         raise ValueError("reference-contact cache schema/content/completeness mismatch")
     identity = value["metadata"]["identity"]
-    current = deepcopy(contact_identity(motion, assets, hands_binding))
+    current = contact_identity(motion, assets, hands_binding, native_hands=native_hands)
     # A caller may pass just the selected asset; the frozen file still contains
     # the complete two-asset geometry identity and full-whitelist labels.
     expected_geometry = identity.get("object_geometry", {})
@@ -336,6 +355,11 @@ def load_contact_cache(path, motion, assets, hands_binding):
     if any(expected_geometry.get(name) != binding for name, binding in actual_geometry.items()):
         raise ValueError("reference-contact object geometry identity mismatch")
     expected_identity = {key: field for key, field in identity.items() if key != "object_geometry"}
+    expected_code = expected_identity.get("implementation_sha256", {})
+    if native_hands is None and all(expected_code.get(name) == digest for name, digest in LEGACY_FQ_IMPLEMENTATION.items()):
+        current["implementation_sha256"].update(LEGACY_FQ_IMPLEMENTATION)
+    elif native_hands is not None and expected_code.get("hoi_tables/prepare_contacts.py") == NATIVE_PREPARATION_IMPLEMENTATION:
+        current["implementation_sha256"]["hoi_tables/prepare_contacts.py"] = NATIVE_PREPARATION_IMPLEMENTATION
     if current != expected_identity:
         raise ValueError("reference-contact robot/hand/manifest/selection/implementation identity mismatch")
     original = {entry["clip_id"]: entry for entry in motion.manifest["clips"]}
@@ -372,6 +396,7 @@ def main():
     parser.add_argument("--chunk-size", type=int, default=32)
     parser.add_argument("--threads", type=int, default=1)
     parser.add_argument("--workers", type=int, default=1, help="CPU processes per partition, e.g. 8 or 16")
+    parser.add_argument("--native-hands")
     args = parser.parse_args()
     if args.threads < 1:
         parser.error("--threads must be positive")
@@ -380,7 +405,7 @@ def main():
     torch.set_num_threads(args.threads)
     report = prepare_contact_cache(args.manifest, args.asset_bundle, args.output,
                                    chunk_size=args.chunk_size,
-                                   workers=args.workers, worker_threads=args.threads,
+                                   workers=args.workers, worker_threads=args.threads, native_hands_path=args.native_hands,
                                    progress=lambda value: print(json.dumps(value), flush=True))
     print(json.dumps(report, indent=2), flush=True)
 

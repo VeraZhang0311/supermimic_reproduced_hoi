@@ -112,6 +112,10 @@ def load_checkpoints(root, iteration, *, manifest, asset_bundle, geometry_bundle
         identity = checkpoint.get("identity",{})
         from .resume import validate_lineage
         validate_lineage(identity)
+        if rank == 0 and identity.get("native_hands") is not None:
+            from supermimic.g1_physics import physics_contract
+            from .native_hands import load_native_hands
+            physics = physics_contract(load_native_hands(identity["native_hands"]).asset_dir)
         if (identity.get("schema")!=feature_schema() or identity.get("asset")!=asset or identity.get("asset_id")!=rank
                 or identity.get("world_size")!=8 or identity.get("smoke") is not False
                 or identity.get("schedule_scope")!="500WM_then_fixed_actor_critic" or identity.get("physics")!=physics):
@@ -203,7 +207,7 @@ def summarize(clips):
     return result
 
 
-def aggregate_reports(root, output=None):
+def aggregate_reports(root, output=None, *, checkpoint_keys=None):
     reports = [json.loads((Path(root)/f"asset_{rank:02d}"/"report.json").read_text()) for rank in range(8)]
     common = ("iteration","checkpoint_sha256","model_state_sha256","parent_run_id","source_identity","smoke",
               "input_sha256","checkpoint_identity","manifest_sha256","canonical_sha256","eval_source_sha256",
@@ -216,8 +220,10 @@ def aggregate_reports(root, output=None):
         raise ValueError("HOI80 canonical manifest/scoring implementation identity changed")
     if reports[0].get("trajectory_schema") != TRAJECTORY_SCHEMA:
         raise ValueError("HOI80 requires full native trajectory recording")
-    if set(reports[0].get("checkpoint_sha256",{}))!={f"rank_{i:02d}" for i in range(8)}:
-        raise ValueError("HOI80 requires all eight checkpoint hashes")
+    if checkpoint_keys is None:
+        checkpoint_keys = {f"rank_{i:02d}" for i in range(8)}
+    if set(reports[0].get("checkpoint_sha256",{})) != checkpoint_keys:
+        raise ValueError("HOI80 checkpoint inventory differs from the training layout")
     for rank,report in enumerate(reports):
         count = sum(c["asset"]==ASSETS[rank] for c in expected.values())
         if (report.get("schema")!=ASSET_SCHEMA or report.get("passed") is not True or report.get("asset")!=ASSETS[rank]
@@ -285,12 +291,13 @@ def main():
     parser.add_argument("--iteration",type=int)
     parser.add_argument("--asset",type=int,choices=range(8))
     parser.add_argument("--batch-clips", action="store_true", help="Run all clips of the asset in parallel native worlds")
+    parser.add_argument("--mixed-request", type=Path)
     parser.add_argument("--smoke",action="store_true")
     parser.add_argument("--device",default="cuda:0")
     parser.add_argument("--seed",type=int,default=0)
     args = parser.parse_args()
     if args.aggregate:
-        result = aggregate_reports(args.aggregate,args.output)
+        result = aggregate_reports(args.aggregate,args.output, checkpoint_keys={"mixed"} if args.mixed_request else None)
         print(json.dumps({"schema":SCHEMA,"passed":True,"clip_count":80,"iteration":result["iteration"]}),flush=True)
         return
     for name in ("checkpoint_root","manifest","asset_bundle","geometry_bundle","shape_bank","reference_contacts",
@@ -312,9 +319,19 @@ def main():
     assets,hands = load_ultra_assets(args.asset_bundle,args.geometry_bundle)
     points,shape_metadata = load_ultra_shape(args.shape_bank,args.asset_bundle)
     from supermimic.g1_physics import physics_contract
-    pair = load_checkpoints(args.checkpoint_root,args.iteration,manifest=args.manifest,asset_bundle=args.asset_bundle,
-                            geometry_bundle=args.geometry_bundle,shape_metadata=shape_metadata,reference_contacts=args.reference_contacts,
-                            physics=physics_contract(),source=source,smoke=args.smoke)
+    if args.mixed_request:
+        from .mixed import evaluation_checkpoint, read_experiment
+        from .mixed_monitor import validate_request
+        request = json.loads(args.mixed_request.read_text())
+        validate_request(request)
+        if args.smoke or args.iteration != request["iteration"] or args.parent_run_id != request["parent_run_id"]:
+            raise ValueError("Canonical rollout differs from mixed evaluation request")
+        pair = evaluation_checkpoint(read_experiment(request["campaign"]), request["checkpoints"]["mixed"],
+                                     args.iteration, request["checkpoint_sha256"]["mixed"])
+    else:
+        pair = load_checkpoints(args.checkpoint_root,args.iteration,manifest=args.manifest,asset_bundle=args.asset_bundle,
+                                geometry_bundle=args.geometry_bundle,shape_metadata=shape_metadata,reference_contacts=args.reference_contacts,
+                                physics=physics_contract(),source=source,smoke=args.smoke)
     import torch
     from supermimic.env import make_sim
     from supermimic.kinematics import G1Kinematics
@@ -332,8 +349,13 @@ def main():
     kin,teacher_kin = G1Kinematics(args.device),RobotKinematics38(device=args.device)
     motion = HOI80TeacherMotion(args.manifest,kin,args.device,asset=args.asset,canonical=args.canonical,helper_root=args.helper_root)
     mdp = MDP(kin,motion,torch.tensor(default_joint_pos_list(),device=args.device))
-    reward = make_ultra_reward(mdp,assets,hands,reference_contacts=args.reference_contacts)
-    if _reward_identity(reward.contract)!=_reward_identity(pair["identity"]["reward"]): raise ValueError("Frozen reward/contact geometry mismatch")
+    native_hands = None
+    if pair["identity"].get("native_hands") is not None:
+        from .native_hands import load_native_hands
+        native_hands = load_native_hands(pair["identity"]["native_hands"])
+    reward = make_ultra_reward(mdp,assets,hands,reference_contacts=args.reference_contacts, native_hands=native_hands)
+    if not args.mixed_request and _reward_identity(reward.contract)!=_reward_identity(pair["identity"]["reward"]):
+        raise ValueError("Frozen reward/contact geometry mismatch")
     policy = Policy(pair["identity"]["global_config"]["actor_hidden"]).to(args.device)
     policy.load_state_dict(pair.pop("policy_state"),strict=True); policy.eval().requires_grad_(False)
     before = state_dict_hash(policy.state_dict())
@@ -344,12 +366,15 @@ def main():
     worlds = len(motion.cases) if args.batch_clips else 1
     env = TableSim(sim_cfg,worlds,motion,mdp,assets[args.asset],output,teacher_kin=teacher_kin,reward=reward,
                    eval_mode=True,max_episode_steps=int(motion.clip_len.max())+1,
-                   solver_ls_iterations=identity_policy(pair['identity'])['ls_iterations'])
+                   solver_ls_iterations=pair["identity"]["solver_ls_iterations"] if args.mixed_request else identity_policy(pair['identity'])['ls_iterations'],
+                   native_hands=native_hands)
     privileged = PrivilegedFeatures(teacher_kin,motion)
     shape = points[args.asset:args.asset+1].to(args.device)
     panel = json.loads(Path(args.canonical).read_text(encoding="utf-8"))
     virtual = virtual_scorer(motion,panel,ASSETS[args.asset],args.device)
     inputs = {name:file_sha256(getattr(args,name)) for name in ("manifest","asset_bundle","geometry_bundle","shape_bank","reference_contacts","canonical")}
+    if args.mixed_request and inputs != request["ultra_inputs"]:
+        raise ValueError("Canonical evaluator inputs differ from the mixed checkpoint")
     from .trajectories import NativeTrajectory
     trajectory_identity = {"iteration":args.iteration,"parent_run_id":args.parent_run_id,
                            "checkpoint_sha256":pair["checkpoint_sha256"],"model_state_sha256":pair["model_state_sha256"],
@@ -400,14 +425,17 @@ def main():
                           "object_pass":record["object_pass"],"joint_pass":record["joint_pass"]}),flush=True)
     after = state_dict_hash(policy.state_dict())
     if after!=before: raise RuntimeError("HOI80 changed policy/RMS tensors")
-    if any(file_sha256(Path(args.checkpoint_root)/rank/f"checkpoint_{args.iteration:06d}.pt")!=digest for rank,digest in pair["checkpoint_sha256"].items()):
+    paths = (request["checkpoints"] if args.mixed_request else
+             {rank: Path(args.checkpoint_root)/rank/f"checkpoint_{args.iteration:06d}.pt" for rank in pair["checkpoint_sha256"]})
+    if any(file_sha256(paths[rank])!=digest for rank,digest in pair["checkpoint_sha256"].items()):
         raise RuntimeError("Evaluated checkpoint changed during rollout")
     report = {"schema":ASSET_SCHEMA,"passed":True,"partition":"protected_eval","asset":ASSETS[args.asset],"asset_id":args.asset,
               "iteration":args.iteration,"parent_run_id":args.parent_run_id,"checkpoint_sha256":pair["checkpoint_sha256"],
               "model_state_sha256":pair["model_state_sha256"],"source_identity":source,"smoke":args.smoke,
               "scheduled_evaluation":not args.smoke,"manifest_sha256":inputs["manifest"],"canonical_sha256":inputs["canonical"],
               "eval_source_sha256":source["evaluation_source_tree_sha256"],"input_sha256":inputs,
-              "checkpoint_identity":_common_identity(pair["identity"]),"policy_state_sha256_before":before,"policy_state_sha256_after":after,
+              "checkpoint_identity":pair["identity"] if args.mixed_request else _common_identity(pair["identity"]),
+              "policy_state_sha256_before":before,"policy_state_sha256_after":after,
               "expected_clip_ids":sorted(expected),"expected_clips":expected,"expected_control_steps":23718,
               "protocol_files_sha256":protocol,"virtual39_identity":virtual.identity,"clip_count":len(clips),
               "control_steps":sum(c["control_steps"] for c in clips),"clips":clips,"metrics":summarize(clips),

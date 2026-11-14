@@ -77,7 +77,7 @@ def future_frames(motion, frames):
     return torch.minimum(frames[..., None] + steps, ends[..., None])
 
 
-def oracle_features(robot_privileged, torso, obj, motion, frames, object_context, object_history):
+def oracle_features(robot_privileged, torso, obj, motion, frames, object_context, object_history, *, check_finite=True):
     batch = len(frames)
     if (robot_privileged.shape != (batch, PRIVILEGED_DIM) or object_history.shape != (batch, 10, 9)
             or object_context.shape != (batch, 12)):
@@ -97,6 +97,6 @@ def oracle_features(robot_privileged, torso, obj, motion, frames, object_context
                           (H @ w.unsqueeze(-1)).squeeze(-1)), -1)
     result = torch.cat((robot_privileged, object_history.flatten(-2), goals.flatten(-2),
                         errors.flatten(-2), velocity, object_context), -1)
-    if result.shape != (batch, ORACLE_DIM) or not torch.isfinite(result).all():
+    if result.shape != (batch, ORACLE_DIM) or (check_finite and not torch.isfinite(result).all()):
         raise ValueError("HOI oracle shape or finite-value contract violated")
     return result

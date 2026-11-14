@@ -78,6 +78,20 @@ def aggregate_training(records, assets):
     return result
 
 
+def curate_mixed_training(record):
+    from .experiments import TABLE_ASSETS, ULTRA_ASSETS
+
+    payload = _curated_metric(record)
+    assets = record.get("assets", {})
+    if set(assets) != set(ULTRA_ASSETS + TABLE_ASSETS):
+        raise ValueError("Mixed telemetry is missing native assets")
+    for asset, row in assets.items():
+        values = _curated_metric({**row, "iteration": payload["iteration"], "stage": payload["stage"]})
+        payload.update({f"assets/{asset}/{key}": value for key, value in values.items()
+                        if key not in ("iteration", "stage")})
+    return payload
+
+
 def owning_run(training_root, expected_run_id=None):
     root = Path(training_root)
     record = json.loads((root/"wandb_registration.json").read_text())
@@ -173,6 +187,7 @@ def define_axes(run):
     for pattern in ("assets/*", "wm_val_*", "rewards/*", "real_reward_terms/*"):
         run.define_metric(pattern, step_metric="iteration")
     run.define_metric("eval/*", step_metric="eval/iteration")
+    run.define_metric("tables_by_action/*", step_metric="iteration")
 
 
 def _exitcode(training_root, train_job, supervisor):
@@ -228,7 +243,9 @@ def monitor(root, training_root, *, assets, supervisor=None, supervisor_factory=
             atomic_json(root/"server_ack.json", {"id": identity["id"], "last_internal_step": last_server_step, "events": acknowledged})
             # Always rebuild from native logs after restart. A local byte cursor
             # can be ahead of network persistence and is not an upload ack.
-            readers = [JSONLReader(training_root/f"rank_{i:02d}/metrics.jsonl") for i in range(len(assets))]
+            mixed = assets == ("mixed",)
+            readers = ([JSONLReader(training_root / "metrics.jsonl", curate=curate_mixed_training)] if mixed else
+                       [JSONLReader(training_root/f"rank_{i:02d}/metrics.jsonl") for i in range(len(assets))])
             eval_failed, eval_state = False, None
             if supervisor is None and supervisor_factory is not None:
                 try:
@@ -264,7 +281,10 @@ def monitor(root, training_root, *, assets, supervisor=None, supervisor_factory=
                     heads = [min(r.pending) for r in readers]
                     if len(set(heads)) != 1: raise ValueError("Training rank metric histories diverged")
                     iteration = heads[0]
-                    payload = aggregate_training([reader.pending[iteration] for reader in readers], assets)
+                    if mixed:
+                        payload = readers[0].pending[iteration]
+                    else:
+                        payload = aggregate_training([reader.pending[iteration] for reader in readers], assets)
                     emit(training_event_id(iteration), "train", payload)
                     for reader in readers: del reader.pending[iteration]
                     if iteration >= last_train_iteration:

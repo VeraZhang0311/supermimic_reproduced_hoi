@@ -68,6 +68,18 @@ class ExperimentTests(unittest.TestCase):
             value=self.config();value['execution']['checkpoint_every']=bad
             with self.assertRaisesRegex(ValueError,'checkpoint_every'):self.resolve_json(value)
 
+    def test_ultra_actor_concurrency_preserves_two_gpu_topology(self):
+        value = self.config()
+        value["execution"].update(workers_per_gpu=4, actor_ranks_per_turn=4)
+        args, experiment, _ = self.resolve_json(value)
+        self.assertEqual((args.actor_ranks_per_turn, experiment.world_size // args.workers_per_gpu), (4, 2))
+        args, _, _ = self.resolve_json(value, "--actor-ranks-per-turn", "2")
+        self.assertEqual(args.actor_ranks_per_turn, 2)
+        for bad in (True, 0, 3, 8):
+            value["execution"]["actor_ranks_per_turn"] = bad
+            with self.assertRaisesRegex(ValueError, "actor_ranks_per_turn"):
+                self.resolve_json(value)
+
     def test_single_l40_keeps_all_eight_assets_and_full_global_configuration(self):
         value=self.config();value['execution']['workers_per_gpu']=8
         args,experiment,_=self.resolve_json(value)

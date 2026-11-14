@@ -103,7 +103,7 @@ class TestFiveChannelContacts(unittest.TestCase):
         model = SimpleNamespace(geom_bodyid=np.array([1, 1, 1, 2, 2, 2, 3, 4, 5, 0, 6]),
                                 geom_type=np.array([2]*9+[int(mujoco.mjtGeom.mjGEOM_PLANE), 2]),
                                 geom_contype=np.ones(11, dtype=int), geom_conaffinity=np.zeros(11, dtype=int))
-        with patch("hoi_tables.contacts._geom_roles", side_effect=lambda *args: roles.copy()), \
+        with patch("hoi_tables.contacts._geom_roles", side_effect=lambda *args, **kwargs: roles.copy()), \
              patch("hoi_tables.contacts._entity_mapping", return_value=({"left_ankle_roll_link": 4, "right_ankle_roll_link": 5}, {})):
             actual = geometry_roles(model, None, None, 1)
             self.assertEqual(actual.tolist(), [0, 0, 0, 1, 1, 1, 2, 3, 4, 5, -1])
@@ -112,6 +112,20 @@ class TestFiveChannelContacts(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "Inactive"):
                     geometry_roles(model, None, None, 1)
                 model.geom_contype[index] = 1
+
+    def test_original_ultra_hand_uses_five_explicit_geoms_per_side(self):
+        import mujoco
+        from hoi_tables.native_hands import SIDES, geom_names
+
+        hands = {side: geom_names(side) for side in SIDES}
+        robot_geoms = {name: i for i, name in enumerate(hands["left"] + hands["right"])}
+        model = SimpleNamespace(ngeom=14, geom_bodyid=np.array([1]*5 + [2]*5 + [3, 4, 5, 0]),
+                                geom_type=np.array([2]*13 + [int(mujoco.mjtGeom.mjGEOM_PLANE)]),
+                                geom_contype=np.ones(14, dtype=int), geom_conaffinity=np.zeros(14, dtype=int))
+        with patch("hoi_residual.v11_contacts._entity_mapping", return_value=({"Object": 3}, {})), \
+             patch("hoi_tables.contacts._entity_mapping", return_value=({"left_ankle_roll_link": 4, "right_ankle_roll_link": 5}, {})):
+            actual = geometry_roles(model, None, robot_geoms, 1, hand_names=hands)
+        self.assertEqual(actual.tolist(), [0]*5 + [1]*5 + [2, 3, 4, 5])
 
     def test_interval_threshold_reset_and_substep_count(self):
         class Impulse:

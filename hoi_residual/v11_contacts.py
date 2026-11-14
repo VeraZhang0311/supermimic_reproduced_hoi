@@ -13,10 +13,16 @@ from supermimic.g1_physics import CONTROL_DECIMATION, CONTROL_DT, PHYSICS_DT
 from supermimic.g1_runtime import _entity_mapping
 
 
-def _geom_roles(model, newton_model, robot_geoms, expected_object_geoms):
+def _geom_roles(model, newton_model, robot_geoms, expected_object_geoms, *, hand_names=None):
     """Map compiled geometry to -1 (other), 0/1 (left/right hand) or 2 (object)."""
     roles = np.full(model.ngeom, -1, dtype=np.int32)
     for channel, side in enumerate(("left", "right")):
+        if hand_names is not None:
+            ids = [robot_geoms[name] for name in hand_names[side]]
+            if not ids or len(set(ids)) != len(ids) or (roles[ids] != -1).any():
+                raise RuntimeError(f"Ambiguous native {side} hand collider binding")
+            roles[ids] = channel
+            continue
         for part in ("palm", "fingers", "thumb"):
             suffix = f"_{side}_rubber_hand_{part}_hull"
             matches = [index for name, index in robot_geoms.items() if name.endswith(suffix)]

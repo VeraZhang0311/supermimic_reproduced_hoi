@@ -51,7 +51,7 @@ def enter_phase(rank, workers_per_gpu, shared):
         active[gpu] += 1
         maxima[gpu] = max(maxima[gpu], active[gpu])
         global_maximum.value = max(global_maximum.value, sum(active))
-    # The one active rank on each logical GPU meets here. This would time out
+    # The active ranks on each logical GPU meet here. This would time out
     # if the implementation serialized independent GPUs as well as sharers.
     gpu_rendezvous.wait(timeout=20)
 
@@ -66,7 +66,7 @@ def release_phase(rank, workers_per_gpu, shared, *, entered=True, fail=False):
         raise RuntimeError("injected allocator release failure")
 
 
-def gradient_worker(rank, world, workers_per_gpu, store, directory, shared):
+def gradient_worker(rank, world, workers_per_gpu, store, directory, shared, ranks_per_turn):
     torch.set_num_threads(1)
     dist.init_process_group("gloo", init_method=store, rank=rank, world_size=world,
                             timeout=timedelta(seconds=30))
@@ -82,7 +82,7 @@ def gradient_worker(rank, world, workers_per_gpu, store, directory, shared):
         model.zero_grad(set_to_none=True)
         entered = False
         releases = lambda: release_phase(rank, workers_per_gpu, shared, entered=entered)
-        with serialized_gpu_backward(workers_per_gpu, release=releases):
+        with serialized_gpu_backward(workers_per_gpu, release=releases, ranks_per_turn=ranks_per_turn):
             entered = True
             enter_phase(rank, workers_per_gpu, shared)
             serial_loss = full_batch_backward(model, rank)
@@ -108,7 +108,7 @@ def gradient_worker(rank, world, workers_per_gpu, store, directory, shared):
         dist.destroy_process_group()
 
 
-def failure_worker(rank, world, workers_per_gpu, store, directory, shared):
+def failure_worker(rank, world, workers_per_gpu, store, directory, shared, ranks_per_turn):
     torch.set_num_threads(1)
     dist.init_process_group("gloo", init_method=store, rank=rank, world_size=world,
                             timeout=timedelta(seconds=30))
@@ -129,7 +129,7 @@ def failure_worker(rank, world, workers_per_gpu, store, directory, shared):
                 fail=rank == 1 and ((failure_kind == "release" and entered)
                                    or (failure_kind == "pre_release" and not entered)))
             try:
-                with serialized_gpu_backward(workers_per_gpu, release=release):
+                with serialized_gpu_backward(workers_per_gpu, release=release, ranks_per_turn=ranks_per_turn):
                     entered = True
                     enter_phase(rank, workers_per_gpu, shared)
                     full_batch_backward(model, rank)
@@ -152,18 +152,18 @@ def failure_worker(rank, world, workers_per_gpu, store, directory, shared):
         dist.destroy_process_group()
 
 
-def launch(worker, world, workers_per_gpu):
+def launch(worker, world, workers_per_gpu, ranks_per_turn=1):
     context = mp.get_context("spawn")
     gpus = world//workers_per_gpu
     shared = (context.Array("i", gpus), context.Array("i", gpus), context.Value("i", 0),
-              context.Array("i", world), context.Lock(), context.Barrier(gpus))
+              context.Array("i", world), context.Lock(), context.Barrier(gpus*ranks_per_turn))
     with TemporaryDirectory(prefix="hoi-serialized-gloo-") as directory:
         with socket.socket() as address:
             address.bind(("127.0.0.1", 0)); port = address.getsockname()[1]
         # Native Windows FileStore and libuv cannot safely rendezvous under
         # every non-ASCII profile, so reuse the project's TCP Gloo convention.
         store = f"tcp://127.0.0.1:{port}?use_libuv=0"
-        mp.spawn(worker, args=(world, workers_per_gpu, store, directory, shared),
+        mp.spawn(worker, args=(world, workers_per_gpu, store, directory, shared, ranks_per_turn),
                  nprocs=world, join=True)
         reports = [json.loads((Path(directory)/f"rank_{rank}.json").read_text()) for rank in range(world)]
     return reports, {"active": list(shared[0]), "maxima": list(shared[1]),
@@ -188,9 +188,9 @@ class SerializedNullContextTests(unittest.TestCase):
 @unittest.skipUnless(dist.is_available() and dist.is_gloo_available(), "PyTorch Gloo is required")
 class SerializedDistributedTests(unittest.TestCase):
     def test_two_and_four_ranks_keep_complete_batch_gradients_and_parallel_independent_gpus(self):
-        for world, workers_per_gpu in ((2, 2), (4, 2), (4, 4)):
-            with self.subTest(world=world):
-                reports, shared = launch(gradient_worker, world, workers_per_gpu)
+        for world, workers_per_gpu, ranks_per_turn in ((2, 2, 1), (4, 2, 1), (4, 4, 1), (4, 4, 2), (4, 4, 4)):
+            with self.subTest(world=world, workers_per_gpu=workers_per_gpu, ranks_per_turn=ranks_per_turn):
+                reports, shared = launch(gradient_worker, world, workers_per_gpu, ranks_per_turn)
                 for report in reports:
                     for key in ("local_equal", "global_equal", "loss_equal", "parameters_and_rms_unchanged",
                                 "rng_unchanged", "model_changed_after_step"):
@@ -198,12 +198,12 @@ class SerializedDistributedTests(unittest.TestCase):
                     self.assertEqual((report["batch"], report["horizon"]), (17, 32))
                     self.assertEqual(len(set(report["final_model_hashes"])), 1)
                 self.assertEqual(shared["active"], [0]*(world//workers_per_gpu))
-                self.assertEqual(shared["maxima"], [1]*(world//workers_per_gpu))
-                self.assertEqual(shared["global_maximum"], world//workers_per_gpu)
+                self.assertEqual(shared["maxima"], [ranks_per_turn]*(world//workers_per_gpu))
+                self.assertEqual(shared["global_maximum"], (world//workers_per_gpu)*ranks_per_turn)
                 self.assertEqual(shared["release_counts"], [2]*world)
 
     def test_body_and_release_failure_reach_all_peers_without_optimizer_step_or_hang(self):
-        reports, shared = launch(failure_worker, 4, 2)
+        reports, shared = launch(failure_worker, 4, 2, ranks_per_turn=2)
         for rank, phases in enumerate(reports):
             for phase in phases:
                 self.assertEqual(phase["optimizer_steps"], 0)
@@ -217,7 +217,7 @@ class SerializedDistributedTests(unittest.TestCase):
                     self.assertEqual(phase["error_type"], "RuntimeError")
                     self.assertIn("peer rank", phase["message"])
         self.assertEqual(shared["active"], [0, 0])
-        self.assertEqual(shared["maxima"], [1, 1])
+        self.assertEqual(shared["maxima"], [2, 2])
         self.assertEqual(shared["release_counts"], [6]*4)
 
 

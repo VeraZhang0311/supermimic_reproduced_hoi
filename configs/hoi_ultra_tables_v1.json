@@ -1,0 +1,19 @@
+{
+  "schema": "hoi_ultra_tables_experiment_v1",
+  "ultra_experiment": "/mnt/projects/ll/tianzizh/hoi_ultra_boxes_teacher_20261107_01/ultra_native_hands_20261112_01/experiment.json",
+  "ultra_initialization": "/mnt/projects/ll/tianzizh/hoi_ultra_boxes_teacher_20261107_01/ultra_native_hands_20261112_01/evaluation/iter_008000/request.json",
+  "table_selection": "hoi_ultra_tables_selection.json",
+  "table_assets": "/mnt/projects/ll/tianzizh/hoi_tables_teacher_20261107_01/input/assets.json",
+  "table_shapes": "/mnt/projects/ll/tianzizh/hoi_tables_teacher_20261107_01/input/shape_bank.json",
+  "sampling": {"ultra_boxes": 0.5, "largetable": 0.25, "smalltable": 0.25},
+  "training": {"num_envs": 4096, "iterations": 20000, "checkpoint_every": 100, "seed": 0},
+  "execution": {
+    "actor_microbatch": 512,
+    "wm_microbatch": 512,
+    "overlap_collection": true,
+    "collector_cuda_graph": true,
+    "compiled_actor": true,
+    "target_seconds_per_iteration": 17
+  },
+  "evaluation": {"every": 2000, "suites": ["canonical_hoi80", "protected_tables20"], "owning_training_run": true}
+}

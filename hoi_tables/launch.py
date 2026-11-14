@@ -72,12 +72,16 @@ def prepare(config, campaign, source, *, workers_per_gpu=None):
     inputs={key:Path(getattr(args,key)).resolve() for key in ('manifest','asset_bundle','shape_bank','reference_contacts')}
     if name=='ultra':inputs.update(geometry_bundle=Path(args.geometry_bundle).resolve(),canonical=Path(args.canonical).resolve())
     if args.resume_bundle:inputs['resume_bundle']=Path(args.resume_bundle).resolve()
+    if args.native_hands:
+        from .native_hands import load_native_hands
+        native_hands = load_native_hands(args.native_hands)
+        inputs['native_hands'] = Path(native_hands.identity['path'])
     for key,path in inputs.items():
         if not path.is_file():raise FileNotFoundError(f'Missing {key}: {path}; run reference-only preparation first')
     campaign.mkdir(parents=True);(campaign/'input').mkdir()
     destinations={'manifest':'manifest.json','asset_bundle':'assets.json','shape_bank':'shape_bank.json',
                   'reference_contacts':'reference_contacts.pt','geometry_bundle':'geometry_bundle.json','canonical':'hoi80_manifest.json',
-                  'resume_bundle':'resume_bundle.json'}
+                  'resume_bundle':'resume_bundle.json','native_hands':'native_hands.json'}
     paths={}
     for key,path in inputs.items():
         target=campaign/'input'/destinations[key];target.symlink_to(path);paths[key]=str(target)
@@ -89,6 +93,7 @@ def prepare(config, campaign, source, *, workers_per_gpu=None):
     normalized=json.loads(config.read_text());normalized['paths'].update({k:v for k,v in paths.items() if k!='canonical'})
     normalized['execution']['workers_per_gpu']=args.workers_per_gpu
     normalized['execution']['checkpoint_every']=args.checkpoint_every
+    if name=='ultra':normalized['execution']['actor_ranks_per_turn']=args.actor_ranks_per_turn
     if name=='ultra':normalized['evaluation']['canonical']=paths['canonical']
     atomic_json(campaign/'experiment.json',normalized)
     training=campaign/'training';training.mkdir()
@@ -107,7 +112,10 @@ def prepare(config, campaign, source, *, workers_per_gpu=None):
     else:metadata['train_source_groups']=raw_manifest['partitions']['train']['source_groups']
     metadata['experiment']={'profile':name,'assets':list(profile.assets),'evaluation':normalized['evaluation'],
                             'workers_per_gpu':args.workers_per_gpu,'config_sha256':sha(config),
-                            'actor_backward_schedule':actor_backward_schedule(name,args.workers_per_gpu)}
+                            'actor_backward_schedule':actor_backward_schedule(name,args.workers_per_gpu,args.actor_ranks_per_turn)}
+    if name=='ultra':metadata['experiment']['actor_ranks_per_turn']=args.actor_ranks_per_turn
+    if args.native_hands:
+        metadata['experiment']['native_hands_sha256'] = native_hands.identity['sha256']
     if args.ls_iterations!=50 or args.resume_bundle:
         from .solver_health import policy
         metadata['solver_health']=policy(args.ls_iterations)
